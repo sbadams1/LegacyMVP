@@ -1,0 +1,47 @@
+name: legacy_mobile
+description: Preserve your voice, photos, and videos forever.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  
+  # Core Services
+  supabase_flutter: ^2.10.3
+  http: ^1.2.2
+  path_provider: ^2.1.5
+  permission_handler: ^12.0.1
+  google_sign_in: ^6.2.1
+  
+  # Media 
+  image_picker: ^1.1.2
+  video_player: ^2.9.1
+  chewie: ^1.8.1
+  cached_network_image: ^3.3.1
+  
+  # Audio/Voice 
+  flutter_sound: ^9.28.0 
+  flutter_tts: ^4.0.2
+  just_audio: ^0.9.38
+  # Fixed to version 5.0.0 to resolve the 'startStream' platform interface mismatch error.
+  record: ^6.0.0 
+
+  # Gemini/Google SDKs
+  google_generative_ai: ^0.4.1 
+  googleapis: ^14.0.0
+  googleapis_auth: ^1.6.0
+  
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/google_speech.json

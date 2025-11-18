@@ -1,0 +1,619 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:typed_data';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:flutter_sound/flutter_sound.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:chewie/chewie.dart';
+import 'package:video_player/video_player.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+import 'package:google_generative_ai/google_generative_ai.dart';
+import 'package:googleapis/speech/v1.dart' as speech; 
+import 'package:googleapis_auth/auth_io.dart';
+import 'package:just_audio/just_audio.dart';
+import 'dart:convert';
+import 'package:http/http.dart' as http; 
+
+// =====================================================================
+//  GLOBAL CONSTANTS & API KEYS 
+// =====================================================================
+const String geminiApiKey = 'AIzaSyA1v_sIMfmXpDvNkHnsnN4R808oI40Acio';
+const String elevenLabsApiKey = 'sk_d4a2077d94bae85ae6c666867186f64715eaa577baf64e70'; // Placeholder
+const String _serviceAccountAssetPath = 'assets/google_speech.json';
+const List<String> _speechScopes = [speech.SpeechApi.cloudPlatformScope];
+
+// =====================================================================
+//  GOOGLE SPEECH AUTH UTILS
+// =====================================================================
+
+Future<speech.SpeechApi> _getSpeechApi() async {
+  try {
+    final serviceAccountJson = await rootBundle.loadString(_serviceAccountAssetPath);
+    final accountCredentials = ServiceAccountCredentials.fromJson(serviceAccountJson);
+    final client = await clientViaServiceAccount(accountCredentials, _speechScopes);
+    return speech.SpeechApi(client);
+  } catch (e) {
+    print("FATAL AUTH ERROR: $e");
+    rethrow;
+  }
+}
+
+// =====================================================================
+//  ELEVENLABS SERVICE (FIX: Missing class definition)
+// =====================================================================
+
+class ElevenLabsService {
+  static Future<String?> createVoice(String name, List<String> files) async {
+    // This is a mock implementation to fix the build error. 
+    // Replace with your actual ElevenLabs API interaction.
+    await Future.delayed(const Duration(seconds: 2));
+    print('Mock Voice creation for files: $files');
+    return 'mock-voice-id-123';
+  }
+
+  static Future<String?> generateSpeech(String voiceId, String text) async {
+    // This is a mock implementation to fix the build error. 
+    // Replace with your actual ElevenLabs API interaction (fetches audio, saves to file).
+    final dir = await getTemporaryDirectory();
+    final tempPath = '${dir.path}/ai_speech_${DateTime.now().millisecondsSinceEpoch}.mp3';
+    
+    // Create a dummy file to prevent just_audio player errors
+    await File(tempPath).writeAsBytes(Uint8List.fromList([1, 2, 3])); 
+    
+    print('Mock speech generated for voice: $voiceId with text: "$text" at $tempPath');
+    return tempPath;
+  }
+}
+
+// =====================================================================
+//  MAIN APP SETUP
+// =====================================================================
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Supabase.initialize(
+    url: 'https://qhlnfgtnqtepwuwbloai.supabase.co',
+    anonKey: 'sb_publishable_LcG-1o1_QckDNDI0KDbo5Q_7nDgZC4o',
+  );
+  runApp(const MyApp());
+}
+
+final supabase = Supabase.instance.client;
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Legacy Mobile',
+      theme: ThemeData(
+        primarySwatch: Colors.deepPurple,
+        useMaterial3: true,
+      ),
+      home: const MainScreen(),
+    );
+  }
+}
+
+// --- Navigation and Main Screen ---
+
+class MainScreen extends StatefulWidget {
+  const MainScreen({super.key});
+
+  @override
+  State<MainScreen> createState() => _MainScreenState();
+}
+
+class _MainScreenState extends State<MainScreen> {
+  int _selectedIndex = 0;
+
+  final List<Widget> _widgetOptions = <Widget>[
+    const StoryScreen(),
+    const AssetsScreen(), // Placeholder required
+    const AIScreen(),     // Placeholder required
+    const SettingsScreen(),// Placeholder required
+  ];
+
+  void _onItemTapped(int index) {
+    setState(() {
+      _selectedIndex = index;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Legacy Archive'),
+        backgroundColor: Colors.deepPurple,
+        foregroundColor: Colors.white,
+      ),
+      body: _widgetOptions.elementAt(_selectedIndex),
+      bottomNavigationBar: BottomNavigationBar(
+        items: const <BottomNavigationBarItem>[
+          BottomNavigationBarItem(
+            icon: Icon(Icons.book),
+            label: 'Story',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.folder),
+            label: 'Assets',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.smart_toy),
+            label: 'AI',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.settings),
+            label: 'Settings',
+          ),
+        ],
+        currentIndex: _selectedIndex,
+        selectedItemColor: Colors.deepPurple,
+        unselectedItemColor: Colors.grey,
+        onTap: _onItemTapped,
+      ),
+    );
+  }
+}
+
+// =====================================================================
+//  Placeholder Screens (Fixes "Couldn't find constructor" errors)
+// =====================================================================
+
+class AssetsScreen extends StatelessWidget {
+  const AssetsScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return const Center(child: Text('Assets Screen Placeholder'));
+  }
+}
+
+class AIScreen extends StatelessWidget {
+  const AIScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return const Center(child: Text('AI Screen Placeholder'));
+  }
+}
+
+class SettingsScreen extends StatelessWidget {
+  const SettingsScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return const Center(child: Text('Settings Screen Placeholder'));
+  }
+}
+
+// =====================================================================
+//  Story Screen
+// =====================================================================
+
+class StoryScreen extends StatelessWidget {
+  const StoryScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return SingleChildScrollView(
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Text(
+              'Your Life Story',
+              style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 10),
+            const Text('Tap below to capture a new moment.'),
+            const SizedBox(height: 20),
+            
+            // Audio Capture Section
+            Card(
+              elevation: 4,
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  children: [
+                    const Text(
+                      'Record Your Voice',
+                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.deepPurple),
+                    ),
+                    const SizedBox(height: 10),
+                    const Text('Share a memory or thought.'),
+                    const SizedBox(height: 10),
+                    AudioRecordAndPlaybackWidget(),
+                  ],
+                ),
+              ),
+            ),
+
+            const SizedBox(height: 20),
+
+            // Text Capture Section
+            Card(
+              elevation: 4,
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  children: [
+                    const Text(
+                      'Write a Memory',
+                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.deepPurple),
+                    ),
+                    const SizedBox(height: 10),
+                    const TextField(
+                      maxLines: 5,
+                      decoration: InputDecoration(
+                        hintText: 'What happened today?',
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.all(Radius.circular(8)),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    ElevatedButton.icon(
+                      onPressed: () {
+                        // Future text saving logic
+                      },
+                      icon: const Icon(Icons.save),
+                      label: const Text('Save Text'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// =====================================================================
+//  Audio Recording and Playback Widget (with Transcription and Upload)
+// =====================================================================
+
+class AudioRecordAndPlaybackWidget extends StatefulWidget {
+  @override
+  _AudioRecordAndPlaybackWidgetState createState() =>
+      _AudioRecordAndPlaybackWidgetState();
+}
+
+class _AudioRecordAndPlaybackWidgetState
+    extends State<AudioRecordAndPlaybackWidget> {
+  final FlutterSoundRecorder _recorder = FlutterSoundRecorder();
+  final FlutterSoundPlayer _player = FlutterSoundPlayer();
+  bool _isRecording = false;
+  String? _audioPath;
+  bool _isRecorderInitialized = false;
+  bool _isPlayerInitialized = false;
+  
+  // New State variables for transcription
+  String? _transcriptionResult;
+  bool _isTranscribing = false;
+
+  // Upload state
+  bool _isUploading = false;
+  String? _uploadedUrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _initAudio();
+  }
+
+  Future<void> _initAudio() async {
+    try {
+      final mic = await Permission.microphone.request();
+      if (mic != PermissionStatus.granted) {
+        setState(() => _error = 'Mic permission required');
+        return;
+      }
+
+      await _recorder.openRecorder();
+      await _player.openPlayer();
+
+      setState(() {
+        _isRecorderInitialized = true;
+        _isPlayerInitialized = true;
+      });
+    } catch (e) {
+      setState(() => _error = 'Init failed: $e');
+    }
+  }
+
+  String? _error;
+
+  @override
+  void dispose() {
+    _recorder.closeRecorder();
+    _player.closePlayer();
+    super.dispose();
+  }
+
+  Future<void> _startRecording() async {
+    final dir = await getTemporaryDirectory();
+    _audioPath = '${dir.path}/recording_${DateTime.now().millisecondsSinceEpoch}.aac';
+    await _recorder.startRecorder(toFile: _audioPath, codec: Codec.aacADTS);
+    setState(() => _isRecording = true);
+  }
+
+  Future<void> _stopRecording() async {
+    await _recorder.stopRecorder();
+    setState(() => _isRecording = false);
+  }
+
+  Future<void> _startPlayback() async {
+    if (_audioPath == null) return;
+    await _player.startPlayer(fromURI: _audioPath, codec: Codec.aacADTS);
+  }
+
+  Future<void> _stopPlayback() async {
+    await _player.stopPlayer();
+  }
+
+  Future<void> _transcribeAudio() async {
+    if (_audioPath == null || _isTranscribing) return;
+
+    setState(() {
+      _isTranscribing = true;
+      _transcriptionResult = 'Transcribing...';
+    });
+
+    String transcription = '';
+    try {
+      final speechApi = await _getSpeechApi();
+
+      final audioFile = File(_audioPath!);
+      final audioBytes = await audioFile.readAsBytes();
+      final base64Audio = base64Encode(audioBytes);
+
+      final request = speech.RecognizeRequest(
+        audio: speech.RecognitionAudio(content: base64Audio),
+        config: speech.RecognitionConfig(
+          encoding: 'MP3',  // ← Your working "lie"
+          sampleRateHertz: 48000,
+          languageCode: 'en-US',
+          enableAutomaticPunctuation: true,
+        ),
+      );
+
+      final response = await speechApi.speech.recognize(request);
+
+      if (response.results?.isNotEmpty ?? false) {
+        transcription = response.results!
+            .map((r) => r.alternatives?.first.transcript ?? '')
+            .join(' ');
+      } else {
+        transcription = 'No speech detected';
+      }
+
+      setState(() {
+        _transcriptionResult = transcription;
+      });
+    } catch (e) {
+      print('TRANSCRIPTION ERROR: $e');
+      setState(() {
+        _transcriptionResult = 'Error: $e';
+      });
+    } finally {
+      setState(() => _isTranscribing = false);
+    }
+  }
+
+  Future<void> _uploadRecording() async {
+    if (_audioPath == null) return;
+
+    setState(() => _isUploading = true);
+    final file = File(_audioPath!);
+    final userId = supabase.auth.currentUser?.id ?? 'anon';
+    final fileName = 'voice/$userId/${file.path.split('/').last}';
+
+    try {
+      await supabase.storage
+          .from('legacy_audio')
+          .upload(
+            fileName,
+            file,
+            fileOptions: const FileOptions(
+              cacheControl: '3600',
+              upsert: false,
+              contentType: 'audio/aac',
+            ),
+          );
+
+      _uploadedUrl = supabase.storage
+          .from('legacy_audio')
+          .getPublicUrl(fileName);
+
+      print('Upload successful: $_uploadedUrl');
+      setState(() {});
+    } on StorageException catch (e) {
+      print('Storage Error: ${e.message}');
+    } catch (e) {
+      print('Unknown Upload Error: $e');
+    } finally {
+      setState(() => _isUploading = false);
+    }
+  }
+
+  Widget _buildRecorderUI() {
+    if (_error != null) {
+      return Column(
+        children: [
+          const Icon(Icons.error, color: Colors.red),
+          Text(_error!, style: const TextStyle(color: Colors.red)),
+          ElevatedButton(
+            onPressed: () {
+              setState(() => _error = null);
+              _initAudio();
+            },
+            child: const Text('Retry'),
+          ),
+        ],
+      );
+    }
+
+    if (!_isRecorderInitialized || !_isPlayerInitialized) {
+      return const Column(
+        children: [
+          CircularProgressIndicator(),
+          SizedBox(height: 8),
+          Text('Initializing audio...'),
+        ],
+      );
+    }
+
+    if (_isRecording) {
+      return ElevatedButton.icon(
+        onPressed: _stopRecording,
+        icon: const Icon(Icons.stop),
+        label: const Text('Stop Recording'),
+        style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+      );
+    } else if (_audioPath != null) {
+      final isPlaying = _player.isPlaying;
+
+      return Column(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceAround,
+            children: [
+              ElevatedButton.icon(
+                onPressed: isPlaying ? _stopPlayback : _startPlayback,
+                icon: Icon(isPlaying ? Icons.pause : Icons.play_arrow),
+                label: Text(isPlaying ? 'Pause' : 'Play'),
+                style: ElevatedButton.styleFrom(backgroundColor: isPlaying ? Colors.orange : Colors.green),
+              ),
+              ElevatedButton.icon(
+                onPressed: _isTranscribing ? null : _transcribeAudio,
+                icon: _isTranscribing
+                    ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                    : const Icon(Icons.translate),
+                label: Text(_isTranscribing ? 'Transcribing...' : 'Transcribe'),
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.blue),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          ElevatedButton.icon(
+            onPressed: _isUploading ? null : _uploadRecording,
+            icon: _isUploading
+                ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                : const Icon(Icons.cloud_upload),
+            label: Text(_isUploading ? 'Uploading...' : (_uploadedUrl != null ? 'Uploaded!' : 'Upload Recording')),
+            style: ElevatedButton.styleFrom(backgroundColor: _uploadedUrl != null ? Colors.grey : Colors.deepPurple),
+          ),
+          if (_transcriptionResult != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 10.0),
+              child: Text('Transcription: $_transcriptionResult', style: const TextStyle(fontStyle: FontStyle.italic)),
+            ),
+          const SizedBox(height: 10),
+          ElevatedButton.icon(
+            onPressed: _startRecording,
+            icon: const Icon(Icons.mic),
+            label: const Text('Record New'),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.deepPurple),
+          ),
+          ElevatedButton.icon(
+            onPressed: _isTraining ? null : _trainAIVoice,
+            icon: _isTraining
+                ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                : const Icon(Icons.record_voice_over),
+            label: Text(_isTraining ? 'Training...' : 'Train AI Voice'),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.purple),
+          ),
+          // ADDED THE SPEAK-AS-AI BUTTON HERE (FIX: Was misplaced code)
+          const SizedBox(height: 10), 
+          ElevatedButton.icon(
+            onPressed: () async {
+              // Replace with your saved voiceId (or a placeholder for demo)
+              const voiceId = 'YOUR_VOICE_ID'; // <-- put the ID you got from training here
+              final path = await ElevenLabsService.generateSpeech(
+                voiceId,
+                "Hello from my AI voice",
+              );
+              if (path != null) {
+                // Play the generated file (just_audio example)
+                final player = AudioPlayer();
+                await player.setFilePath(path);
+                await player.play();
+              }
+            },
+            icon: const Icon(Icons.volume_up),
+            label: const Text('Speak as AI'),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.indigo),
+          ),
+        ],
+      );
+    } else {
+      return ElevatedButton.icon(
+        onPressed: _startRecording,
+        icon: const Icon(Icons.mic),
+        label: const Text('Start Recording'),
+        style: ElevatedButton.styleFrom(backgroundColor: Colors.deepPurple),
+      );
+    }
+  }
+
+  // -------------------------------------------------
+//  AI TRAINING SECTION
+// -------------------------------------------------
+
+// State for training
+bool _isTraining = false;
+List<String> _trainingFiles = [];
+
+// -------------------------------------------------
+//  Train the custom voice on ElevenLabs
+// -------------------------------------------------
+
+  Future<void> _trainAIVoice() async {
+    if (_audioPath == null) return;
+
+    setState(() {
+      _isTraining = true;
+      _trainingFiles.add(_audioPath!);          // collect this recording
+    });
+
+    final voiceId = await ElevenLabsService.createVoice(
+      'My Legacy Voice',
+      _trainingFiles,
+    );
+
+    if (voiceId != null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('AI Voice Trained! ID: $voiceId')),
+        );
+      }
+      // optional: store voiceId for later use
+      // await SharedPreferences.getInstance().then((prefs) => prefs.setString('voice_id', voiceId));
+    } else {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Training failed')),
+        );
+      }
+    }
+
+    setState(() => _isTraining = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _buildRecorderUI();
+  }
+}
+// END OF FILE
