@@ -19,7 +19,7 @@ Future<void> main() async {
   //   Your Cloud Function uses the SECRET key (server-side) already.
   await Supabase.initialize(
     url: 'https://qhlnfgtnqtepwuwbloai.supabase.co', // your project URL
-    anonKey: 'sb_secret_4oV8-iLDKprUMP4un49Hnw_FHVNe3TG',
+    anonKey: 'sb_publishable_LcG-1o1_QckDNDI0KDbo5Q_7nDgZC4o',
   );
 
   runApp(const LegacyMobileApp());

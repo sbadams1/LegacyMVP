@@ -45,9 +45,18 @@ serve(async (req: Request): Promise<Response> => {
   }
 
   try {
-    const body = (await req.json()) as BrainRequest;
+    // Parse request body
+    const rawBody = await req.json();
+    console.log("ai-brain incoming body:", rawBody);
 
-    if (!body.user_id || !body.message) {
+    const body = rawBody as Partial<BrainRequest>;
+    const user_id = body.user_id ?? null;
+    const message =
+      typeof body.message === "string" ? body.message : "";
+    const parent_id = body.parent_id ?? null;
+
+    // Minimal validation – user_id + non-empty message required
+    if (!user_id || !message.trim()) {
       return jsonResponse(
         { error: "user_id and message are required" },
         400,
@@ -66,9 +75,9 @@ serve(async (req: Request): Promise<Response> => {
     // --- Call Gemini ---
     const geminiRes = await fetch(
       "https://generativelanguage.googleapis.com/v1beta/" +
-      MODEL +
-      ":generateContent?key=" +
-      apiKey,
+        MODEL +
+        ":generateContent?key=" +
+        apiKey,
       {
         method: "POST",
         headers: {
@@ -78,7 +87,7 @@ serve(async (req: Request): Promise<Response> => {
           contents: [
             {
               role: "user",
-              parts: [{ text: body.message }],
+              parts: [{ text: message }],
             },
           ],
         }),
@@ -107,7 +116,9 @@ serve(async (req: Request): Promise<Response> => {
       const parts = geminiJson?.candidates?.[0]?.content?.parts;
       if (Array.isArray(parts)) {
         const combined = parts
-          .map((p: any) => (typeof p.text === "string" ? p.text : ""))
+          .map((p: any) =>
+            typeof p.text === "string" ? p.text : ""
+          )
           .join("\n")
           .trim();
         if (combined) {
@@ -120,8 +131,8 @@ serve(async (req: Request): Promise<Response> => {
 
     const responsePayload: BrainResponse = {
       reply,
-      user_id: body.user_id,
-      parent_id: body.parent_id ?? null,
+      user_id,
+      parent_id,
       created_at: new Date().toISOString(),
     };
 

@@ -358,7 +358,7 @@ s3_secret_key = "env(S3_SECRET_KEY)"
 
 [functions.grandpa-chat]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/grandpa-chat/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
@@ -367,9 +367,9 @@ entrypoint = "./functions/grandpa-chat/index.ts"
 # For example, if you want to serve static HTML pages in your function:
 # static_files = [ "./functions/grandpa-chat/*.html" ]
 
-[functions.legacy-ai]
+[functions.legacymvp]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/legacy-ai/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
@@ -380,11 +380,12 @@ entrypoint = "./functions/legacy-ai/index.ts"
 
 [functions.ai-brain]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/ai-brain/deno.json"
-# Uncomment to specify a custom file path to the entrypoint.
-# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
 entrypoint = "./functions/ai-brain/index.ts"
-# Specifies static files to be bundled with the function. Supports glob patterns.
-# For example, if you want to serve static HTML pages in your function:
 # static_files = [ "./functions/ai-brain/*.html" ]
+
+[functions.speech-to-text]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/speech-to-text/index.ts"
