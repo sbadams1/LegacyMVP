@@ -1,178 +1,309 @@
 // supabase/functions/media-ingest/index.ts
 //
-// Analyze an uploaded photo or short video using Gemini 2.0 Flash Exp,
-// returning a warm, concise description + follow-up question(s).
-//
-// We currently only call this from the app for IMAGES,
-// but the video branch is kept for future use.
-//
-// Request JSON:
-// {
-//   "user_id": "uuid",
-//   "media_base64": "....",
-//   "mime_type": "image/jpeg" | "video/mp4",
-//   "media_type": "image" | "video",
-//   "file_name": "optional string"
-// }
-//
-// Response JSON:
-// {
-//   "status": "ok",
-//   "description": "...",
-//   "model": "models/gemini-2.0-flash-exp"
-// }
+// Uses Gemini 2.0 Flash Experimental to describe uploaded media (image or video)
+// for the Legacy app. Returns a single "caption" string that is meant to be
+// shown as one unified AI chat bubble in the mobile app.
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 
-serve(async (req: Request): Promise<Response> => {
-  // --- CORS ---
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+// Prefer unified GOOGLE_API_KEY, fall back to GEMINI_API_KEY
+const GOOGLE_API_KEY =
+  Deno.env.get("GOOGLE_API_KEY") ?? Deno.env.get("GEMINI_API_KEY") ?? null;
+
+// Extract caption text from Gemini response
+function extractCaption(gJson: any): string {
+  try {
+    const candidates = gJson?.candidates;
+    if (!Array.isArray(candidates) || candidates.length === 0) return "";
+
+    const parts = candidates[0]?.content?.parts;
+    if (!Array.isArray(parts)) return "";
+
+    const textParts = parts
+      .map((p: any) => (typeof p?.text === "string" ? p.text : ""))
+      .filter((t: string) => t.trim().length > 0);
+
+    return textParts.join("\n").trim();
+  } catch {
+    return "";
+  }
+}
+
+serve(async (req) => {
+  // CORS preflight
   if (req.method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers":
-          "authorization, x-client-info, apikey, content-type",
-      },
-    });
+    return new Response("ok", { headers: corsHeaders });
   }
 
   if (req.method !== "POST") {
-    return jsonResponse({ error: "Method not allowed" }, 405);
+    return new Response("Method not allowed", {
+      status: 405,
+      headers: corsHeaders,
+    });
   }
 
-  // --- Parse incoming JSON ---
-  let payload: any;
   try {
-    payload = await req.json();
-  } catch {
-    return jsonResponse({ error: "Invalid JSON" }, 400);
-  }
+    if (!GOOGLE_API_KEY) {
+      console.error("media-ingest: GOOGLE_API_KEY / GEMINI_API_KEY not set");
+      return new Response(
+        JSON.stringify({ error: "server_not_configured" }),
+        {
+          status: 500,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        },
+      );
+    }
 
-  const { user_id, media_base64, mime_type, media_type, file_name } = payload;
+    // Be defensive about body shape
+    const raw = await req.json().catch(() => ({}));
+    const body: any = raw?.body ?? raw?.data ?? raw ?? {};
 
-  if (!user_id || !media_base64 || !mime_type || !media_type) {
-    return jsonResponse(
-      {
-        error:
-          "user_id, media_base64, mime_type, and media_type are required",
-      },
-      400,
-    );
-  }
+    try {
+      console.log("📸 media-ingest body keys:", Object.keys(body));
+    } catch {
+      console.log("📸 media-ingest body is not a plain object");
+    }
 
-  const apiKey = Deno.env.get("GEMINI_API_KEY");
-  if (!apiKey) {
-    return jsonResponse(
-      { error: "GEMINI_API_KEY is not configured" },
-      500,
-    );
-  }
+    const userId: string | undefined =
+      body?.user_id ??
+      body?.userId ??
+      undefined;
 
-  const model =
-    Deno.env.get("GEMINI_MODEL") ?? "models/gemini-2.0-flash-exp";
+    const mediaTypeRaw: string | undefined =
+      body?.media_type ??
+      body?.mediaType ??
+      undefined;
 
-  // ------------------------------------------------------------------
-  // 🌟 WARM, BUT CONCISE PROMPTS (image vs video)
-  // ------------------------------------------------------------------
-  const isVideo = media_type === "video";
+    const imageUrl: string | undefined =
+      body?.image_url ??
+      body?.imageUrl ??
+      body?.photo_url ??
+      body?.photoUrl ??
+      undefined;
 
-  const prompt = isVideo
-    ? [
-        // We’re not calling this from the app yet, but keep it ready.
-        "You are helping someone preserve a short life moment from a video.",
-        "Describe ONLY what you can visually observe.",
-        "Write 2–3 short sentences (max 50 words total) noticing concrete details like expressions, movement, and mood.",
-        "Use warm, human language, but do NOT guess relationships, names, or backstory.",
-        "Then ask ONE short follow-up question inviting them to share why this clip matters to them.",
-        'Example: "What was happening around this moment that makes it meaningful to you?"',
-        "Do NOT mention that you are an AI. Do NOT talk about 'watching' the video.",
-      ].join(" ")
-    : [
-        "You are helping someone preserve a meaningful moment from a photo.",
-        "Describe ONLY what you can directly see.",
-        "Write 1–2 short sentences (max 40 words) that notice a few key visual details and the overall mood.",
-        "Use warm, natural language, but do NOT guess relationships, names, or backstory.",
-        "Then ask ONE gentle follow-up question that invites them to tell the story or meaning behind this moment.",
-        'Example: "What was happening in this moment, and why is it important to you?"',
-        "Do NOT mention that you are an AI. Do NOT talk about 'looking at' the image.",
-      ].join(" ");
+    const videoUrl: string | undefined =
+      body?.video_url ??
+      body?.videoUrl ??
+      undefined;
 
-  const requestBody = {
-    contents: [
+    const publicUrl: string | undefined =
+      body?.public_url ??
+      body?.publicUrl ??
+      body?.url ??
+      body?.media_url ??
+      body?.mediaUrl ??
+      undefined;
+
+    const mediaBase64: string | undefined =
+      body?.media_base64 ??
+      body?.base64 ??
+      body?.base64_snippet ??
+      undefined;
+
+    const mimeTypeBody: string | undefined =
+      body?.mime_type ??
+      body?.mimeType ??
+      undefined;
+
+    if (!userId) {
+      return new Response(
+        JSON.stringify({
+          error: "user_id_required",
+          message: "user_id is required in body",
+          body_keys: Object.keys(body || {}),
+        }),
+        {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        },
+      );
+    }
+
+    // Decide media type
+    let mediaType: "image" | "video" = "image";
+    if (mediaTypeRaw === "image" || mediaTypeRaw === "video") {
+      mediaType = mediaTypeRaw;
+    } else if (!mediaTypeRaw && videoUrl && !imageUrl) {
+      mediaType = "video";
+    }
+
+    const mediaUrl =
+      imageUrl ??
+      videoUrl ??
+      publicUrl ??
+      null;
+
+    // Need *some* actual media
+    if (!mediaUrl && !mediaBase64) {
+      console.error("media-ingest: no media URL or base64 found in body");
+      return new Response(
+        JSON.stringify({
+          error: "no_media_found",
+          message:
+            "One of image_url, video_url, public_url, or media_base64/base64_snippet is required",
+          body_keys: Object.keys(body || {}),
+        }),
+        {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        },
+      );
+    }
+
+    const mimeType =
+      mimeTypeBody ??
+      (mediaType === "image" ? "image/jpeg" : "video/mp4");
+
+    console.log("📸 media-ingest called", {
+      user_id: userId,
+      media_type: mediaType,
+      hasUrl: !!mediaUrl,
+      hasBase64: !!mediaBase64,
+      mimeType,
+    });
+
+    // 🔹 SIMPLE PATH FOR VIDEO (no Gemini for now)
+    // You decided rich video understanding isn't worth the time tonight.
+    // So for videos we return a gentle, fixed caption in the desired style.
+    if (mediaType === "video") {
+      const caption =
+        "I see you captured a short video clip. When you have a moment, tell me what was happening and why this moment mattered to you.";
+
+      return new Response(
+        JSON.stringify({
+          caption,
+          media_type: mediaType,
+          model: "static-video-caption",
+        }),
+        {
+          status: 200,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        },
+      );
+    }
+
+    // 🔹 IMAGE PATH (Gemini)
+
+    // Prefer inline base64 (inlineData) whenever we have it.
+    // Only fall back to fileUri if there is *no* base64.
+    let mediaPart: any;
+    if (mediaBase64) {
+      console.log("📸 using inlineData (base64) for Gemini");
+      mediaPart = {
+        inlineData: {
+          data: mediaBase64 as string,
+          mimeType,
+        },
+      };
+    } else if (mediaUrl) {
+      console.log("📸 using fileData.fileUri for Gemini:", mediaUrl);
+      mediaPart = {
+        fileData: {
+          fileUri: mediaUrl,
+          mimeType,
+        },
+      };
+    } else {
+      console.error("media-ingest: reached no-media fallback for image");
+      return new Response(
+        JSON.stringify({
+          error: "no_media_for_gemini",
+        }),
+        {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        },
+      );
+    }
+
+    const promptText =
+      `You are helping someone build a personal memory archive.\n` +
+      `They just shared a PHOTO.\n\n` +
+      `Write ONE short paragraph (2–3 short sentences) that does BOTH of these things:\n` +
+      `1) Briefly describe what you see in the photo: the main subject, the general setting, and the overall mood.\n` +
+      `2) Then, in the same response, invite them to share more, with a gentle question like "Tell me about him", ` +
+      `"Tell me about her", "Tell me about that day", or "I'd love to hear the story behind this.".\n\n` +
+      `Guidelines:\n` +
+      `- Use warm, conversational language.\n` +
+      `- It's okay to start with "I see..." or "It looks like...".\n` +
+      `- Do NOT guess exact names, precise locations, ages, or private information.\n` +
+      `- Do NOT mention 'uploading' or refer to it as a file; just talk about the scene itself.\n`;
+
+    const contents: any[] = [
       {
         role: "user",
         parts: [
-          { text: prompt },
-          {
-            inlineData: {
-              mimeType: mime_type,
-              data: media_base64,
-            },
-          },
+          { text: promptText },
+          mediaPart,
         ],
       },
-    ],
-  };
+    ];
 
-  try {
-    const resp = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(requestBody),
-      },
-    );
+    const genReq = { contents };
 
-    const raw = await resp.text();
-    if (!resp.ok) {
-      return jsonResponse(
+    const genUrl =
+      "https://generativelanguage.googleapis.com/v1beta/models/" +
+      "gemini-2.0-flash-exp:generateContent" +
+      `?key=${GOOGLE_API_KEY}`;
+
+    const gRes = await fetch(genUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(genReq),
+    });
+
+    if (!gRes.ok) {
+      const errText = await gRes.text().catch(() => "");
+      console.error("media-ingest: Gemini error", gRes.status, errText);
+
+      return new Response(
+        JSON.stringify({
+          error: "gemini_api_error",
+          status: gRes.status,
+        }),
         {
-          error: "Gemini error",
-          status: resp.status,
-          body: raw,
+          status: 500,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
         },
-        500,
       );
     }
 
-    let parsed: any;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return jsonResponse(
-        { error: "Failed to parse Gemini response", raw },
-        500,
-      );
+    const gJson = await gRes.json();
+    const caption = extractCaption(gJson);
+
+    if (!caption) {
+      console.warn("media-ingest: No caption extracted from Gemini response");
     }
 
-    const parts = parsed?.candidates?.[0]?.content?.parts ?? [];
-    const description = parts
-      .map((p: any) => p.text ?? "")
-      .join("")
-      .trim();
-
-    return jsonResponse(
+    return new Response(
+      JSON.stringify({
+        caption,
+        media_type: mediaType,
+        model: "gemini-2.0-flash-exp",
+      }),
       {
-        status: "ok",
-        description,
-        model,
+        status: 200,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
       },
-      200,
     );
   } catch (err) {
-    return jsonResponse(
-      { error: "Server error", details: String(err) },
-      500,
+    console.error("media-ingest: unexpected error", err);
+    return new Response(
+      JSON.stringify({
+        error: "unexpected_server_error",
+        message: String(err),
+      }),
+      {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      },
     );
   }
 });
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-}

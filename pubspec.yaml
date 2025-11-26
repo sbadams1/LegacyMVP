@@ -9,6 +9,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  intl: ^0.18.0
+  device_info_plus: ^10.0.0   # or whatever version you’re using  
   
   # Core Services
   supabase_flutter: ^2.10.3
@@ -31,7 +33,7 @@ dependencies:
   just_audio: ^0.9.38
   # Fixed to version 5.0.0 to resolve the 'startStream' platform interface mismatch error.
   record: ^6.0.0 
-
+ 
   # Gemini/Google SDKs
   google_generative_ai: ^0.4.1 
   googleapis: ^14.0.0
@@ -44,3 +46,5 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/lesson_plans/json_plan.json

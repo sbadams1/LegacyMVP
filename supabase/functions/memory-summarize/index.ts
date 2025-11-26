@@ -6,6 +6,7 @@
 // - Calls Gemini to produce short_summary, full_summary, observations
 // - Upserts a single row per (user_id, conversation_id) in memory_summary
 // - Also updates a lifetime memory_profile row per user
+// - NEW: Updates coverage_map & coverage_timeline coverage tables per user
 //
 // Expects JSON body:
 //   {
@@ -44,6 +45,80 @@ if (!GEMINI_API_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
+
+const COVERAGE_SYSTEM_PROMPT = `
+You are an expert archivist analyzing a person's life stories.
+
+Your task:
+- Read the life-story entries provided.
+- Decide how well each chapter of their life is covered.
+- Return ONLY a single JSON object, no commentary, matching this TypeScript type:
+
+type CoverageBucket =
+  | "childhood"
+  | "adolescence"
+  | "education_early_identity"
+  | "young_adulthood"
+  | "career_purpose"
+  | "relationships_family"
+  | "beliefs_worldview_values"
+  | "health_lifestyle"
+  | "lessons_regrets_hard_wisdom"
+  | "hopes_dreams_legacy";
+
+type LifeStage =
+  | "childhood"
+  | "adolescence"
+  | "early_adulthood"
+  | "midlife"
+  | "later_life"
+  | "unspecified";
+
+type CoverageTimelineSlice = {
+  life_stage: LifeStage;
+  coverage_score: number; // 0-100
+  event_count: number;
+};
+
+type CoverageBucketSummary = {
+  bucket: CoverageBucket;
+  event_count: number;
+  text_count: number;
+  audio_count: number;
+  image_count: number;
+  video_count: number;
+  frequency_score: number; // 0-100
+  depth_score: number;     // 0-100
+  diversity_score: number; // 0-100
+  emotion_score: number;   // 0-100
+  insight_score: number;   // 0-100
+  overall_score: number;   // 0-100 combined coverage
+  last_contribution_at: string | null; // ISO timestamp in UTC, or null if unknown
+  timeline: CoverageTimelineSlice[];
+};
+
+type CoverageReport = {
+  user_id: string;
+  generated_at: string; // ISO timestamp in UTC
+  overall_coverage_score: number; // 0-100, average of overall_score across buckets
+  buckets: CoverageBucketSummary[];
+};
+
+Rules:
+- Map each entry to one or more buckets based on its main theme.
+- Estimate life_stage from context (age, dates, school, retirement, etc.). Use "unspecified" if unclear.
+- event_count is the number of entries that meaningfully contribute to that bucket.
+- *_count values are how many entries of each media type contributed.
+- frequency_score reflects how often this bucket appears relative to the others.
+- depth_score reflects narrative detail, nuance, and reflection.
+- diversity_score reflects how many different media types (text/audio/image/video) appear.
+- emotion_score reflects emotional intensity and variety.
+- insight_score reflects how much wisdom or meaning is expressed.
+- overall_score is your combined judgment of how well this bucket is covered.
+- coverage_score in timeline slices reflects coverage for that bucket within that life_stage only.
+
+Output JSON MUST be valid and parseable. Do not include comments, explanations, or markdown.
+`;
 
 // ---- Handler ----
 
@@ -533,7 +608,15 @@ serve(async (req: Request): Promise<Response> => {
       // Non-fatal
     }
 
-    // 8) Return conversation-level summary as function result
+    // 8) Update coverage map (best-effort, non-fatal)
+    try {
+      await updateCoverageForUser(userId);
+    } catch (err) {
+      console.error("Error while updating coverage map:", err);
+      // Non-fatal; main memory_summary result should still be returned.
+    }
+
+    // 9) Return conversation-level summary as function result
     return jsonResponse(
       {
         short_summary: savedSummaryRow.short_summary,
@@ -552,6 +635,199 @@ serve(async (req: Request): Promise<Response> => {
     );
   }
 });
+
+async function updateCoverageForUser(userId: string): Promise<void> {
+  if (!GEMINI_API_KEY) {
+    console.warn("Skipping coverage update: GEMINI_API_KEY is not configured.");
+    return;
+  }
+
+  // 1) Load recent raw memories for this user (coverage is user-wide, not per-conversation)
+  const { data: rawRows, error: rawError } = await supabase
+    .from("memory_raw")
+    .select("id, created_at, media_type, source, content")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: true })
+    .limit(300);
+
+  if (rawError) {
+    console.error("Error reading memory_raw for coverage:", rawError);
+    return;
+  }
+
+  if (!rawRows || rawRows.length === 0) {
+    console.log("No memory_raw rows found for coverage.");
+    return;
+  }
+
+  const entriesText = buildCoverageEntriesText(rawRows);
+  const nowIso = new Date().toISOString();
+
+  const userPrompt = `
+Analyze the following life-story entries for coverage for user_id=${userId}.
+
+Each ENTRY has:
+- id
+- created_at (UTC)
+- media_type ("text" | "audio" | "image" | "video")
+- source (who/what produced it)
+- content (raw text or transcript)
+
+ENTRIES:
+${entriesText}
+`.trim();
+
+  const prompt = `${COVERAGE_SYSTEM_PROMPT}
+
+${userPrompt}`;
+
+  const geminiUrl =
+    `https://generativelanguage.googleapis.com/v1beta/${MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+
+  const coverageReqBody = {
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: prompt }],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.35,
+      maxOutputTokens: 768,
+      responseMimeType: "application/json",
+    },
+  };
+
+  const coverageRes = await fetch(geminiUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(coverageReqBody),
+  });
+
+  const coverageBodyText = await coverageRes.text();
+  let coverageHttpJson: any;
+
+  try {
+    coverageHttpJson = JSON.parse(coverageBodyText);
+  } catch (_err) {
+    console.error("Failed to parse Gemini coverage HTTP body as JSON:", coverageBodyText);
+    return;
+  }
+
+  if (!coverageRes.ok) {
+    console.error(
+      "Gemini coverage HTTP error:",
+      coverageRes.status,
+      coverageHttpJson,
+    );
+    return;
+  }
+
+  let coverageReport: any;
+
+  try {
+    const textFromModel =
+      coverageHttpJson?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    coverageReport = JSON.parse(textFromModel);
+  } catch (err) {
+    console.error(
+      "Failed to parse model's coverage JSON payload:",
+      err,
+      coverageHttpJson,
+    );
+    return;
+  }
+
+  if (!coverageReport || !coverageReport.buckets) {
+    console.error("Coverage report missing buckets:", coverageReport);
+    return;
+  }
+
+  // Ensure user_id and generated_at exist in the report; fill if missing.
+  coverageReport.user_id = coverageReport.user_id || userId;
+  coverageReport.generated_at = coverageReport.generated_at || nowIso;
+
+  const buckets = coverageReport.buckets as any[];
+
+  for (const b of buckets) {
+    const bucket = b.bucket;
+    if (!bucket) continue;
+
+    // Upsert into coverage_map
+    const { error: cmError } = await supabase
+      .from("coverage_map")
+      .upsert(
+        {
+          user_id: userId,
+          bucket,
+          event_count: b.event_count ?? 0,
+          text_count: b.text_count ?? 0,
+          audio_count: b.audio_count ?? 0,
+          image_count: b.image_count ?? 0,
+          video_count: b.video_count ?? 0,
+          frequency_score: b.frequency_score ?? 0,
+          depth_score: b.depth_score ?? 0,
+          diversity_score: b.diversity_score ?? 0,
+          emotion_score: b.emotion_score ?? 0,
+          insight_score: b.insight_score ?? 0,
+          overall_score: b.overall_score ?? 0,
+          last_contribution_at: b.last_contribution_at ?? null,
+        },
+        { onConflict: "user_id,bucket" },
+      );
+
+    if (cmError) {
+      console.error("Error upserting coverage_map:", cmError);
+    }
+
+    // Upsert timeline slices if present
+    if (Array.isArray(b.timeline)) {
+      for (const t of b.timeline) {
+        if (!t.life_stage) continue;
+
+        const { error: ctError } = await supabase
+          .from("coverage_timeline")
+          .upsert(
+            {
+              user_id: userId,
+              bucket,
+              life_stage: t.life_stage,
+              coverage_score: t.coverage_score ?? 0,
+              event_count: t.event_count ?? 0,
+            },
+            { onConflict: "user_id,bucket,life_stage" },
+          );
+
+        if (ctError) {
+          console.error("Error upserting coverage_timeline:", ctError);
+        }
+      }
+    }
+  }
+
+  console.log("Coverage map updated for user:", userId);
+}
+
+function buildCoverageEntriesText(rawRows: any[]): string {
+  return rawRows
+    .map((row: any, index: number) => {
+      const id = row.id;
+      const time = row.created_at ?? "";
+      const mediaType = row.media_type ?? "text";
+      const src = row.source ?? "unknown";
+      const content = (row.content ?? "").toString().trim();
+      return [
+        `ENTRY ${index + 1}`,
+        `id: ${id}`,
+        `created_at: ${time}`,
+        `media_type: ${mediaType}`,
+        `source: ${src}`,
+        `content: ${content}`,
+        "",
+      ].join("\n");
+    })
+    .join("\n");
+}
 
 // ---- Helpers ----
 

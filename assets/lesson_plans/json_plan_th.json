@@ -1,0 +1,86 @@
+{
+  "language_code": "th-TH",
+  "skill_code": "S1_GREETINGS",
+  "lesson_code": "S1_L1",
+  "learner_level": "beginner",
+  "title": "Greetings and polite endings",
+  "description": "Learn how to say hello politely and introduce yourself in simple Thai.",
+  "phases": [
+    {
+      "id": 1,
+      "label": "Context setup",
+      "system_goal": "Explain that the learner will practice greeting someone politely in Thai, using their native language for explanations.",
+      "steps": [
+        {
+          "id": "p1_intro",
+          "type": "ai_message",
+          "language": "native",
+          "tts_channel": "native",
+          "ai_instruction": "Describe a simple scene where the learner meets someone for the first time (for example, meeting a neighbor). Explain in the learner's native language what you will practice: simple Thai greetings and polite endings."
+        },
+        {
+          "id": "p1_check",
+          "type": "ai_message",
+          "language": "native",
+          "tts_channel": "native",
+          "ai_instruction": "Ask a single question (in the learner's native language) such as: 'Does this situation feel realistic for you? If not, tell me a situation where you might say hello in Thai.'"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "label": "Guided instructions",
+      "system_goal": "Teach 3–4 core greeting phrases and polite endings (krub/ka) in Thai.",
+      "steps": [
+        {
+          "id": "p2_teach_phrases",
+          "type": "ai_message",
+          "language": "mixed",
+          "tts_channel": "target",
+          "ai_instruction": "Teach the phrases: 1) 'สวัสดีครับ/ค่ะ' (hello), 2) 'ผมชื่อ…' or 'ฉันชื่อ…' (my name is...), 3) 'ยินดีที่ได้รู้จักครับ/ค่ะ' (nice to meet you). Explain each briefly in the learner's native language. Choose the correct polite ending (ครับ or ค่ะ) based on learner_gender and do NOT say both. Avoid reading or pronouncing symbols like '*' or '/' out loud."
+        },
+        {
+          "id": "p2_practice_one_by_one",
+          "type": "user_practice",
+          "expected_user_response": "short_target_phrases",
+          "ai_instruction": "Ask the learner to repeat one phrase at a time in Thai (either by typing or speaking). Respond with a corrected Thai version if needed and a single short tip."
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "label": "Interactive role play",
+      "system_goal": "Do a tiny role play greeting exchange in Thai only.",
+      "steps": [
+        {
+          "id": "p3_roleplay_start",
+          "type": "ai_message",
+          "language": "target",
+          "tts_channel": "target",
+          "ai_instruction": "Start a role-play as someone the learner is meeting. Say hello in Thai and ask their name. Keep your sentences short and simple. Wait for the learner to answer in Thai, then respond with gentle correction and encouragement."
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "label": "Review",
+      "system_goal": "Summarize key phrases and encourage the learner.",
+      "steps": [
+        {
+          "id": "p4_summary",
+          "type": "ai_message",
+          "language": "mixed",
+          "tts_channel": "native",
+          "ai_instruction": "Repeat the key Thai phrases learned in this lesson, then explain in the learner's native language when to use them. Give one suggestion for practice (for example, 'try saying hello in Thai to a friend tomorrow')."
+        }
+      ]
+    }
+  ],
+  "vocabulary_refs": [
+    { "skill_vocab_group": "S1_L1_CORE" }
+  ],
+  "constraints": {
+    "max_new_words": 4,
+    "max_review_words": 2
+  }
+}

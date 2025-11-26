@@ -1,0 +1,85 @@
+{
+  "language_code": "th-TH",
+  "skill_code": "S1_GREETINGS",
+  "lesson_code": "S1_L1",
+  "learner_level": "beginner",
+  "title": "Basic greetings and politeness",
+  "phases": [
+    {
+      "id": 1,
+      "label": "Context setup",
+      "system_goal": "Introduce a very simple real-world scenario using the learner's native language, then move into the target language for a short greeting.",
+      "steps": [
+        {
+          "id": "p1_intro",
+          "type": "ai_message",
+          "language": "native",
+          "tts_channel": "native",
+          "ai_instruction": "Briefly set the scene: for example, the learner is meeting someone in a cafe. Explain in the learner's native language what they will practice: simple greetings and politeness in the target language."
+        },
+        {
+          "id": "p1_check",
+          "type": "ai_message",
+          "language": "native",
+          "tts_channel": "native",
+          "ai_instruction": "Ask a single, easy comprehension question in the learner's native language to confirm they understand the scenario. Keep it yes/no or multiple choice."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "label": "Guided instructions",
+      "system_goal": "Teach 3–4 key greeting phrases and politeness formulas, with meaning and pronunciation.",
+      "steps": [
+        {
+          "id": "p2_teach_phrases",
+          "type": "ai_message",
+          "language": "mixed",
+          "tts_channel": "target",
+          "ai_instruction": "Introduce 3–4 greeting phrases in the target language. For each: 1) say the phrase in the target language, 2) show it with native script, 3) give a simple one-line explanation in the learner's native language, 4) suggest that the learner repeat it out loud."
+        },
+        {
+          "id": "p2_mini_drill",
+          "type": "user_practice",
+          "expected_user_response": "short_target_phrases",
+          "ai_instruction": "Ask the learner to write or say one of the new phrases and respond with gentle correction and a natural version. Do NOT be overly academic."
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "label": "Interactive role play",
+      "system_goal": "Simulate a short greeting exchange in the target language only.",
+      "steps": [
+        {
+          "id": "p3_roleplay_start",
+          "type": "ai_message",
+          "language": "target",
+          "tts_channel": "target",
+          "ai_instruction": "Start a very short role-play in the target language. You play the other person (e.g., barista or friend), and the learner says greetings and polite phrases."
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "label": "Review",
+      "system_goal": "Summarize key phrases and give one or two tips.",
+      "steps": [
+        {
+          "id": "p4_summary",
+          "type": "ai_message",
+          "language": "mixed",
+          "tts_channel": "native",
+          "ai_instruction": "Briefly summarize what the learner practiced (in the target language and with short explanations in the learner's native language). End with one encouragement and suggest the next skill or review task."
+        }
+      ]
+    }
+  ],
+  "vocabulary_refs": [
+    { "skill_vocab_group": "S1_L1_CORE" }
+  ],
+  "constraints": {
+    "max_new_words": 4,
+    "max_review_words": 2
+  }
+}

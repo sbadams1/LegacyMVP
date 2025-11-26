@@ -1,0 +1,847 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:typed_data';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:flutter_sound/flutter_sound.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:chewie/chewie.dart';
+import 'package:video_player/video_player.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+import 'package:google_generative_ai/google_generative_ai.dart';
+import 'package:googleapis/speech/v1.dart' as speech;
+import 'package:googleapis_auth/auth_io.dart';
+import 'package:just_audio/just_audio.dart';
+import 'dart:convert';
+import 'package:http/http.dart' as http; 
+
+const String geminiApiKey = 'AIzaSyA1v_sIMfmXpDvNkHnsnN4R808oI40Acio';
+const String _serviceAccountAssetPath = 'assets/google_speech.json';
+const List<String> _speechScopes = [speech.SpeechApi.cloudPlatformScope];
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Supabase.initialize(
+    url: 'https://qhlnfgtnqtepwuwbloai.supabase.co',
+    anonKey:
+        'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFobG5mZ3RucXRlcHd1d2Jsb2FpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjI0ODI4OTcsImV4cCI6MjA3ODA1ODg5N30.7cFtWoXcCWIYv9d7j0WY3Kc3ehYv_NRGxcdDih0lyoU',
+  );
+  runApp(const LegacyApp());
+}
+
+class LegacyApp extends StatelessWidget {
+  const LegacyApp({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Legacy Immortal',
+      theme: ThemeData(
+        // Use a more modern color scheme with DeepPurple as the primary color
+        colorScheme: ColorScheme.fromSwatch(primarySwatch: Colors.deepPurple).copyWith(
+          secondary: Colors.purpleAccent,
+        ),
+        useMaterial3: true,
+        fontFamily: 'Roboto',
+      ),
+      home: const AuthScreen(),
+      debugShowCheckedModeBanner: false,
+    );
+  }
+}
+
+// AUTH SCREEN – ICONS SHOW
+class AuthScreen extends StatefulWidget {
+  const AuthScreen({super.key});
+  @override
+  State<AuthScreen> createState() => _AuthScreenState();
+}
+
+class _AuthScreenState extends State<AuthScreen> {
+  final supabase = Supabase.instance.client;
+  final emailController = TextEditingController();
+  final passwordController = TextEditingController();
+  bool isLogin = true;
+  bool showPassword = false;
+
+  Future<void> _auth() async {
+    try {
+      if (isLogin) {
+        await supabase.auth.signInWithPassword(
+          email: emailController.text.trim(),
+          password: passwordController.text,
+        );
+      } else {
+        await supabase.auth.signUp(
+          email: emailController.text.trim(),
+          password: passwordController.text,
+        );
+        // Automatically sign in after sign up
+        await supabase.auth.signInWithPassword(
+          email: emailController.text.trim(),
+          password: passwordController.text,
+        );
+      }
+      if (mounted) {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(builder: (_) => const HomeScreen()),
+        );
+      }
+    } catch (e) {
+      _showSnackBar('Auth failed: $e');
+    }
+  }
+
+  void _showSnackBar(String message) {
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(message),
+          duration: const Duration(seconds: 2),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Colors.deepPurple, Colors.purpleAccent],
+          ),
+        ),
+        child: SafeArea(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+            child: Column(
+              children: [
+                const Icon(Icons.memory, size: 70, color: Colors.white),
+                const SizedBox(height: 12),
+                const Text(
+                  'Legacy Immortal',
+                  style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.white),
+                ),
+                const SizedBox(height: 6),
+                const Text(
+                  'Preserve your voice, photos, and videos forever.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 15, color: Colors.white70),
+                ),
+                const SizedBox(height: 30),
+                Card(
+                  elevation: 10,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      children: [
+                        TextField(
+                          controller: emailController,
+                          keyboardType: TextInputType.emailAddress,
+                          decoration: InputDecoration(
+                            labelText: 'Email',
+                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                            prefixIcon: const Icon(Icons.email),
+                          ),
+                        ),
+                        const SizedBox(height: 14),
+                        TextField(
+                          controller: passwordController,
+                          obscureText: !showPassword,
+                          decoration: InputDecoration(
+                            labelText: 'Password',
+                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                            prefixIcon: const Icon(Icons.lock),
+                            suffixIcon: IconButton(
+                              icon: Icon(showPassword ? Icons.visibility : Icons.visibility_off),
+                              onPressed: () => setState(() => showPassword = !showPassword),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 20),
+                        SizedBox(
+                          width: double.infinity,
+                          child: ElevatedButton(
+                            onPressed: _auth,
+                            style: ElevatedButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(vertical: 15),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                            ),
+                            child: Text(isLogin ? 'LOGIN' : 'SIGN UP', style: const TextStyle(fontSize: 17)),
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: () => setState(() => isLogin = !isLogin),
+                          child: Text(
+                            isLogin ? 'Need account? Sign up' : 'Have account? Login',
+                            style: const TextStyle(color: Colors.deepPurple, fontSize: 15),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// HOME SCREEN — REAL STT + avatar_training POPULATED + AUDIO PLAYS
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  final supabase = Supabase.instance.client;
+  final picker = ImagePicker();
+  final recorder = FlutterSoundRecorder();
+  bool isRecording = false;
+  int seconds = 0;
+  Timer? _timer;
+  bool _isRecorderReady = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeRecorder();
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    // Use .closeRecorder() instead of .release() if openRecorder() was called.
+    // The library handles resource release internally on close.
+    if (recorder.isRecording) {
+      recorder.closeRecorder();
+    }
+    super.dispose();
+  }
+
+  Future<void> _initializeRecorder() async {
+    final micStatus = await Permission.microphone.request();
+    if (!micStatus.isGranted) {
+      _showSnackBar('MIC DENIED — GO TO SETTINGS');
+      return;
+    }
+
+    try {
+      await recorder.openRecorder();
+      setState(() => _isRecorderReady = true);
+      print('RECORDER READY');
+    } catch (e) {
+      print('OPEN FAILED: $e');
+      _showSnackBar('Recorder failed: $e');
+    }
+  }
+
+  Future<void> _startRecording() async {
+    // Prevent starting if not ready or already recording
+    if (!_isRecorderReady || recorder.isRecording) return;
+
+    try {
+      // Audio is saved to the app's internal temporary directory (hidden from file manager).
+      // If you need to debug the file directly, you can switch this to 
+      // final dir = await getApplicationDocumentsDirectory(); 
+      final dir = await getTemporaryDirectory();
+      
+      // FIX 1: Change file extension to WAV
+      final path = '${dir.path}/temp_voice_recording.wav'; 
+
+      await recorder.startRecorder(
+        toFile: path,
+        // FIX 2: Change codec to PCM 16-bit WAV (LINEAR16) for reliable STT
+        codec: Codec.pcm16WAV, 
+        sampleRate: 16000,
+        numChannels: 1,
+      );
+
+      setState(() {
+        isRecording = true;
+        seconds = 0;
+      });
+      _startTimer();
+      print('RECORDING STARTED: $path');
+    } catch (e) {
+      print('START ERROR: $e');
+      _showSnackBar('Start failed: $e');
+    }
+  }
+
+  Future<void> _stopRecording() async {
+    if (!recorder.isRecording) return;
+
+    try {
+      final path = await recorder.stopRecorder(); 
+
+      _timer?.cancel();
+      setState(() => isRecording = false);
+      
+      if (path == null) {
+        print('STOP ERROR: recorder.stopRecorder() returned null (recording failed).');
+        _showSnackBar('Recording failed or was too short to finalize.');
+        return;
+      }
+
+      final file = File(path);
+      
+      if (!await file.exists()) {
+        print('STOP ERROR: File was not found at the returned path: $path');
+        _showSnackBar('File not found after stopping recording.');
+        return;
+      }
+      
+      final bytes = await file.readAsBytes();
+      print('FILE SIZE: ${bytes.length} bytes | PATH: $path');
+
+      // Check for zero data. WAV files are larger than AAC, so this threshold is safer.
+      if (bytes.length < 500) { 
+        _showSnackBar('EMPTY: Recording too short or failed.');
+        await file.delete();
+        return;
+      }
+      
+      final text = await _googleSTT(bytes); 
+      
+      if (text.isNotEmpty) {
+        await _trainAvatar(text);
+        // Path is now .wav, which is used correctly in _uploadMedia
+        await _uploadMedia(path, 'audio', 'voice'); 
+        _showSnackBar('SAVED: "$text"');
+      } else {
+        _showSnackBar('No speech detected or STT failed. Check console for STT ERROR.');
+      }
+      
+      // Mandatory: Delete the temp file after processing
+      await file.delete(); 
+
+    } catch (e) {
+      print('STOP ERROR: $e');
+      _showSnackBar('Error: $e');
+    }
+  }
+
+  void _startTimer() {
+    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!isRecording) return timer.cancel();
+      setState(() => seconds++);
+      if (seconds >= 60) _stopRecording();
+    });
+  }
+
+  // REAL GOOGLE CLOUD SPEECH-TO-TEXT
+  Future<String> _googleSTT(Uint8List audioBytes) async {
+    if (audioBytes.length < 1024) {
+      print('STT FAILED: Audio data too short for recognition.');
+      return '';
+    }
+
+    http.Client? client;
+    try {
+      // 1. LOAD CREDENTIALS
+      // Use rootBundle to load the service account JSON from assets
+      final jsonString = await rootBundle.loadString('assets/google_speech.json');
+      final jsonCredentials = json.decode(jsonString);
+
+      // 2. AUTHENTICATE CLIENT
+      final credentials = ServiceAccountCredentials.fromJson(jsonCredentials);
+      client = await clientViaServiceAccount(
+        credentials,
+        [speech.SpeechApi.cloudPlatformScope],
+      );
+
+      final speechApi = speech.SpeechApi(client);
+
+      // 3. ENCODE AUDIO
+      final audioContent = base64Encode(audioBytes);
+
+      // 4. BUILD REQUEST
+      final request = speech.RecognizeRequest()
+        ..config = (speech.RecognitionConfig()
+          // CRITICAL: Ensure this matches your recorder settings (WAV/PCM 16-bit)
+          ..encoding = 'LINEAR16'
+          ..sampleRateHertz = 16000
+          ..languageCode = 'en-US'
+          ..audioChannelCount = 1)
+        ..audio = (speech.RecognitionAudio()..content = audioContent);
+
+      // 5. CALL API
+      final response = await speechApi.speech.recognize(request);
+    
+      // 6. PROCESS RESPONSE
+      final transcript = response.results?.firstOrNull?.alternatives?.firstOrNull?.transcript ?? '';
+      print('STT RESULT: "$transcript"');
+      return transcript;
+
+    } catch (e) {
+      print('STT ERROR: ${e.runtimeType}: $e');
+      // A more descriptive error for debugging credential issues
+      if (e.toString().contains('Invalid JSON')) {
+        print('DEBUG HINT: Check the format of assets/google_speech.json');
+      }
+      return '';
+    } finally {
+      // Ensure the client is closed after use
+      client?.close();
+    }
+  }
+
+  Future<void> _pickPhoto() async {
+    final picked = await picker.pickImage(source: ImageSource.gallery);
+    if (picked != null) {
+      await _uploadMedia(picked.path, 'photos', 'photo');
+      _showSnackBar('Photo saved!');
+    }
+  }
+
+  Future<void> _pickVideo() async {
+    final picked = await picker.pickVideo(source: ImageSource.gallery);
+    if (picked != null) {
+      await _uploadMedia(picked.path, 'video', 'video');
+      _showSnackBar('Video saved!');
+    }
+  }
+
+  Future<void> _uploadMedia(String path, String bucket, String type) async {
+    try {
+      final user = supabase.auth.currentUser!;
+      final file = File(path);
+      final bytes = await file.readAsBytes();
+      
+      // FIX 4: Update extension and content type for the new WAV format
+      String extension = type == 'photo' 
+          ? path.toLowerCase().endsWith('.png') ? '.png' : '.jpg'
+          : type == 'video' ? '.mp4' : '.wav'; // Now uses .wav
+      String contentType = type == 'photo' 
+          ? extension == '.png' ? 'image/png' : 'image/jpeg'
+          : type == 'video' ? 'video/mp4' : 'audio/wav'; // Now uses audio/wav
+
+      final fileName = '${type}_${DateTime.now().millisecondsSinceEpoch}$extension';
+      final storagePath = 'user_${user.id}/$fileName';
+
+      await supabase.storage.from(bucket).uploadBinary(
+        storagePath,
+        bytes,
+        fileOptions: FileOptions(contentType: contentType),
+      );
+
+      // Changed 365 days to 30 days for signed URL duration
+      final signedUrl = await supabase.storage 
+          .from(bucket)
+          .createSignedUrl(storagePath, 60 * 60 * 24 * 30); 
+
+      await supabase.from('memories').insert({
+        'user_id': user.id,
+        'media': signedUrl,
+        'context': '$type: Voice/Photo/Video', // Simplified context
+      });
+    } catch (e) {
+      _showSnackBar('Upload failed: $e');
+    }
+  }
+
+  Future<void> _trainAvatar(String userInput) async {
+    final model = GenerativeModel(
+      model: 'gemini-2.0-flash-exp',
+      apiKey: geminiApiKey,
+    );
+
+    final prompt = """
+    You are training to become a digital clone of the user.
+    Learn their voice, wit, philosophy, and tone from this input:
+    
+    "$userInput"
+    
+    Respond in FIRST PERSON as the user would.
+    Keep it under 100 words.
+    Be warm, thoughtful, and true to their style.
+    """;
+
+    try {
+      final content = [Content.text(prompt)];
+      final response = await model.generateContent(content);
+      final aiResponse = response.text ?? "I hear you.";
+
+      final tts = FlutterTts();
+      await tts.setLanguage('en-US');
+      await tts.setVoice({"name": "Karen", "locale": "en-AU"});
+      await tts.setSpeechRate(0.5);
+      await tts.speak(aiResponse);
+
+      final user = supabase.auth.currentUser!;
+      await supabase.from('avatar_training').insert({
+        'user_id': user.id,
+        'user_input': userInput,
+        'ai_response': aiResponse,
+      });
+      print('INSERTED INTO avatar_training: $aiResponse');
+      _showSnackBar('AI clone says: "$aiResponse"');
+    } catch (e) {
+      print('AI error: $e');
+      _showSnackBar('Training failed: $e');
+    }
+  }
+
+  void _showSnackBar(String message) {
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(message),
+          duration: const Duration(seconds: 4),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Legacy Immortal', style: TextStyle(fontWeight: FontWeight.bold)),
+        backgroundColor: Colors.deepPurple,
+        foregroundColor: Colors.white,
+        elevation: 6,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.photo_library),
+            onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const ReviewScreen())),
+            tooltip: 'My Memories',
+          ),
+          IconButton(
+            icon: const Icon(Icons.logout),
+            onPressed: () async {
+              await supabase.auth.signOut();
+              if (mounted) {
+                Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const AuthScreen()));
+              }
+            },
+            tooltip: 'Logout',
+          ),
+        ],
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          children: [
+            _buildCaptureCard(
+              title: 'Voice Recording',
+              timer: '$seconds / 60',
+              buttonText: isRecording ? 'STOP' : 'START VOICE',
+              onPressed: isRecording ? _stopRecording : _startRecording,
+              icon: isRecording ? Icons.stop : Icons.mic,
+              color: isRecording ? Colors.red : Colors.green,
+            ),
+            const SizedBox(height: 16),
+            _buildCaptureCard(
+              title: 'Add Photo',
+              buttonText: 'SELECT PHOTO',
+              onPressed: _pickPhoto,
+              icon: Icons.photo,
+            ),
+            const SizedBox(height: 16),
+            _buildCaptureCard(
+              title: 'Add Video',
+              buttonText: 'SELECT VIDEO',
+              onPressed: _pickVideo,
+              icon: Icons.videocam,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCaptureCard({
+    required String title,
+    String? timer,
+    required String buttonText,
+    required VoidCallback onPressed,
+    required IconData icon,
+    Color? color,
+  }) {
+    return Card(
+      elevation: 6,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            Text(title, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            if (timer != null) ...[
+              const SizedBox(height: 8),
+              Text(timer, style: const TextStyle(fontSize: 28, fontWeight: FontWeight.w300)),
+            ],
+            const SizedBox(height: 12),
+            Icon(icon, size: 40, color: color ?? Colors.deepPurple),
+            const SizedBox(height: 12),
+            ElevatedButton.icon(
+              onPressed: onPressed,
+              icon: Icon(icon, size: 20),
+              label: Text(buttonText),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: color ?? Colors.deepPurple,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// REVIEW SCREEN – AUDIO PLAYS
+class ReviewScreen extends StatefulWidget {
+  const ReviewScreen({super.key});
+  @override
+  State<ReviewScreen> createState() => _ReviewScreenState();
+}
+
+class _ReviewScreenState extends State<ReviewScreen> {
+  final supabase = Supabase.instance.client;
+  List<Map<String, dynamic>> memories = [];
+  bool loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadMemories();
+  }
+
+  Future<void> _loadMemories() async {
+    try {
+      final user = supabase.auth.currentUser!;
+      final response = await supabase
+          .from('memories')
+          .select()
+          .eq('user_id', user.id)
+          .order('created_at', ascending: false);
+      setState(() {
+        memories = List<Map<String, dynamic>>.from(response);
+        loading = false;
+      });
+    } catch (e) {
+      print('LOAD ERROR: $e');
+      setState(() => loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('My Legacy'),
+        backgroundColor: Colors.deepPurple,
+        foregroundColor: Colors.white,
+      ),
+      body: loading
+          ? const Center(child: CircularProgressIndicator())
+          : memories.isEmpty
+              ? const Center(child: Text('No memories yet. Start recording!'))
+              : ListView.builder(
+                  padding: const EdgeInsets.all(12),
+                  itemCount: memories.length,
+                  itemBuilder: (context, index) {
+                    final mem = memories[index];
+                    final url = mem['media'] as String;
+                    final type = mem['context'].toString().split(':')[0];
+
+                    return Card(
+                      elevation: 4,
+                      margin: const EdgeInsets.symmetric(vertical: 6),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                      child: ListTile(
+                        leading: CircleAvatar(
+                          backgroundColor: Colors.deepPurple.shade100,
+                          child: _getIcon(type),
+                        ),
+                        title: Text('$type Memory', style: const TextStyle(fontWeight: FontWeight.bold)),
+                        subtitle: Text(mem['created_at'].toString().substring(0, 19)),
+                        trailing: IconButton(
+                          icon: const Icon(Icons.delete, color: Colors.red),
+                          onPressed: () async {
+                            await supabase.from('memories').delete().eq('id', mem['id']);
+                            _loadMemories();
+                          },
+                        ),
+                        onTap: () => _showMedia(url, type),
+                      ),
+                    );
+                  },
+                ),
+    );
+  }
+
+  Widget _getIcon(String type) {
+    switch (type) {
+      case 'voice':
+        return const Icon(Icons.mic, color: Colors.deepPurple);
+      case 'photo':
+        return const Icon(Icons.photo, color: Colors.deepPurple);
+      case 'video':
+        return const Icon(Icons.videocam, color: Colors.deepPurple);
+      default:
+        return const Icon(Icons.memory, color: Colors.deepPurple);
+    }
+  }
+
+  void _showMedia(String url, String type) {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Text('$type Memory', style: const TextStyle(fontWeight: FontWeight.bold)),
+        content: SizedBox(
+          width: 300,
+          height: 300,
+          // FIX: Corrected the chained ternary operator logic
+          child: type == 'photo'
+              ? ClipRRect(
+                  borderRadius: BorderRadius.circular(16),
+                  child: CachedNetworkImage(imageUrl: url, fit: BoxFit.cover),
+                )
+              : type == 'voice' // This was incorrectly using '?' instead of ':'
+                  ? AudioPlayerWidget(url: url)
+                  : VideoPlayerWidget(url: url),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close', style: TextStyle(color: Colors.deepPurple)),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// AUDIO PLAYER — PLAYS .AAC (or .WAV if old files exist)
+class AudioPlayerWidget extends StatefulWidget {
+  final String url;
+  const AudioPlayerWidget({super.key, required this.url});
+  @override
+  State<AudioPlayerWidget> createState() => _AudioPlayerWidgetState();
+}
+
+class _AudioPlayerWidgetState extends State<AudioPlayerWidget> {
+  late AudioPlayer player;
+  bool isPlaying = false;
+  bool isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    player = AudioPlayer();
+    player.setUrl(widget.url).then((_) {
+      setState(() => isLoading = false);
+      player.playerStateStream.listen((state) {
+        if (state.processingState == ProcessingState.completed) {
+          setState(() => isPlaying = false);
+        }
+      });
+    }).catchError((e) {
+      print('AUDIO LOAD ERROR: $e');
+      setState(() => isLoading = false);
+      // Optional: show error to user
+    });
+  }
+
+  @override
+  void dispose() {
+    player.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return isLoading
+        ? const Center(child: CircularProgressIndicator())
+        : Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                icon: Icon(isPlaying ? Icons.pause : Icons.play_arrow, size: 48, color: Colors.deepPurple),
+                onPressed: () async {
+                  if (player.processingState == ProcessingState.ready || player.processingState == ProcessingState.completed) {
+                    if (isPlaying) {
+                      await player.pause();
+                    } else {
+                      if (player.processingState == ProcessingState.completed) {
+                        await player.seek(Duration.zero);
+                      }
+                      await player.play();
+                    }
+                    setState(() => isPlaying = !isPlaying);
+                  }
+                },
+              ),
+              const Text('Tap to play/pause', style: TextStyle(color: Colors.deepPurple)),
+            ],
+          );
+  }
+}
+
+class VideoPlayerWidget extends StatefulWidget {
+  final String url;
+  const VideoPlayerWidget({super.key, required this.url});
+  @override
+  State<VideoPlayerWidget> createState() => _VideoPlayerWidgetState();
+}
+
+class _VideoPlayerWidgetState extends State<VideoPlayerWidget> {
+  late VideoPlayerController controller;
+  ChewieController? chewieController;
+  bool isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    controller = VideoPlayerController.networkUrl(Uri.parse(widget.url)); // Use networkUrl for modern versions
+    controller.initialize().then((_) {
+      chewieController = ChewieController(
+        videoPlayerController: controller,
+        autoPlay: false,
+        looping: false,
+        aspectRatio: controller.value.aspectRatio,
+      );
+      setState(() => isLoading = false);
+    }).catchError((e) {
+      print('VIDEO INIT ERROR: $e');
+      setState(() => isLoading = false);
+    });
+  }
+
+  @override
+  void dispose() {
+    controller.dispose();
+    chewieController?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return isLoading
+        ? const Center(child: CircularProgressIndicator())
+        : chewieController != null
+            ? Chewie(controller: chewieController!)
+            : const Center(child: Text('Failed to load video'));
+  }
+}
