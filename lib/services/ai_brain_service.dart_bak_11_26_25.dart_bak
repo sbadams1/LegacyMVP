@@ -1,0 +1,306 @@
+// lib/services/ai_brain_service.dart
+//
+// Central service for talking to the AI brain via Supabase Edge Functions
+// and writing raw messages into the memory_raw table, plus triggering
+// level-2 summaries in memory_summary and lifetime profiles in memory_profile.
+//
+// This version:
+// - Provides a simple askBrain({ required String message }) entry point.
+// - Resolves the user's preferred language from profiles.preferred_language.
+// - Sends the preferred language to BOTH ai-brain and memory-summarize.
+// - Supports optional language-learning metadata so the backend can orchestrate
+//   structured tutoring sessions when you’re in language-learning mode.
+
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:uuid/uuid.dart';
+
+class AIBrainService {
+  AIBrainService._internal();
+
+  static final AIBrainService instance = AIBrainService._internal();
+
+  final SupabaseClient _client = Supabase.instance.client;
+
+  /// Current conversation id for this device/session.
+  /// The UI can decide when to start a new conversation (e.g., switch modes).
+  String _conversationId = const Uuid().v4();
+
+  /// Force a brand-new conversation thread (e.g., when user flips modes).
+  void startNewConversation() {
+    _conversationId = const Uuid().v4();
+  }
+
+  /// Internal helper: resolve the user's preferred language (L1).
+  ///
+  /// We read this from the standard Supabase auth profile table:
+  ///   profiles.preferred_language
+  ///
+  /// and fall back to 'en-US' if anything goes wrong or the field is empty.
+  Future<String> _getPreferredLanguage(
+    SupabaseClient client,
+    String userId,
+  ) async {
+    try {
+      final result = await client
+          .from('profiles')
+          .select('preferred_language')
+          .eq('id', userId)
+          .maybeSingle();
+
+      final preferredLanguage = result?['preferred_language'] as String?;
+      if (preferredLanguage != null && preferredLanguage.isNotEmpty) {
+        return preferredLanguage;
+      }
+    } catch (e) {
+      // ignore: avoid_print
+      print('⚠️ _getPreferredLanguage failed, using en-US fallback: $e');
+    }
+
+    // Fallback
+    return 'en-US';
+  }
+
+  /// Main entry point for talking to the AI brain.
+  ///
+  /// This supports *optional* language-learning metadata:
+  /// - [preferredLanguageOverride] -> override profiles.preferred_language.
+  /// - [conversationMode] -> 'legacy' | 'language_learning'.
+  /// - [targetLanguage] -> learner's target language locale (e.g. 'th-TH').
+  /// - [learningLevel] -> 'beginner' | 'intermediate' | 'advanced'.
+  /// - [lessonPlanId] / [skillId] / [sessionPhase] / [sessionPlan] /
+  ///   [extraContext] are passed straight through to the `ai-brain` Edge
+  ///   Function so it can orchestrate structured tutoring sessions.
+  ///
+  /// NOTE: Existing UI that calls only `askBrain(message: ...)` still works.
+  Future<String> askBrain({
+    required String message,
+    String? preferredLanguageOverride,
+    String? conversationMode,
+    String? targetLanguage,
+    String? learningLevel,
+    String? lessonPlanId,
+    String? skillId,
+    String? sessionPhase,
+    Map<String, dynamic>? sessionPlan,
+    Map<String, dynamic>? extraContext,
+  }) async {
+    final user = _client.auth.currentUser;
+    if (user == null) {
+      throw Exception('No authenticated user for AIBrainService.askBrain');
+    }
+
+    final userId = user.id;
+
+    // 1) Resolve preferred language (L1)
+    final preferredLanguage =
+        preferredLanguageOverride ??
+            await _getPreferredLanguage(_client, userId);
+
+    final now = DateTime.now().toUtc().toIso8601String();
+
+    // 2) Insert the user's raw message into memory_raw
+    try {
+      await _client.from('memory_raw').insert({
+        'user_id': userId,
+        'conversation_id': _conversationId,
+        'role': 'user',
+        'content': message,
+        'created_at': now,
+      });
+    } catch (e) {
+      // ignore: avoid_print
+      print('⚠️ Failed to insert user message into memory_raw: $e');
+    }
+
+    // 3) Call ai-brain Edge Function with structured metadata
+    final Map<String, dynamic> body = {
+      'user_id': userId,
+      'message': message,
+      'conversation_id': _conversationId,
+
+      // Wire protocol: keep 'primary_language' for backwards compatibility,
+      // but it is sourced from profiles.preferred_language.
+      'primary_language': preferredLanguage,
+      // Optionally also expose a clearer key for newer backends.
+      'preferred_language': preferredLanguage,
+    };
+
+    if (conversationMode != null) {
+      body['conversation_mode'] = conversationMode;
+    }
+    if (targetLanguage != null) {
+      body['target_language'] = targetLanguage;
+    }
+    if (learningLevel != null) {
+      body['learning_level'] = learningLevel;
+    }
+    if (lessonPlanId != null) {
+      body['lesson_plan_id'] = lessonPlanId;
+    }
+    if (skillId != null) {
+      body['skill_id'] = skillId;
+    }
+    if (sessionPhase != null) {
+      body['session_phase'] = sessionPhase;
+    }
+    if (sessionPlan != null) {
+      body['session_plan'] = sessionPlan;
+    }
+    if (extraContext != null) {
+      body['extra_context'] = extraContext;
+    }
+
+    final response = await _client.functions.invoke(
+      'ai-brain',
+      body: body,
+    );
+
+    final data = response.data;
+    final replyText = _extractReplyString(data);
+
+    // 4) Insert the AI's reply into memory_raw
+    try {
+      final replyNow = DateTime.now().toUtc().toIso8601String();
+      await _client.from('memory_raw').insert({
+        'user_id': userId,
+        'conversation_id': _conversationId,
+        'role': 'assistant',
+        'content': replyText,
+        'created_at': replyNow,
+      });
+    } catch (e) {
+      // ignore: avoid_print
+      print('⚠️ Failed to insert AI reply into memory_raw: $e');
+    }
+
+    // 5) Kick off memory-summarize in the background (best-effort)
+    try {
+      await _client.functions.invoke(
+        'memory-summarize',
+        body: {
+          'user_id': userId,
+          'conversation_id': _conversationId,
+
+          // Same convention as above: the function can read either key.
+          'primary_language': preferredLanguage,
+          'preferred_language': preferredLanguage,
+        },
+      );
+    } catch (e) {
+      // ignore: avoid_print
+      print('⚠️ Failed to invoke memory-summarize: $e');
+    }
+
+    return replyText;
+  }
+
+  /// Convenience wrapper for language-learning conversations.
+  ///
+  /// This simply fills in the language-learning metadata and forwards to
+  /// [askBrain]. The UI / tutoring engine can choose appropriate values
+  /// for [lessonPlanId], [skillId], [sessionPhase], [sessionPlan], etc.
+  ///
+  /// Example usage (from a future language-learning engine):
+  ///
+  ///   final reply = await AIBrainService.instance.askLanguageLesson(
+  ///     message: userUtterance,
+  ///     preferredLanguage: 'en-US',
+  ///     targetLanguage: 'th-TH',
+  ///     learningLevel: 'beginner',
+  ///     lessonPlanId: 'th-beginner-core-01',
+  ///     skillId: 's1-greetings',
+  ///     sessionPhase: 'guided',
+  ///     sessionPlan: { ... JSON for the 4-phase flow ... },
+  ///   );
+  Future<String> askLanguageLesson({
+    required String message,
+    required String preferredLanguage,
+    required String targetLanguage,
+    required String learningLevel,
+    required String lessonPlanId,
+    required String skillId,
+    String? sessionPhase,
+    Map<String, dynamic>? sessionPlan,
+    Map<String, dynamic>? extraContext,
+  }) {
+    return askBrain(
+      message: message,
+      preferredLanguageOverride: preferredLanguage,
+      conversationMode: 'language_learning',
+      targetLanguage: targetLanguage,
+      learningLevel: learningLevel,
+      lessonPlanId: lessonPlanId,
+      skillId: skillId,
+      sessionPhase: sessionPhase,
+      sessionPlan: sessionPlan,
+      extraContext: extraContext,
+    );
+  }
+
+  /// Extract a reply string from whatever shape ai-brain returns.
+  ///
+  /// We keep this tolerant so the Edge Function can evolve its response JSON
+  /// without breaking the app. Common patterns:
+  /// {
+  ///   "reply": "text..."
+  /// }
+  /// {
+  ///   "choices": [{ "message": { "content": "..." } }]
+  /// }
+  /// {
+  ///   "content": "..."
+  /// }
+  /// or even just a raw string.
+  String _extractReplyString(dynamic data) {
+    if (data == null) {
+      return '';
+    }
+
+    if (data is String) {
+      return data;
+    }
+
+    if (data is Map<String, dynamic>) {
+      // Direct "reply" field
+      final reply = data['reply'];
+      if (reply is String && reply.isNotEmpty) {
+        return reply;
+      }
+
+      // OpenAI-style choices[0].message.content
+      final choices = data['choices'];
+      if (choices is List && choices.isNotEmpty) {
+        final first = choices.first;
+        if (first is Map) {
+          final message = first['message'];
+          if (message is Map) {
+            final content = message['content'];
+            if (content is String && content.isNotEmpty) {
+              return content;
+            }
+          }
+        }
+      }
+
+      // Fallback to "content" if present
+      final contentField = data['content'];
+      if (contentField is String && contentField.isNotEmpty) {
+        return contentField;
+      }
+
+      // As a last resort, grab the first non-null stringy value
+      for (final entry in data.entries) {
+        final value = entry.value;
+        if (value is String && value.isNotEmpty) {
+          return value;
+        }
+      }
+
+      // Last resort: stringify the whole payload
+      return data.toString();
+    }
+
+    // Non-map, non-string: fallback
+    return data.toString();
+  }
+}
