@@ -1,0 +1,49 @@
+﻿concept_key,l1_language_code,l1_headword,l1_gloss_short,l1_gloss_long,part_of_speech,semantic_domain,metadata,frequency_rank
+GREET_HELLO_BASIC,en,hello,hello (general greeting),A general friendly greeting used any time of day,expression,greetings,[],10
+GREET_GOODBYE_BASIC,en,goodbye,goodbye / bye,A simple farewell used when leaving,expression,greetings,[],20
+GREET_THANK_YOU,en,thank you,thank you / thanks,Polite expression of gratitude,expression,greetings,[],30
+GREET_YES,en,yes,yes / correct,Affirmative answer or agreement,expression,greetings,[],40
+GREET_NO,en,no,no / not correct,Negative answer or disagreement,expression,greetings,[],50
+GREET_SORRY,en,sorry,sorry / excuse me,Short apology for small mistakes,expression,greetings,[],60
+INTRO_MY_NAME,en,my name is...,my name is...,Phrase used to state your name,expression,introductions,[],70
+INTRO_WHATS_YOUR_NAME,en,what is your name?,what is your name?,Question asking for someone's name,expression,introductions,[],80
+ORIGIN_WHERE_FROM,en,where are you from?,where are you from?,Question asking about country or city of origin,expression,introductions,[],90
+ORIGIN_I_AM_FROM,en,I am from...,I am from...,Phrase to say which place/country you come from,expression,introductions,[],100
+FEEL_GOOD,en,I'm fine / I'm good,I'm fine / I'm good,Short answer when you feel okay,expression,feelings,[],110
+FEEL_NOT_GOOD,en,I'm not so good,I'm not so good,Short answer when you feel bad or tired,expression,feelings,[],120
+FAMILY_FAMILY,en,family,family,Your close relatives (parents,noun,family,[],130
+FAMILY_MOTHER,en,mother,mother / mom,Your female parent,noun,family,[],140
+FAMILY_FATHER,en,father,father / dad,Your male parent,noun,family,[],150
+FAMILY_FRIEND,en,friend,friend,A person you know well and like,noun,relationships,[],160
+TIME_TODAY,en,today,today,The current day,noun,time,[],170
+TIME_TOMORROW,en,tomorrow,tomorrow,The day after today,noun,time,[],180
+TIME_YESTERDAY,en,yesterday,yesterday,The day before today,noun,time,[],190
+TIME_NOW,en,now,now,The current moment,adverb,time,[],200
+PLACE_HOME,en,home,home / house,The place where you live,noun,places,[],210
+PLACE_WORK,en,work,work / workplace,Place where you work or your job,noun,places,[],220
+PLACE_SCHOOL,en,school,school,Place where people study,noun,places,[],230
+PLACE_MARKET,en,market,market / shop area,Place where people buy food and goods,noun,places,[],240
+VERB_GO,en,go,to go,Verb for moving from one place to another,verb,actions,[],250
+VERB_COME,en,come,to come,Verb for moving towards the speaker,verb,actions,[],260
+VERB_EAT,en,eat,to eat,Verb for eating food,verb,actions,[],270
+VERB_DRINK,en,drink,to drink,Verb for drinking liquids,verb,actions,[],280
+VERB_SPEAK,en,speak,to speak,Verb for talking with your mouth,verb,communication,[],290
+VERB_UNDERSTAND,en,understand,to understand,Verb for when something makes sense to you,verb,mental,[],300
+VERB_LIKE,en,like,to like,Verb for when you enjoy or prefer something,verb,feelings,[],310
+VERB_WANT,en,want,to want,Verb for when you desire something,verb,mental,[],320
+PRONOUN_I,en,I,I / me,First person singular pronoun,pronoun,pronouns,[],5
+PRONOUN_YOU,en,you,you (singular),Second person pronoun,pronoun,pronouns,[],6
+PRONOUN_HE,en,he,he,Third person singular (male),pronoun,pronouns,[],7
+PRONOUN_SHE,en,she,she,Third person singular (female),pronoun,pronouns,[],8
+PRONOUN_WE,en,we,we / us,First person plural pronoun,pronoun,pronouns,[],9
+PRONOUN_THEY,en,they,they / them,Third person plural pronoun,pronoun,pronouns,[],11
+RUN_PHYSICAL_MOVE,en,run (move),run (physically move),Verb for running with your legs,verb,actions,[],330
+JOB_WORK,en,work (job),work / job,Job or employment,verb,work,[],340
+PEOPLE_TALL,en,tall,tall,Adjective describing a person of high height,adjective,people,[],350
+WEATHER_HOT,en,hot (weather),hot (weather),Describes high temperature,adjective,weather,[],360
+DIRECTION_TURN_LEFT,en,turn left,turn left,Instruction for directions,verb,travel,[],370
+REVIEW_EVERYDAY_SIMPLE,en,everyday review,everyday review,Generic concept for reviewing daily-life language,other,meta,[],380
+REVIEW_PEOPLE_PLACES,en,people & places review,people and places review,Generic concept for reviewing people/places language,other,meta,[],390
+GREET_OK,en,okay,okay / all right,Informal agreement or acceptance,expression,greetings,[],55
+GREET_PLEASE,en,please,please,Polite word used when asking,expression,greetings,[],65
+GREET_EXCUSE_ME,en,excuse me,excuse me,Used to get attention or lightly apologise,expression,greetings,[],75

@@ -1,229 +1,249 @@
 // supabase/functions/pronunciation-score/index.ts
 //
-// Input:
-// {
-//   "user_id": "<uuid>",
-//   "audio_base64": "<base64 audio>",
-//   "mime_type": "audio/aac",
-//   "language_code": "th-TH",
-//   "expected_text": "สวัสดีครับ",
-//   "debug": true (optional)
-// }
+// REAL pronunciation scoring using Gemini Pro audio.
+// - Input: base64 audio + target phrase in L2
+// - Output: JSON with score, feedback, ideal L2 form, attempt transcript
 //
-// Output: 200 OK
-// {
-//   "transcript": "สวัสดีครับ",
-//   "expected_text": "สวัสดีครับ",
-//   "normalized_transcript": "...",
-//   "normalized_expected": "...",
-//   "similarity_score": 0.94,
-//   "pronunciation_score": 0.94,
-//   "is_acceptable": true
-// }
-//
-// The client can then write pronunciation_score into vocab_progress.last_score.
+// This function is intentionally separate from ai-brain/index.ts so
+// conversation logic (flash) and pronunciation scoring (pro audio) stay clean.
 
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.48.0";
 
-import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+const GEMINI_API_KEY =
+  Deno.env.get("GEMINI_API_KEY") ?? Deno.env.get("GEMINI_API_KEY_EDGE");
 
-const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+// Use an audio-capable Pro model.
+const GEMINI_AUDIO_MODEL =
+  Deno.env.get("GEMINI_AUDIO_MODEL") ?? "models/gemini-1.5-pro-latest";
 
-// -----------------------------------------------------------------------------
-// Utility: normalize strings for similarity
-// -----------------------------------------------------------------------------
-
-function normalize(text: string): string {
-  return text
-    .toLowerCase()
-    .normalize("NFC")
-    // Strip obvious control / punctuation that shouldn't affect pronunciation
-    .replace(/[\*\_\/\.\,\!\?\(\)\[\]\{\}"'`~]/g, "")
-    // Collapse whitespace
-    .replace(/\s+/g, " ")
-    .trim();
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error("❌ SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not set.");
 }
 
-// Levenshtein distance (dynamic programming)
-function levenshtein(a: string, b: string): number {
-  const m = a.length;
-  const n = b.length;
-
-  if (m === 0) return n;
-  if (n === 0) return m;
-
-  const dp: number[][] = Array.from({ length: m + 1 }, () =>
-    new Array(n + 1).fill(0)
-  );
-
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,      // deletion
-        dp[i][j - 1] + 1,      // insertion
-        dp[i - 1][j - 1] + cost // substitution
-      );
-    }
-  }
-
-  return dp[m][n];
+if (!GEMINI_API_KEY) {
+  console.error("❌ GEMINI_API_KEY / GEMINI_API_KEY_EDGE is not set.");
 }
 
-// Convert distance to similarity score in [0,1]
-function similarityScore(a: string, b: string): number {
-  if (!a && !b) return 1.0;
-  if (!a || !b) return 0.0;
+const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { persistSession: false },
+    })
+  : null;
 
-  const dist = levenshtein(a, b);
-  const maxLen = Math.max(a.length, b.length);
-  const sim = 1 - dist / maxLen;
-  return Math.max(0, Math.min(1, sim));
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
-// -----------------------------------------------------------------------------
-// Main handler
-// -----------------------------------------------------------------------------
+// Small helper to strip code fences if Gemini ever wraps JSON.
+function stripCodeFences(text: string): string {
+  if (!text) return text;
+  let result = text.trim();
+  // remove ```json ... ``` or ``` ... ```
+  result = result.replace(/^```[a-zA-Z0-9]*\s*/m, "");
+  result = result.replace(/```$/m, "");
+  return result.trim();
+}
 
-serve(async (req) => {
+Deno.serve(async (req) => {
   if (req.method !== "POST") {
-    return new Response("Method not allowed", { status: 405 });
+    return jsonResponse({ error: "Method not allowed" }, 405);
   }
 
+  if (!GEMINI_API_KEY) {
+    return jsonResponse({ error: "Gemini API key not configured" }, 500);
+  }
+
+  let body: any;
   try {
-    const body = await req.json();
-    const userId = body.user_id as string | undefined;
-    const audioBase64 = body.audio_base64 as string | undefined;
-    const mimeType = (body.mime_type as string | undefined) ?? "audio/aac";
-    const languageCode = (body.language_code as string | undefined) ?? "th-TH";
-    const expectedText = body.expected_text as string | undefined;
-    const debug = !!body.debug;
+    body = await req.json();
+  } catch {
+    return jsonResponse({ error: "Invalid JSON payload" }, 400);
+  }
 
-    if (!userId || !audioBase64 || !expectedText) {
-      return new Response(
-        JSON.stringify({
-          error:
-            "user_id, audio_base64, and expected_text are required fields."
-        }),
-        { status: 400, headers: { "Content-Type": "application/json" } }
-      );
-    }
+  const {
+    user_id,
+    l1_locale,
+    l2_locale,
+    target_phrase_l2,
+    target_phrase_romanization,
+    audio_base64,
+    audio_mime_type,
+    lesson_meta,
+  } = body ?? {};
 
-    // Optional: check that user exists
-    const supabase = createClient(supabaseUrl, serviceRoleKey);
-    const { data: profile, error: profileError } = await supabase
-      .from("profiles")
-      .select("id")
-      .eq("id", userId)
-      .maybeSingle();
-
-    if (profileError) {
-      console.error("Profile lookup error:", profileError);
-    }
-    if (!profile) {
-      return new Response(
-        JSON.stringify({ error: "User not found in profiles." }),
-        { status: 400, headers: { "Content-Type": "application/json" } }
-      );
-    }
-
-    // -----------------------------------------------------------------------
-    // 1) Call your existing 'speech-to-text' function to get transcript
-    // -----------------------------------------------------------------------
-
-    const sttUrl = `${supabaseUrl}/functions/v1/speech-to-text`;
-    const sttPayload = {
-      user_id: userId,
-      audio_base64: audioBase64,
-      mime_type: mimeType,
-      language_code: languageCode
-    };
-
-    const sttResp = await fetch(sttUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        // Functions accept Bearer token as authorization header
-        Authorization: `Bearer ${serviceRoleKey}`,
-        apikey: serviceRoleKey
+  if (!user_id || !audio_base64 || !target_phrase_l2 || !l2_locale) {
+    return jsonResponse(
+      {
+        error:
+          "Missing required fields: user_id, audio_base64, target_phrase_l2, l2_locale",
       },
-      body: JSON.stringify(sttPayload)
-    });
-
-    if (!sttResp.ok) {
-      const text = await sttResp.text();
-      console.error("speech-to-text error:", sttResp.status, text);
-      return new Response(
-        JSON.stringify({
-          error: "speech-to-text call failed",
-          status: sttResp.status,
-          details: debug ? text : undefined
-        }),
-        { status: 502, headers: { "Content-Type": "application/json" } }
-      );
-    }
-
-    const sttData = await sttResp.json();
-    if (sttData.error) {
-      console.error("speech-to-text returned error:", sttData.error);
-      return new Response(
-        JSON.stringify({ error: "STT error", details: sttData.error }),
-        { status: 502, headers: { "Content-Type": "application/json" } }
-      );
-    }
-
-    const transcriptRaw = (sttData.transcript as string | undefined) ?? "";
-    const transcript = transcriptRaw.trim();
-
-    if (!transcript) {
-      return new Response(
-        JSON.stringify({
-          error: "No transcript returned from speech-to-text."
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } }
-      );
-    }
-
-    // -----------------------------------------------------------------------
-    // 2) Compute normalized similarity between transcript & expected_text
-    // -----------------------------------------------------------------------
-
-    const normalizedTranscript = normalize(transcript);
-    const normalizedExpected = normalize(expectedText);
-
-    const sim = similarityScore(normalizedTranscript, normalizedExpected);
-    const pronunciationScore = sim; // for now 1:1 mapping
-
-    // You can tune threshold later
-    const isAcceptable = pronunciationScore >= 0.8;
-
-    const responsePayload = {
-      transcript,
-      expected_text: expectedText,
-      normalized_transcript: normalizedTranscript,
-      normalized_expected: normalizedExpected,
-      similarity_score: sim,
-      pronunciation_score: pronunciationScore,
-      is_acceptable: isAcceptable,
-      debug: debug ? { stt_raw: sttData } : undefined
-    };
-
-    return new Response(JSON.stringify(responsePayload), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
-  } catch (e) {
-    console.error("pronunciation-score exception:", e);
-    return new Response(
-      JSON.stringify({
-        error: "pronunciation-score failed",
-        details: `${e}`
-      }),
-      { status: 500, headers: { "Content-Type": "application/json" } }
+      400,
     );
   }
+
+  const safeL1 = typeof l1_locale === "string" && l1_locale.trim()
+    ? l1_locale
+    : "en-US";
+
+  // You should set this to match your recorder output:
+  // e.g. "audio/webm", "audio/m4a", "audio/aac", "audio/wav"
+  const mimeType = typeof audio_mime_type === "string" && audio_mime_type.trim()
+    ? audio_mime_type.trim()
+    : "audio/webm";
+
+  const prompt = `
+You are a pronunciation coach in a language-learning app.
+
+Learner:
+- Main language (L1) locale: ${safeL1}
+- Target language (L2) locale: ${l2_locale}
+
+Target phrase:
+- L2 script: "${target_phrase_l2}"
+- L2 romanization (if provided): "${target_phrase_romanization || ""}"
+
+TASK:
+1) Listen carefully to the learner's audio.
+2) Compare it to the target phrase.
+3) Evaluate pronunciation accuracy (segmental sounds, tones, stress, rhythm, etc.).
+4) Respond ONLY with a single JSON object, strictly following this schema:
+
+{
+  "score_0_100": <integer 0-100>,
+  "feedback_l1": "<short feedback in the learner's main language>",
+  "ideal_l2_script": "<correct target phrase in L2 script>",
+  "ideal_l2_romanization": "<romanization for the correct phrase>",
+  "attempt_transcript_l2": "<your best guess at what the learner actually said in L2>"
+}
+
+CONSTRAINTS:
+- "feedback_l1" MUST be concise (1–2 sentences), friendly, and specific:
+  - Mention 1–2 key strengths.
+  - Mention 1–2 key issues (e.g., final tone too flat, vowel too short).
+- "score_0_100":
+  - 0–40: very hard to understand / many issues.
+  - 41–70: understandable but several clear pronunciation issues.
+  - 71–90: generally good, with some minor issues.
+  - 91–100: very close to native-like pronunciation.
+- Output MUST be valid JSON. Do NOT include any extra commentary, Markdown, or text outside the JSON object.
+`.trim();
+
+  const geminiUrl =
+    `https://generativelanguage.googleapis.com/v1beta/${GEMINI_AUDIO_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+
+  const geminiRequestBody = {
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            inlineData: {
+              mimeType,
+              data: audio_base64,
+            },
+          },
+          { text: prompt },
+        ],
+      },
+    ],
+  };
+
+  let geminiText = "";
+  try {
+    const geminiRes = await fetch(geminiUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(geminiRequestBody),
+    });
+
+    if (!geminiRes.ok) {
+      const errText = await geminiRes.text();
+      console.error("Gemini error:", errText);
+      return jsonResponse(
+        { error: "Gemini request failed", details: errText },
+        500,
+      );
+    }
+
+    const geminiJson = await geminiRes.json();
+
+    // We expect the JSON to be in the first text part.
+    const parts = geminiJson?.candidates?.[0]?.content?.parts ?? [];
+    const textParts = parts
+      .map((p: any) => p?.text)
+      .filter((t: any) => typeof t === "string") as string[];
+
+    geminiText = stripCodeFences(textParts.join("\n").trim());
+  } catch (err) {
+    console.error("Gemini request exception:", err);
+    return jsonResponse(
+      { error: "Gemini request exception", details: String(err) },
+      500,
+    );
+  }
+
+  // Parse JSON from the model
+  let parsed: any;
+  try {
+    parsed = JSON.parse(geminiText);
+  } catch (err) {
+    console.error("Failed to parse Gemini JSON:", err, geminiText);
+    return jsonResponse(
+      { error: "Bad model JSON", raw: geminiText },
+      500,
+    );
+  }
+
+  let score = Number(parsed.score_0_100 ?? 0);
+  if (!Number.isFinite(score)) score = 0;
+  score = Math.max(0, Math.min(100, score));
+
+  const feedback_l1 = String(parsed.feedback_l1 ?? "");
+  const ideal_l2_script = String(parsed.ideal_l2_script ?? target_phrase_l2);
+  const ideal_l2_romanization = String(
+    parsed.ideal_l2_romanization ?? target_phrase_romanization ?? "",
+  );
+  const attempt_transcript = String(parsed.attempt_transcript_l2 ?? "");
+
+  // Optional logging into pronunciation_attempts (reuse schema from ai-brain).
+  if (supabase) {
+    try {
+      const payload = {
+        user_id,
+        target_language: l2_locale,
+        unit_id: lesson_meta?.unit_id ?? null,
+        lesson_id: lesson_meta?.lesson_id ?? null,
+        concept_key: lesson_meta?.concept_key ?? null,
+        target_phrase: target_phrase_l2,
+        learner_transcript: attempt_transcript || null,
+        score,
+        raw_model_score_line: feedback_l1,
+        created_at: new Date().toISOString(),
+      };
+
+      const { error } = await supabase
+        .from("pronunciation_attempts")
+        .insert(payload);
+
+      if (error) {
+        console.error("pronunciation_attempts insert error:", error);
+      }
+    } catch (err) {
+      console.error("pronunciation_attempts insert exception:", err);
+    }
+  }
+
+  return jsonResponse({
+    score,
+    feedback_l1,
+    ideal_l2_script,
+    ideal_l2_romanization,
+    attempt_transcript,
+  });
 });

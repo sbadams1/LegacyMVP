@@ -1,0 +1,2594 @@
+// supabase/functions/ai-brain/index.ts
+//
+// Gemini 2.0 Flash Experimental "brain" for LegacyMVP.
+// Supports:
+// - Legacy mode: chapter-based interviews
+// - Language learning mode: unit/lesson-based tutoring
+//
+// Now includes:
+// - state_json for minimal structured state (legacy & language modes)
+// - Strong anti-JSON / anti-Markdown rules for language-learning
+// - sanitizeGeminiOutput() to strip code fences / JSON wrappers
+
+import { getGoogleAccessToken } from "../_shared/googleAuth.ts";
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.48.0";
+import {
+  chooseExpansionForConcept,
+  getConceptWithExpansion,
+  PronunciationDrill,
+  buildPronunciationDrill,
+} from "../_shared/vocabulary.ts"; // adjust relative path if needed
+
+// ============================================================================
+// ENV VARS & MODEL
+// ============================================================================
+
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error("❌ SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not set.");
+}
+
+const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { persistSession: false },
+    })
+  : null;
+
+const GEMINI_API_KEY =
+  Deno.env.get("GEMINI_API_KEY") ?? Deno.env.get("GEMINI_API_KEY_EDGE");
+
+// Correct Gemini model + correct endpoint structure
+// You *can* override with GEMINI_MODEL in Supabase if needed
+const GEMINI_MODEL =
+  Deno.env.get("GEMINI_MODEL") ?? "models/gemini-2.0-flash-exp";
+
+if (!GEMINI_API_KEY) {
+  console.error("❌ GEMINI_API_KEY is NOT set in Supabase environment.");
+}
+
+// ============================================================================
+// Types
+// ============================================================================
+type ConversationMode = "legacy" | "language_learning";
+type LearningLevel = "beginner" | "intermediate" | "advanced";
+
+// ---- Speech-to-Text v2 helper ---------------------------------------------
+interface SpeechV2RecognizeOptions {
+  /** Base64-encoded audio bytes (no data: prefix). */
+  audioBytesBase64: string;
+  /** MIME type of the audio, e.g. "audio/webm;codecs=opus" or "audio/mp4". */
+  mimeType: string;
+  /** One or more BCP-47 language codes, e.g. ["en-US", "th-TH"]. */
+  languageCodes: string[];
+  /** Optional model name; default is "latest_long". */
+  model?: string;
+  /**
+   * Optional hint for the learner's target language (L2), e.g. "es-ES" or "th-TH".
+   * If omitted, we'll infer it from languageCodes.
+   */
+  targetLocaleHint?: string | null;
+}
+
+async function recognizeWithSpeechV2(
+  opts: SpeechV2RecognizeOptions,
+): Promise<any> {
+  const projectId = Deno.env.get("GCP_STT_PROJECT_ID");
+  const location = Deno.env.get("GCP_STT_LOCATION") || "global";
+
+  if (!projectId) {
+    throw new Error("GCP_STT_PROJECT_ID is not set in Edge Function secrets.");
+  }
+  if (!location) {
+    throw new Error("GCP_STT_LOCATION is not set in Edge Function secrets.");
+  }
+
+  const accessToken = await getGoogleAccessToken([
+    "https://www.googleapis.com/auth/cloud-platform",
+  ]);
+
+  const languageCodes = opts.languageCodes || [];
+
+  // Start from an explicit hint if provided.
+  let targetLocale: string | undefined =
+    (opts.targetLocaleHint ?? undefined) || undefined;
+
+  // If no hint, pick the first non-English language code, otherwise the first.
+  if (!targetLocale && languageCodes.length > 0) {
+    targetLocale =
+      languageCodes.find((c) =>
+        typeof c === "string" && !c.toLowerCase().startsWith("en")
+      ) ?? languageCodes[0];
+  }
+
+  // Build the full recognizer path
+  const endpointPath = selectRecognizer(targetLocale);
+
+  // Use regional host when not global
+  const host =
+    location === "global"
+      ? "https://speech.googleapis.com"
+      : `https://${location}-speech.googleapis.com`;
+
+  const url = `${host}/v2/${endpointPath}`;
+
+  // Your recognizers are configured for Chirp_3.
+  const model = opts.model ?? "chirp_3";
+
+  const body = {
+    config: {
+      // Let STT auto-detect decoding. This supports MP3, FLAC, WAV_LINEAR16, OGG_OPUS, etc.
+      // We'll send MP3 from the client.
+      autoDecodingConfig: {},
+      languageCodes,
+      model,
+    },
+    content: opts.audioBytesBase64,
+  };
+
+  console.log("[STT v2] recognize request", {
+    url,
+    location,
+    endpointPath,
+    languageCodes,
+    model,
+    mimeType: opts.mimeType,
+  });
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errorText = await res.text();
+
+    console.error("[STT v2] recognize error", {
+      status: res.status,
+      statusText: res.statusText,
+      url,
+      location,
+      endpointPath,
+      languageCodes,
+      model,
+      rawError: errorText,
+    });
+
+    throw new Error(
+      `Speech-to-Text v2 recognize failed: ${res.status} ${res.statusText} | model=${model} | recognizer=${endpointPath} | ${errorText}`,
+    );
+  }
+
+  const json = await res.json();
+
+  console.log("[STT v2] recognize success", {
+    endpointPath,
+    location,
+    model,
+    languageCodes,
+  });
+
+  return json;
+}
+
+interface AiBrainPayload {
+  user_id: string;
+  conversation_id?: string;
+  message_text: string;
+  mode?: ConversationMode;
+  preferred_locale?: string;
+  target_locale?: string | null;
+  learning_level?: LearningLevel;
+  // optional structured state
+  state_json?: string | null;
+  // Optional: pronunciation scoring payload, if the client sends it.
+  pronunciation_scores?: PronunciationScoresPayload | null;
+}
+
+interface PronunciationWordScorePayload {
+  word: string;
+  score: number;
+}
+
+interface PronunciationScoresPayload {
+  reference_text: string;
+  target_locale: string;
+  overall_score: number;
+  words: PronunciationWordScorePayload[];
+}
+
+// Optional: only needed if you later fetch from the profiles table directly
+interface ProfileLanguages {
+  preferred_language?: string | null;
+  supported_languages?: string[] | null;
+}
+
+// ------- LEGACY STATE & CATALOG --------------------------------------------
+interface LegacyInterviewState {
+  chapter_id: string;
+  chapter_title: string;
+  progress_percent: number; // 0–100
+  focus_topic: string | null;
+}
+
+interface LegacyChapterConfig {
+  chapter_id: string;
+  chapter_title: string;
+  goal: string;
+  default_focus_topic: string | null;
+  topics: string[];
+}
+
+// Minimal catalog; extend over time
+const LEGACY_CHAPTERS: Record<string, LegacyChapterConfig> = {
+  childhood: {
+    chapter_id: "childhood",
+    chapter_title: "Childhood & Family Background",
+    goal:
+      "Capture memories about family, home environment, early influences, and early school years.",
+    default_focus_topic: "family_background",
+    topics: [
+      "family_background",
+      "childhood_home",
+      "school_years",
+      "earliest_memory",
+    ],
+  },
+  early_career: {
+    chapter_id: "early_career",
+    chapter_title: "Early Career & First Jobs",
+    goal:
+      "Capture stories about first serious jobs, career direction, mentors, early wins and failures.",
+    default_focus_topic: "first_full_time_job",
+    topics: [
+      "first_full_time_job",
+      "why_chosen_field",
+      "early_mentors",
+      "early_failures",
+      "early_wins",
+    ],
+  },
+};
+
+interface LanguageTargetPhrase {
+  /** Main phrase in the target language script (Thai, etc.) */
+  l2_script: string;
+
+  /** Stable concept key from concept_master (e.g. "RUN_PHYSICAL_MOVE"). */
+  concept_key?: string;
+
+  /** Short L1 gloss for the learner (e.g. "run (physically)"). */
+  l1_gloss?: string;
+
+  /** Optional IPA transcription for internal use. */
+  ipa?: string;
+
+  /** Optional L2 example sentence using this phrase. */
+  example_l2?: string;
+
+  /** Optional L1 translation of that example sentence. */
+  example_l1?: string;
+
+  /** Optional structured drill recipe derived from vocabulary_expansions.drill_steps. */
+  drill?: PronunciationDrill | null;
+}
+
+interface LanguageLessonState {
+  unit_id: string; // e.g. U1_GREETINGS
+  lesson_id: string; // e.g. L1_HELLO_BASICS
+  stage: string; // intro | guided_practice | free_practice | review
+  target_phrases: LanguageTargetPhrase[];
+  // How many times the learner has seen/practiced the main phrase for this lesson.
+  times_seen_main_phrase: number;
+  // Whether the learner is considered to have basically mastered the main phrase.
+  has_mastered_main_phrase: boolean;
+}
+
+// NEW: container that tracks progress per language (th, es, etc.)
+interface MultiLanguageLessonContainer {
+  // version so we can evolve the shape in the future if needed
+  version?: number;
+  // which language key was active most recently ("th", "es", etc.)
+  current_language?: string | null;
+  // Map of language key → per-language lesson state
+  languages: Record<string, LanguageLessonState>;
+}
+
+interface LanguageLessonConfig {
+  lesson_id: string;
+  lesson_name: string;
+  default_stage: string;
+  default_target_phrases: LanguageTargetPhrase[];
+}
+
+interface LanguageUnitConfig {
+  unit_id: string;
+  unit_name: string;
+  lessons: Record<string, LanguageLessonConfig>;
+}
+
+// Language-agnostic curriculum outline.
+// Gemini uses these unit / lesson names plus the guardrails in
+// buildLanguageLearningSystemPrompt() to choose concrete L2 phrases.
+const LANGUAGE_UNITS: Record<string, LanguageUnitConfig> = {
+  // ---------------------------------------------------------------------------
+  // U1 – Greetings & Social Basics (roughly A1)
+  // ---------------------------------------------------------------------------
+  U1_GREETINGS: {
+    unit_id: "U1_GREETINGS",
+    unit_name: "Greetings & Social Basics",
+    lessons: {
+      // Saying hello, basic politeness, first contact.
+      L1_HELLO_BASICS: {
+        lesson_id: "L1_HELLO_BASICS",
+        lesson_name: "Basic greetings",
+        default_stage: "intro",
+        default_target_phrases: [],
+      },
+
+      // Introducing yourself by name / asking others’ names.
+      L2_INTRO_NAME: {
+        lesson_id: "L2_INTRO_NAME",
+        lesson_name: "Saying your name",
+        default_stage: "guided_practice",
+        default_target_phrases: [],
+      },
+
+      // Where you are from / where you live (country, city, origin).
+      L3_WHERE_FROM: {
+        lesson_id: "L3_WHERE_FROM",
+        lesson_name: "Where you are from",
+        default_stage: "guided_practice",
+        default_target_phrases: [],
+      },
+
+      // Simple feelings / “how are you” patterns, very short answers.
+      L4_FEELINGS_SIMPLE: {
+        lesson_id: "L4_FEELINGS_SIMPLE",
+        lesson_name: "How you are feeling",
+        default_stage: "guided_practice",
+        default_target_phrases: [],
+      },
+
+      // Simple goodbyes / closing a conversation politely.
+      L5_GOODBYES: {
+        lesson_id: "L5_GOODBYES",
+        lesson_name: "Simple goodbyes",
+        default_stage: "review",
+        default_target_phrases: [],
+      },
+    },
+  },
+
+  // ---------------------------------------------------------------------------
+  // U2 – Everyday Life & Routines (A1 → A2)
+  // ---------------------------------------------------------------------------
+  U2_EVERYDAY_LIFE: {
+    unit_id: "U2_EVERYDAY_LIFE",
+    unit_name: "Everyday Life & Routines",
+    lessons: {
+      // Days, dates, clock time; talking about “today / tomorrow / yesterday”.
+      L1_TIME_DATE: {
+        lesson_id: "L1_TIME_DATE",
+        lesson_name: "Time and date basics",
+        default_stage: "intro",
+        default_target_phrases: [],
+      },
+
+      // “I wake up at…”, “I go to work at…”, simple daily routine sentences.
+      L2_DAILY_ROUTINE: {
+        lesson_id: "L2_DAILY_ROUTINE",
+        lesson_name: "Simple daily routines",
+        default_stage: "guided_practice",
+        default_target_phrases: [],
+      },
+
+      // Talking about family members and people in your home.
+      L3_HOME_FAMILY: {
+        lesson_id: "L3_HOME_FAMILY",
+        lesson_name: "Home and family",
+        default_stage: "guided_practice",
+        default_target_phrases: [],
+      },
+
+      // Weather small talk (“it’s hot / cold / raining”) + very short comments.
+      L4_WEATHER_SMALL_TALK: {
+        lesson_id: "L4_WEATHER_SMALL_TALK",
+        lesson_name: "Weather & small talk",
+        default_stage: "guided_practice",
+        default_target_phrases: [],
+      },
+
+      // Quick recap of U2 with short dialogues about a typical day.
+      L5_REVIEW_EVERYDAY: {
+        lesson_id: "L5_REVIEW_EVERYDAY",
+        lesson_name: "Everyday life review",
+        default_stage: "review",
+        default_target_phrases: [],
+      },
+    },
+  },
+
+  // ---------------------------------------------------------------------------
+  // U3 – People & Places (A2)
+  // ---------------------------------------------------------------------------
+  U3_PEOPLE_PLACES: {
+    unit_id: "U3_PEOPLE_PLACES",
+    unit_name: "People & Places",
+    lessons: {
+      // Physical + simple personality descriptions (“tall / short / friendly…”).
+      L1_DESCRIBE_PEOPLE_BASIC: {
+        lesson_id: "L1_DESCRIBE_PEOPLE_BASIC",
+        lesson_name: "Describing people (basic)",
+        default_stage: "intro",
+        default_target_phrases: [],
+      },
+
+      // Jobs, study, “I work as…”, “I am a student…”.
+      L2_JOBS_STUDY: {
+        lesson_id: "L2_JOBS_STUDY",
+        lesson_name: "Jobs and study",
+        default_stage: "guided_practice",
+        default_target_phrases: [],
+      },
+
+      // Places in town: shops, bank, station, park, etc.
+      L3_PLACES_IN_TOWN: {
+        lesson_id: "L3_PLACES_IN_TOWN",
+        lesson_name: "Places in town",
+        default_stage: "guided_practice",
+        default_target_phrases: [],
+      },
+
+      // Very simple “go straight / turn left / near the…” directions.
+      L4_GIVING_DIRECTIONS_SIMPLE: {
+        lesson_id: "L4_GIVING_DIRECTIONS_SIMPLE",
+        lesson_name: "Simple directions",
+        default_stage: "guided_practice",
+        default_target_phrases: [],
+      },
+
+      // Review describing people + describing locations / giving directions.
+      L5_REVIEW_PEOPLE_PLACES: {
+        lesson_id: "L5_REVIEW_PEOPLE_PLACES",
+        lesson_name: "Review: people & places",
+        default_stage: "review",
+        default_target_phrases: [],
+      },
+    },
+  },
+
+  // ---------------------------------------------------------------------------
+  // U4 – Practical Tasks & Survival Situations (A2)
+  // ---------------------------------------------------------------------------
+  U4_PRACTICAL_TASKS: {
+    unit_id: "U4_PRACTICAL_TASKS",
+    unit_name: "Practical Tasks & Survival Situations",
+    lessons: {
+      // Buying things, asking prices, quantities, “I would like…”.
+      L1_SHOPPING_BASICS: {
+        lesson_id: "L1_SHOPPING_BASICS",
+        lesson_name: "Shopping basics",
+        default_stage: "intro",
+        default_target_phrases: [],
+      },
+
+      // Ordering food/drinks, simple restaurant interactions.
+      L2_EATING_OUT: {
+        lesson_id: "L2_EATING_OUT",
+        lesson_name: "Eating out",
+        default_stage: "guided_practice",
+        default_target_phrases: [],
+      },
+
+      // Transport: tickets, buses, trains, taxis, “How do I get to…?”
+      L3_TRANSPORTATION: {
+        lesson_id: "L3_TRANSPORTATION",
+        lesson_name: "Getting around",
+        default_stage: "guided_practice",
+        default_target_phrases: [],
+      },
+
+      // Very simple health situations: “I feel…”, “I have a headache…”.
+      L4_HEALTH_SIMPLE: {
+        lesson_id: "L4_HEALTH_SIMPLE",
+        lesson_name: "Simple health problems",
+        default_stage: "guided_practice",
+        default_target_phrases: [],
+      },
+
+      // Survival review: mixed-roleplay with shops, restaurants, travel, health.
+      L5_REVIEW_PRACTICAL: {
+        lesson_id: "L5_REVIEW_PRACTICAL",
+        lesson_name: "Practical review",
+        default_stage: "review",
+        default_target_phrases: [],
+      },
+    },
+  },
+};
+
+// ============================================================================
+// Helpers
+// ============================================================================
+function selectRecognizer(targetLocale?: string): string {
+  const projectId = Deno.env.get("GCP_STT_PROJECT_ID");
+  const location = Deno.env.get("GCP_STT_LOCATION") || "global";
+
+  if (!projectId) {
+    throw new Error("GCP_STT_PROJECT_ID is not set in Edge Function secrets.");
+  }
+  if (!location) {
+    throw new Error("GCP_STT_LOCATION is not set in Edge Function secrets.");
+  }
+
+  // These are your actual recognizer IDs from the console
+  const LEGACY_EN_ES_RECOGNIZER = "legacymvp-en-es";
+  const LEGACY_EN_TH_RECOGNIZER = "legacymvp-en-th";
+  const DEFAULT_RECOGNIZER = LEGACY_EN_ES_RECOGNIZER;
+
+  const lc = (targetLocale || "").toLowerCase();
+
+  let recognizerName = DEFAULT_RECOGNIZER;
+
+  if (lc.startsWith("th")) {
+    recognizerName = LEGACY_EN_TH_RECOGNIZER;
+  } else if (lc.startsWith("es")) {
+    recognizerName = LEGACY_EN_ES_RECOGNIZER;
+  }
+
+  // Full path AFTER /v2/, including :recognize
+  // e.g. projects/638417074365/locations/northamerica-northeast1/recognizers/legacymvp-en-th:recognize
+  return `projects/${projectId}/locations/${location}/recognizers/${recognizerName}:recognize`;
+}
+
+function languageDisplayName(locale: string): string {
+  const lc = (locale || '').toLowerCase();
+  if (lc.startsWith('en')) return 'English';
+  if (lc.startsWith('th')) return 'Thai';
+  if (lc.startsWith('es')) return 'Spanish';
+  if (lc.startsWith('fr')) return 'French';
+  if (lc.startsWith('de')) return 'German';
+  // Fallback
+  return 'the target language';
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function normalizeLocale(raw: unknown, fallback = "en-US"): string {
+  if (typeof raw !== "string" || !raw.trim()) return fallback;
+  const val = raw.trim();
+  const lower = val.toLowerCase();
+
+  switch (lower) {
+    case "en":
+    case "en-us":
+      return "en-US";
+    case "en-gb":
+      return "en-GB";
+    case "th":
+    case "th-th":
+      return "th-TH";
+    case "es":
+    case "es-es":
+      return "es-ES";
+    case "fr":
+    case "fr-fr":
+      return "fr-FR";
+    case "de":
+    case "de-de":
+      return "de-DE";
+    default: {
+      const cleaned = lower.replaceAll("_", "-");
+      if (cleaned.includes("-")) return cleaned;
+      return `${cleaned}-${cleaned.toUpperCase()}`;
+    }
+  }
+}
+
+// NEW: collapse "th-TH" → "th", "es-ES" → "es" for progress keys.
+function getProgressLanguageKey(locale: string | null | undefined): string {
+  if (!locale) return "default";
+  const parts = String(locale).split("-");
+  if (!parts[0]) return "default";
+  return parts[0].toLowerCase();
+}
+
+// Strip code fences / JSON / quotes so Flutter never sees them
+function sanitizeGeminiOutput(text: string): string {
+  if (!text) return text;
+
+  let result = text;
+
+  // Remove ```...``` blocks (any language)
+  result = result.replace(/```[\s\S]*?```/g, "");
+  result = result.replace(/```/g, "");
+
+  // Remove bare { } [ ] lines and simple "key": prefixes
+  result = result.replace(/^\s*[{\[]\s*$/gm, "");
+  result = result.replace(/^\s*[}\]],?\s*$/gm, "");
+  result = result.replace(/"[^"]*"\s*:\s*\[/g, "");
+  result = result.replace(/"[^"]*"\s*:\s*/g, "");
+
+  // Strip surrounding quotes on lines and trailing commas
+  result = result.replace(/^"\s*(.*)\s*",?\s*$/gm, "$1");
+  result = result.replace(/,\s*$/gm, "");
+
+  // Remove empty lines
+  result = result
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0)
+    .join("\n");
+
+  return result.trim();
+}
+
+function extractPronunciationScoreFromReply(
+  reply: string,
+): { score: number | null; line: string | null } {
+  if (!reply) return { score: null, line: null };
+
+  const lines = reply.split(/\r?\n/);
+  let candidate: string | null = null;
+
+  // Prefer a line that mentions both "pronunciation" and "score"
+  for (const line of lines) {
+    if (/pronunciation/i.test(line) && /score/i.test(line)) {
+      candidate = line.trim();
+      break;
+    }
+  }
+
+  // Fallback: any line mentioning "score"
+  if (!candidate) {
+    for (const line of lines) {
+      if (/score/i.test(line)) {
+        candidate = line.trim();
+        break;
+      }
+    }
+  }
+
+  if (!candidate) return { score: null, line: null };
+
+  // Try several patterns, from most specific to more general
+  const regexes = [
+    // "[L1] Pronunciation score: 82/100 – ..."
+    /pronunciation[^0-9]*(\d{1,3})\s*\/\s*100/i,
+    /pronunciation[^0-9]*(\d{1,3})\s*(?:out of|\/)\s*100/i,
+
+    // "Score: 82/100", "score is 82 out of 100"
+    /score[^0-9]*(\d{1,3})\s*\/\s*100/i,
+    /score[^0-9]*(\d{1,3})\s*(?:out of|\/)\s*100/i,
+
+    // Bare "82/100"
+    /(\d{1,3})\s*\/\s*100/i,
+
+    // "82 percent", "82 points"
+    /(\d{1,3})\s*(?:points|percent|percentage)/i,
+
+    // "Pronunciation ... 82"
+    /pronunciation[^0-9]*(\d{1,3})\b/i,
+
+    // "score ... 82"
+    /score[^0-9]*(\d{1,3})\b/i,
+  ];
+
+  for (const re of regexes) {
+    const match = candidate.match(re);
+    if (match) {
+      const raw = parseInt(match[1], 10);
+      if (!Number.isNaN(raw)) {
+        const clamped = Math.max(0, Math.min(100, raw));
+        return { score: clamped, line: candidate };
+      }
+    }
+  }
+
+  // We saw a "score" line but couldn't parse a number cleanly
+  return { score: null, line: candidate };
+}
+
+function isProgressQuery(raw: unknown): boolean {
+  if (!raw || typeof raw !== "string") return false;
+  const text = raw.trim().toLowerCase();
+  if (!text) return false;
+
+  // Explicit slash command
+  if (text.startsWith("/progress")) return true;
+
+  const normalized = text.replace(/[?.!]/g, "");
+
+  // A few natural-language variants
+  if (normalized.includes("show my progress")) return true;
+  if (normalized.includes("what is my progress")) return true;
+  if (normalized.includes("where am i in this course")) return true;
+  if (normalized.includes("where am i in this lesson")) return true;
+  if (normalized.includes("which lesson am i on")) return true;
+  if (normalized.includes("what unit am i on")) return true;
+  if (normalized === "progress") return true;
+
+  return false;
+}
+
+/**
+ * Build a human-readable progress summary for the current language-learning
+ * state, using ONLY [L1] lines (since this is meta-info in the learner's
+ * main language).
+ */
+function buildLanguageProgressSummary(
+  preferredLocale: string,
+  targetLocale: string,
+  learningLevel: LearningLevel,
+  state: LanguageLessonState,
+): string {
+  const fallbackUnit = LANGUAGE_UNITS["U1_GREETINGS"];
+  const unit =
+    LANGUAGE_UNITS[state.unit_id] ?? fallbackUnit;
+
+  const fallbackLesson = fallbackUnit.lessons["L1_HELLO_BASICS"];
+  const lesson =
+    unit.lessons[state.lesson_id] ?? fallbackLesson;
+
+  const stageLabels: Record<string, string> = {
+    intro: "introduction",
+    guided_practice: "guided practice",
+    free_practice: "free practice",
+    review: "review",
+  };
+
+  const stageLabel =
+    stageLabels[state.stage] ?? state.stage ?? "unknown";
+
+  const levelLabel = (() => {
+    switch (learningLevel) {
+      case "beginner":
+        return "beginner";
+      case "intermediate":
+        return "intermediate";
+      case "advanced":
+        return "advanced";
+      default:
+        return String(learningLevel || "unspecified");
+    }
+  })();
+
+  const masteredText = state.has_mastered_main_phrase ? "yes" : "not yet";
+
+  const lines: string[] = [
+    "[L1] Here is your current progress in this language course.",
+    `[L1] Your main language (L1) is set to ${preferredLocale}, and your target language (L2) is ${targetLocale}.`,
+    `[L1] You are currently in unit ${unit.unit_id} – "${unit.unit_name}".`,
+    `[L1] Current lesson: "${lesson.lesson_name}" (${lesson.lesson_id}).`,
+    `[L1] Current stage in this lesson: ${stageLabel}.`,
+    `[L1] Overall learning level: ${levelLabel}.`,
+    `[L1] Times you have practiced the main phrase in this lesson: ${state.times_seen_main_phrase}.`,
+    `[L1] Mastery of the main phrase in this lesson: ${masteredText}.`,
+    "[L1] You can say something like \"move ahead\" if this feels too easy, or keep practicing here for more depth.",
+  ];
+
+  return lines.join("\n");
+}
+
+function isMoveAheadQuery(raw: unknown): boolean {
+  if (!raw || typeof raw !== "string") return false;
+  const text = raw.trim().toLowerCase();
+  if (!text) return false;
+
+  // Explicit slash command
+  if (text.startsWith("/advance")) return true;
+  if (text.startsWith("/skip")) return true;
+
+  const normalized = text.replace(/[?.!]/g, "");
+
+  // Natural-language variants
+  if (normalized.includes("move me ahead")) return true;
+  if (normalized.includes("move ahead")) return true;
+  if (normalized.includes("skip ahead")) return true;
+  if (normalized.includes("skip this")) return true;
+  if (normalized.includes("this is too easy")) return true;
+  if (normalized.includes("go faster")) return true;
+  if (normalized.includes("harder content")) return true;
+
+  return false;
+}
+
+function isGoBackQuery(raw: unknown): boolean {
+  if (!raw || typeof raw !== "string") return false;
+  const text = raw.trim().toLowerCase();
+  if (!text) return false;
+
+  // Explicit slash command for a button to send
+  if (text.startsWith("/back")) return true;
+  if (text.startsWith("/easier")) return true;
+
+  const normalized = text.replace(/[?.!]/g, "");
+
+  // Natural-language variants
+  if (normalized.includes("go back")) return true;
+  if (normalized.includes("too hard")) return true;
+  if (normalized.includes("this is hard")) return true;
+  if (normalized.includes("slow down")) return true;
+  if (normalized.includes("easier")) return true;
+
+  return false;
+}
+
+/**
+ * Fast-forward the lesson state by marking the current lesson as "mastered"
+ * and then calling advanceLanguageLessonState() once. This nudges the
+ * curriculum forward without jumping wildly.
+ */
+function fastForwardLanguageState(
+  state: LanguageLessonState,
+): LanguageLessonState {
+  const forced: LanguageLessonState = {
+    ...state,
+    times_seen_main_phrase: Math.max(
+      state.times_seen_main_phrase ?? 0,
+      3,
+    ),
+    has_mastered_main_phrase: true,
+  };
+
+  return advanceLanguageLessonState(forced);
+}
+
+/**
+ * Build a friendly [L1]-only response telling the learner we've moved
+ * them forward and where they are now in the curriculum.
+ */
+function buildMoveAheadReply(
+  preferredLocale: string,
+  targetLocale: string,
+  learningLevel: LearningLevel,
+  newState: LanguageLessonState,
+): string {
+  const fallbackUnit = LANGUAGE_UNITS["U1_GREETINGS"];
+  const unit =
+    LANGUAGE_UNITS[newState.unit_id] ?? fallbackUnit;
+
+  const fallbackLesson = fallbackUnit.lessons["L1_HELLO_BASICS"];
+  const lesson =
+    unit.lessons[newState.lesson_id] ?? fallbackLesson;
+
+  const stageLabels: Record<string, string> = {
+    intro: "introduction",
+    guided_practice: "guided practice",
+    free_practice: "free practice",
+    review: "review",
+  };
+
+  const stageLabel =
+    stageLabels[newState.stage] ?? newState.stage ?? "unknown";
+
+  const levelLabel = (() => {
+    switch (learningLevel) {
+      case "beginner":
+        return "beginner";
+      case "intermediate":
+        return "intermediate";
+      case "advanced":
+        return "advanced";
+      default:
+        return String(learningLevel || "unspecified");
+    }
+  })();
+
+  return [
+    "[L1] Got it — I’ll move you ahead to slightly more challenging material.",
+    `[L1] Your main language (L1) is ${preferredLocale}, and your target language (L2) is ${targetLocale}.`,
+    `[L1] You are now in unit ${unit.unit_id} – "${unit.unit_name}".`,
+    `[L1] Current lesson: "${lesson.lesson_name}" (${lesson.lesson_id}).`,
+    `[L1] Current stage in this lesson: ${stageLabel}.`,
+    `[L1] Overall learning level: ${levelLabel}.`,
+    "[L1] I will start using this new spot as your baseline. Try answering in the target language, and I’ll keep adjusting difficulty based on your replies.",
+  ].join("\n");
+}
+
+function buildGoBackReply(
+  preferredLocale: string,
+  targetLocale: string,
+  learningLevel: LearningLevel,
+  newState: LanguageLessonState,
+): string {
+  const fallbackUnit = LANGUAGE_UNITS["U1_GREETINGS"];
+  const unit =
+    LANGUAGE_UNITS[newState.unit_id] ?? fallbackUnit;
+
+  const fallbackLesson = fallbackUnit.lessons["L1_HELLO_BASICS"];
+  const lesson =
+    unit.lessons[newState.lesson_id] ?? fallbackLesson;
+
+  const stageLabels: Record<string, string> = {
+    intro: "introduction",
+    guided_practice: "guided practice",
+    free_practice: "free practice",
+    review: "review",
+  };
+
+  const stageLabel =
+    stageLabels[newState.stage] ?? newState.stage ?? "unknown";
+
+  const levelLabel = (() => {
+    switch (learningLevel) {
+      case "beginner":
+        return "beginner";
+      case "intermediate":
+        return "intermediate";
+      case "advanced":
+        return "advanced";
+      default:
+        return String(learningLevel || "unspecified");
+    }
+  })();
+
+  return [
+    "[L1] Got it — I’ll step back to slightly easier practice for this topic.",
+    `[L1] Your main language (L1) is ${preferredLocale}, and your target language (L2) is ${targetLocale}.`,
+    `[L1] You are now in unit ${unit.unit_id} – "${unit.unit_name}".`,
+    `[L1] Current lesson: "${lesson.lesson_name}" (${lesson.lesson_id}).`,
+    `[L1] Current stage in this lesson: ${stageLabel}.`,
+    `[L1] Overall learning level: ${levelLabel}.`,
+    "[L1] I’ll stay around this level until you feel ready to move ahead again. You can say \"move ahead\" or use the advance button when you’re comfortable.",
+  ].join("\n");
+}
+
+// Ensure [L1] lines don't contain Thai script or obvious Thai romanization
+// when L2 is Thai. This keeps Thai content on [L2] only, and avoids ugly
+// pronunciation attempts by the L1 TTS voice.
+function enforceLanguageOnTaggedLines(
+  text: string,
+  preferredLocale: string,
+  targetLocale: string | null,
+): string {
+  if (!text) return text;
+
+  const isThaiTarget =
+    targetLocale && targetLocale.toLowerCase().startsWith("th");
+
+  // For non-Thai targets, do nothing.
+  if (!isThaiTarget) {
+    return text;
+  }
+
+  const thaiRegex = /[\u0E00-\u0E7F]/g;
+
+  // Heuristic for Thai romanization:
+  // - Latin letters, spaces, hyphens, diacritics
+  // - and typical Thai romanization patterns like khrap, kha, ph, kh, ng, etc.
+  const looksLikeThaiRomanization =
+    /(sa\-?wat|sawasdee|khrap|kha\b|khun\b|phra|ngaan|baan|krung|th[aăeio])/i;
+
+  // Parenthesized segments that might contain romanization
+  const romanizationParenRegex =
+    /\(([A-Za-zÀ-ÿ0-9\s\-\u0300-\u036f]+)\)/g;
+
+  // Quoted segments that might contain romanization
+  const romanizationQuoteRegex =
+    /"([^"]*)"/g;
+
+  const lines = text.split(/\r?\n/);
+
+  const processed = lines.map((line) => {
+    const match = line.match(/^\s*\[(L1|L2)\]\s*(.*)$/);
+    if (!match) return line;
+
+    const tag = match[1];
+    let content = match[2] ?? "";
+
+    if (tag === "L1") {
+      // 1) Strip or neutralize quoted romanization like "khrap", "kha".
+      content = content.replace(romanizationQuoteRegex, (full, inner) => {
+        const innerStr = String(inner);
+        if (looksLikeThaiRomanization.test(innerStr)) {
+          // Replace with a neutral label rather than raw romanization.
+          return '"this phrase"';
+        }
+        return full;
+      });
+
+      // 2) Strip parenthesized romanization like (sa-wat-dii khrap).
+      content = content.replace(romanizationParenRegex, (full, inner) => {
+        const innerStr = String(inner);
+        if (looksLikeThaiRomanization.test(innerStr)) {
+          // Drop completely; the learner will see the real Thai on [L2] lines.
+          return "";
+        }
+        // Keep English explanations like "(polite)" untouched.
+        return full;
+      });
+
+      // 3) Remove any remaining Thai script characters.
+      content = content.replace(thaiRegex, "");
+
+      // 4) Clean up artifacts:
+      //    - empty parentheses
+      //    - extra spaces
+      //    - stray slashes at line end
+      content = content.replace(/\(\s*\)/g, "");
+      content = content.replace(/[\/]+$/g, "");
+      content = content.replace(/\s{2,}/g, " ").trim();
+
+      return content ? `[${tag}] ${content}` : `[${tag}]`;
+    }
+
+    // For [L2], we leave Thai + romanization as-is; the client
+    // decides what gets spoken vs displayed.
+    return line;
+  });
+
+  return processed.join("\n").trim();
+}
+
+// ------- Legacy state utilities --------------------------------------------
+function parseLegacyState(stateJson?: string | null): LegacyInterviewState | null {
+  if (!stateJson) return null;
+  try {
+    const obj = JSON.parse(stateJson);
+    if (!obj || typeof obj !== "object") return null;
+    const state = obj as LegacyInterviewState;
+    if (!state.chapter_id) return null;
+    return {
+      chapter_id: state.chapter_id,
+      chapter_title: state.chapter_title ?? "",
+      progress_percent:
+        typeof state.progress_percent === "number"
+          ? state.progress_percent
+          : 0,
+      focus_topic: state.focus_topic ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getDefaultLegacyState(): LegacyInterviewState {
+  const chapter = LEGACY_CHAPTERS["childhood"];
+  return {
+    chapter_id: chapter.chapter_id,
+    chapter_title: chapter.chapter_title,
+    progress_percent: 0,
+    focus_topic: chapter.default_focus_topic,
+  };
+}
+
+// ------- Language state utilities ------------------------------------------
+
+// Example: figure out which "run" you mean before calling the helper.
+// For now, this is a simple mapping from (unit_id, lesson_id)
+// to a concept_key in concept_master. You can extend this over time.
+function chooseConceptKeyForLesson(
+  unitId: string,
+  lessonId: string,
+): string | null {
+  // Example: in U2_DAILY_ROUTINE you might want "RUN_PHYSICAL_MOVE"
+  // so Gemini can talk about "I run every morning" with the correct L2 verb.
+  if (unitId === "U2_EVERYDAY_LIFE" && lessonId === "L2_DAILY_ROUTINE") {
+    return "RUN_PHYSICAL_MOVE";
+  }
+
+  // Add more mappings here as you seed concept_master, e.g.:
+  // if (unitId === "U1_GREETINGS" && lessonId === "L1_HELLO_BASICS") {
+  //   return "GREET_HELLO_BASIC";
+  // }
+
+  // No specific concept for this lesson yet.
+  return null;
+}
+
+function parseLanguageLessonState(
+  stateJson?: string | null,
+): LanguageLessonState | null {
+  if (!stateJson) return null;
+
+  try {
+    const obj = JSON.parse(stateJson);
+    if (!obj || typeof obj !== "object") return null;
+
+    const state = obj as any;
+
+    if (!state.unit_id || !state.lesson_id) return null;
+
+    const phrases = Array.isArray(state.target_phrases)
+      ? state.target_phrases
+          .filter((p: any) => p && typeof p.l2_script === "string")
+      : [];
+
+    const timesSeen =
+      typeof state.times_seen_main_phrase === "number" &&
+      Number.isFinite(state.times_seen_main_phrase)
+        ? state.times_seen_main_phrase
+        : 0;
+
+    const hasMastered = state.has_mastered_main_phrase === true;
+
+    return {
+      unit_id: state.unit_id as string,
+      lesson_id: state.lesson_id as string,
+      stage: (state.stage as string) || "intro",
+      target_phrases: phrases,
+      times_seen_main_phrase: timesSeen,
+      has_mastered_main_phrase: hasMastered,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// NEW: wrapper that supports either:
+//  - old single-language state_json, or
+//  - new multi-language container with .languages
+function parseMultiLanguageLessonState(
+  stateJson: string | null | undefined,
+  langKey: string,
+): { container: MultiLanguageLessonContainer; active: LanguageLessonState } {
+  // Default state + container
+  const defaultState = getDefaultLanguageLessonState();
+  let container: MultiLanguageLessonContainer = {
+    version: 1,
+    current_language: langKey,
+    languages: {},
+  };
+
+  if (!stateJson) {
+    container.languages[langKey] = defaultState;
+    return { container, active: defaultState };
+  }
+
+  try {
+    const raw = JSON.parse(stateJson);
+
+    // Case 1: Already a multi-language container
+    if (raw && typeof raw === "object" && "languages" in raw) {
+      const existing = raw as any;
+      const languages = (existing.languages ?? {}) as Record<string, any>;
+
+      // Try to parse the specific language entry if it exists.
+      const rawStateForLang = languages[langKey];
+      let active: LanguageLessonState;
+
+      if (rawStateForLang) {
+        const parsed = parseLanguageLessonState(
+          JSON.stringify(rawStateForLang),
+        );
+        active = parsed ?? defaultState;
+      } else {
+        active = defaultState;
+      }
+
+      const normalizedLanguages: Record<string, LanguageLessonState> = {};
+      for (const [key, value] of Object.entries(languages)) {
+        const parsed = parseLanguageLessonState(JSON.stringify(value));
+        if (parsed) {
+          normalizedLanguages[key] = parsed;
+        }
+      }
+
+      // Ensure current language is present.
+      normalizedLanguages[langKey] = active;
+
+      container = {
+        version: typeof existing.version === "number" ? existing.version : 1,
+        current_language: langKey,
+        languages: normalizedLanguages,
+      };
+
+      return { container, active };
+    }
+
+    // Case 2: Old-style single-language state
+    const single = parseLanguageLessonState(stateJson);
+    if (single) {
+      container.languages[langKey] = single;
+      return { container, active: single };
+    }
+  } catch {
+    // fall through to default
+  }
+
+  // Fallback: nothing parseable, return default
+  container.languages[langKey] = defaultState;
+  return { container, active: defaultState };
+}
+
+function getDefaultLanguageLessonState(): LanguageLessonState {
+  const unit = LANGUAGE_UNITS["U1_GREETINGS"];
+  const lesson = unit.lessons["L1_HELLO_BASICS"];
+
+  return {
+    unit_id: unit.unit_id,
+    lesson_id: lesson.lesson_id,
+    stage: lesson.default_stage,
+    target_phrases: lesson.default_target_phrases,
+    times_seen_main_phrase: 0,
+    has_mastered_main_phrase: false,
+  };
+}
+
+// Advance the lesson stage so we don't stay stuck on "intro" forever.
+// Very simple progression for now:
+//   intro -> guided_practice -> free_practice -> review -> review (stay)
+function advanceLanguageLessonState(
+  state: LanguageLessonState,
+): LanguageLessonState {
+  const stageOrder = ["intro", "guided_practice", "free_practice", "review"] as const;
+
+  // Ordered curriculum path across all units/lessons.
+  // This MUST stay in sync with LANGUAGE_UNITS.
+  const curriculumPath: Array<{ unitId: string; lessonId: string }> = [
+    // U1 – Greetings & Small Talk
+    { unitId: "U1_GREETINGS", unitId: "U1_GREETINGS", lessonId: "L1_HELLO_BASICS" },
+    { unitId: "U1_GREETINGS", lessonId: "L2_INTRO_NAME" },
+    { unitId: "U1_GREETINGS", lessonId: "L3_WHERE_FROM" },
+    { unitId: "U1_GREETINGS", lessonId: "L4_FEELINGS_SIMPLE" },
+    { unitId: "U1_GREETINGS", lessonId: "L5_GOODBYES" },
+
+    // U2 – Everyday Life
+    { unitId: "U2_EVERYDAY_LIFE", lessonId: "L1_TIME_DATE" },
+    { unitId: "U2_EVERYDAY_LIFE", lessonId: "L2_DAILY_ROUTINE" },
+    { unitId: "U2_EVERYDAY_LIFE", lessonId: "L3_HOME_FAMILY" },
+    { unitId: "U2_EVERYDAY_LIFE", lessonId: "L4_WEATHER_SMALL_TALK" },
+    { unitId: "U2_EVERYDAY_LIFE", lessonId: "L5_REVIEW_EVERYDAY" },
+
+    // U3 – People & Places
+    { unitId: "U3_PEOPLE_PLACES", lessonId: "L1_DESCRIBE_PEOPLE_BASIC" },
+    { unitId: "U3_PEOPLE_PLACES", lessonId: "L2_JOBS_STUDY" },
+    { unitId: "U3_PEOPLE_PLACES", lessonId: "L3_PLACES_IN_TOWN" },
+    { unitId: "U3_PEOPLE_PLACES", lessonId: "L4_GIVING_DIRECTIONS_SIMPLE" },
+    { unitId: "U3_PEOPLE_PLACES", lessonId: "L5_REVIEW_PEOPLE_PLACES" },
+
+    // U4 – Practical Tasks
+    { unitId: "U4_PRACTICAL_TASKS", lessonId: "L1_SHOPPING_BASICS" },
+    { unitId: "U4_PRACTICAL_TASKS", lessonId: "L2_EATING_OUT" },
+    { unitId: "U4_PRACTICAL_TASKS", lessonId: "L3_TRANSPORTATION" },
+    { unitId: "U4_PRACTICAL_TASKS", lessonId: "L4_HEALTH_SIMPLE" },
+    { unitId: "U4_PRACTICAL_TASKS", lessonId: "L5_REVIEW_PRACTICAL" },
+  ];
+
+  const findPathIndex = (unitId: string, lessonId: string): number =>
+    curriculumPath.findIndex(
+      (p) => p.unitId === unitId && p.lessonId === lessonId,
+    );
+
+  const idx = stageOrder.indexOf(state.stage as any);
+
+  // Default: advance stage within the current lesson.
+  let nextStage = state.stage;
+  if (idx === -1) {
+    nextStage = "guided_practice";
+  } else if (idx < stageOrder.length - 1) {
+    nextStage = stageOrder[idx + 1];
+  } else {
+    nextStage = "review";
+  }
+
+  // Increment "times seen" up to a cap.
+  const currentTimes = Number.isFinite(state.times_seen_main_phrase)
+    ? state.times_seen_main_phrase
+    : 0;
+  const nextTimes = Math.min(currentTimes + 1, 10);
+
+  // Compute mastery flag.
+  let nextMastered = state.has_mastered_main_phrase;
+  if (!nextMastered) {
+    if (nextTimes >= 3 || nextStage === "free_practice" || nextStage === "review") {
+      nextMastered = true;
+    }
+  }
+
+  let nextUnitId = state.unit_id;
+  let nextLessonId = state.lesson_id;
+  let lessonChanged = false;
+
+  // If we've reached review and are considered "mastered", consider moving on.
+  if (nextMastered && nextStage === "review") {
+    const pathIndex = findPathIndex(state.unit_id, state.lesson_id);
+
+    if (pathIndex >= 0 && pathIndex < curriculumPath.length - 1) {
+      const next = curriculumPath[pathIndex + 1];
+      nextUnitId = next.unitId;
+      nextLessonId = next.lessonId;
+      nextStage = "intro";
+      lessonChanged = true;
+    }
+    // If we're at the end of the path, just stay in the final review lesson.
+  }
+
+  let nextTargetPhrases = state.target_phrases;
+
+  if (lessonChanged) {
+    const unit =
+      LANGUAGE_UNITS[nextUnitId] ?? LANGUAGE_UNITS["U1_GREETINGS"];
+    const lesson =
+      unit.lessons[nextLessonId] ??
+      unit.lessons["L1_HELLO_BASICS"];
+
+    nextTargetPhrases = lesson.default_target_phrases;
+
+    // When we change lessons, reset counters.
+    return {
+      unit_id: unit.unit_id,
+      lesson_id: lesson.lesson_id,
+      stage: lesson.default_stage ?? nextStage,
+      target_phrases: nextTargetPhrases,
+      times_seen_main_phrase: 0,
+      has_mastered_main_phrase: false,
+    };
+  }
+
+  // Otherwise, stay in the same lesson and just advance stage / counters.
+  return {
+    ...state,
+    stage: nextStage,
+    times_seen_main_phrase: nextTimes,
+    has_mastered_main_phrase: nextMastered,
+  };
+}
+
+// Step the lesson state backwards to slightly easier practice.
+// Very simple regression:
+//   review -> free_practice -> guided_practice -> intro
+//   intro stays intro (we do not jump to earlier units here).
+function regressLanguageLessonState(
+  state: LanguageLessonState,
+): LanguageLessonState {
+  const stageOrder = ["intro", "guided_practice", "free_practice", "review"] as const;
+  const idx = stageOrder.indexOf(state.stage as any);
+
+  let prevStage = state.stage;
+  if (idx === -1 || idx === 0) {
+    prevStage = "intro";
+  } else {
+    prevStage = stageOrder[idx - 1];
+  }
+
+  // Nudge "times seen" down a bit so mastery relaxes.
+  const downgradedTimes = Math.max(
+    (state.times_seen_main_phrase ?? 0) - 1,
+    0,
+  );
+
+  const downgradedMastered =
+    downgradedTimes >= 3 && prevStage !== "intro"
+      ? state.has_mastered_main_phrase
+      : false;
+
+  return {
+    ...state,
+    stage: prevStage,
+    times_seen_main_phrase: downgradedTimes,
+    has_mastered_main_phrase: downgradedMastered,
+  };
+}
+
+// ============================================================================
+// Persistent language progress (Supabase)
+// ============================================================================
+
+interface LanguageProgressRow {
+  user_id: string;
+  target_language: string;
+  unit_id: string;
+  lesson_id: string;
+  stage: string;
+  learning_level: string;
+  times_seen_main_phrase: number | null;
+  has_mastered_main_phrase: boolean | null;
+}
+
+/**
+ * Convert a progress row from Supabase into a LanguageLessonState,
+ * using LANGUAGE_UNITS to supply default target_phrases and stages.
+ */
+function languageLessonStateFromProgressRow(
+  row: LanguageProgressRow,
+): LanguageLessonState {
+  const unitId = row.unit_id || "U1_GREETINGS";
+  const lessonId = row.lesson_id || "L1_HELLO_BASICS";
+
+  const fallbackUnit = LANGUAGE_UNITS["U1_GREETINGS"];
+  const unit = LANGUAGE_UNITS[unitId] ?? fallbackUnit;
+
+  const fallbackLesson = fallbackUnit.lessons["L1_HELLO_BASICS"];
+  const lesson = unit.lessons[lessonId] ?? fallbackLesson;
+
+  const stage = (row.stage as LanguageLessonState["stage"]) ||
+    lesson.default_stage ||
+    "intro";
+
+  const times = Number.isFinite(row.times_seen_main_phrase)
+    ? (row.times_seen_main_phrase as number)
+    : 0;
+
+  const mastered = row.has_mastered_main_phrase === true;
+
+  return {
+    unit_id: unit.unit_id,
+    lesson_id: lesson.lesson_id,
+    stage,
+    target_phrases: lesson.default_target_phrases,
+    times_seen_main_phrase: times,
+    has_mastered_main_phrase: mastered,
+  };
+}
+
+/**
+ * Load persistent progress for (user_id, target_language) from Supabase.
+ * Returns null if no progress exists or on error.
+ */
+async function loadLanguageProgress(
+  userId: string,
+  targetLocale: string,
+): Promise<LanguageLessonState | null> {
+  if (!supabase) return null;
+
+  const targetLanguage = normalizeLocale(targetLocale, "en-US");
+
+  try {
+    const { data, error } = await supabase
+      .from("language_progress")
+      .select(
+        "user_id, target_language, unit_id, lesson_id, stage, learning_level, times_seen_main_phrase, has_mastered_main_phrase",
+      )
+      .eq("user_id", userId)
+      .eq("target_language", targetLanguage)
+      .maybeSingle<LanguageProgressRow>();
+
+    if (error) {
+      // Log but don't break the request
+      console.error("loadLanguageProgress error:", error);
+      return null;
+    }
+
+    if (!data) return null;
+
+    return languageLessonStateFromProgressRow(data);
+  } catch (err) {
+    console.error("loadLanguageProgress exception:", err);
+    return null;
+  }
+}
+
+/**
+ * Persist progress for (user_id, target_language) back to Supabase.
+ * This is best-effort; failures are logged but don't fail the request.
+ */
+async function saveLanguageProgress(
+  userId: string,
+  targetLocale: string,
+  state: LanguageLessonState,
+  learningLevel: LearningLevel,
+): Promise<void> {
+  if (!supabase) return;
+
+  const targetLanguage = normalizeLocale(targetLocale, "en-US");
+
+  try {
+    const payload = {
+      user_id: userId,
+      target_language: targetLanguage,
+      unit_id: state.unit_id,
+      lesson_id: state.lesson_id,
+      stage: state.stage,
+      learning_level: learningLevel,
+      times_seen_main_phrase: state.times_seen_main_phrase,
+      has_mastered_main_phrase: state.has_mastered_main_phrase,
+      last_active_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    const { error } = await supabase
+      .from("language_progress")
+      .upsert(payload, {
+        onConflict: "user_id,target_language",
+      });
+
+    if (error) {
+      console.error("saveLanguageProgress error:", error);
+    }
+  } catch (err) {
+    console.error("saveLanguageProgress exception:", err);
+  }
+}
+
+async function logPronunciationAttempt(
+  userId: string,
+  targetLocale: string,
+  state: LanguageLessonState,
+  learnerTranscript: string,
+  score: number | null,
+  scoreLine: string | null,
+): Promise<void> {
+  if (!supabase) return;
+
+  const targetLanguage = normalizeLocale(targetLocale, "en-US");
+
+  if (!state.target_phrases || state.target_phrases.length === 0) {
+    return;
+  }
+
+  const main = state.target_phrases[0];
+
+  try {
+    const payload = {
+      user_id: userId,
+      target_language: targetLanguage,
+      unit_id: state.unit_id,
+      lesson_id: state.lesson_id,
+      concept_key: main.concept_key ?? null,
+      target_phrase: main.l2_script,
+      learner_transcript: learnerTranscript,
+      score,
+      raw_model_score_line: scoreLine,
+    };
+
+    const { error } = await supabase
+      .from("pronunciation_attempts")
+      .insert(payload);
+
+    if (error) {
+      console.error("logPronunciationAttempt error:", error);
+    }
+  } catch (err) {
+    console.error("logPronunciationAttempt exception:", err);
+  }
+}
+
+// ============================================================================
+// System prompts
+// ============================================================================
+function buildLegacySystemPrompt(
+  preferredLocale: string,
+  state: LegacyInterviewState,
+  chapter: LegacyChapterConfig,
+): string {
+  const focusTopic = state.focus_topic || chapter.default_focus_topic;
+  const progressText = `${Math.round(
+    state.progress_percent ?? 0,
+  )}`.padStart(1, "0");
+
+  return `
+You are the LEGACY STORYTELLING brain for the LegacyMVP app.
+
+ROLE
+- The donor is sharing life stories, reflections, values, regrets, and hopes.
+- You are a warm, empathetic conversational partner and gentle interviewer.
+- You help them leave a meaningful record of their life for future generations.
+
+LANGUAGE
+- The donor's preferred language (L1) is "${preferredLocale}".
+- You MUST respond ONLY in this language.
+
+CURRENT CHAPTER CONTEXT
+- Chapter ID: "${chapter.chapter_id}"
+- Chapter Title: "${chapter.chapter_title}"
+- Chapter Goal: ${chapter.goal}
+- Approximate progress in this chapter: ${progressText}% complete.
+- Focus topic in this chapter: "${focusTopic ?? "general"}"
+- Available topics within this chapter:
+  ${chapter.topics.map((t) => `- ${t}`).join("\n  ")}
+
+BEHAVIOR
+- Stay within the current chapter unless the donor explicitly changes topics.
+- Prefer questions that deepen the current focus topic ("${focusTopic ?? "general"}").
+- If the donor jumps to another part of life, briefly acknowledge it but gently steer back to the current chapter.
+- Ask exactly ONE thoughtful follow-up question per reply.
+- Reflect their emotions and values, not just facts.
+- Avoid rapid-fire questioning; let them feel heard.
+
+STYLE
+- Clear, natural sentences in ${preferredLocale}.
+- Warm, humane, not robotic.
+- Acknowledge what they said.
+- Reflect 1–2 key themes or feelings.
+- Then end with one inviting follow-up question related to the current chapter and focus topic.
+
+ABSOLUTE OUTPUT RULES
+- Your reply must be plain text only.
+- Do NOT use Markdown.
+- NEVER wrap your reply in { }, [ ], or quotes.
+- Output ONLY plain text lines beginning with [L1] or [L2].
+- Never include romanization on [L1] lines (not even inside quotes or parentheses).
+- Romanization is allowed ONLY on [L2] lines, optionally in parentheses.
+- For EVERY pronunciation attempt you detect, you MUST include exactly ONE [L1] line
+  that contains the phrase "Pronunciation score:" followed by an integer from 0 to 100
+  and "/100", for example:
+  [L1] Pronunciation score: 82/100 – vowels were clear, but the final tone was a bit off.
+- Once the learner has been introduced to a phrase (such as a basic greeting),
+  you must NOT keep restarting the lesson with "Let's start learning how to say hello".
+  Continue the lesson from where the learner appears to be, based on:
+  - the latest message,
+  - the current stage, and
+  - the memory fields in lesson_state.
+`.trim();
+}
+
+function buildLanguageLearningSystemPrompt(
+  l1: string,
+  l2: string,
+  level: LearningLevel,
+  state: LanguageLessonState,
+  unitConfig: LanguageUnitConfig,
+  lessonConfig: LanguageLessonConfig,
+): string {
+     const phraseLines = state.target_phrases
+    .map((p, idx) => {
+      const lines: string[] = [];
+
+      lines.push(`- Phrase ${idx + 1}: ${p.l2_script}`);
+
+      if (p.l1_gloss) {
+        lines.push(`  • L1 gloss: ${p.l1_gloss}`);
+      }
+      if (p.ipa) {
+        lines.push(`  • IPA (for you, the AI): ${p.ipa}`);
+      }
+      if (p.example_l2) {
+        lines.push(`  • Example L2 sentence: ${p.example_l2}`);
+      }
+      if (p.example_l1) {
+        lines.push(`  • Example meaning (L1): ${p.example_l1}`);
+      }
+
+      return lines.join("\n");
+    })
+    .join("\n  ");
+
+  const stage = state.stage || "intro";
+
+  // Optional memory fields
+  const anyState = state as any;
+  const timesSeen = anyState.times_seen_main_phrase ?? 0;
+  const hasMastered = anyState.has_mastered_main_phrase === true;
+
+  // Simple human-readable names for locales
+  const describeLocale = (loc: string): string => {
+    const lc = (loc || "").toLowerCase();
+    if (lc.startsWith("en")) return "English";
+    if (lc.startsWith("th")) return "Thai";
+    if (lc.startsWith("es")) return "Spanish";
+    if (lc.startsWith("fr")) return "French";
+    if (lc.startsWith("de")) return "German";
+    return "the target language";
+  };
+
+  const l1Name = describeLocale(l1);
+  const l2Name = describeLocale(l2);
+  const l1Lower = l1Name.toLowerCase();
+  const l2Lower = l2Name.toLowerCase();
+  const l2IsThai = l2.toLowerCase().startsWith("th");
+
+  const stageGuidance = (() => {
+    switch (stage) {
+      case "intro":
+        return `
+- Treat this as the FIRST introduction for this lesson ONLY when:
+  - lesson_state.times_seen_main_phrase is 0, AND
+  - lesson_state.has_mastered_main_phrase is false.
+- If the learner has already seen this greeting in earlier turns or sessions
+  (times_seen_main_phrase >= 1), or if has_mastered_main_phrase is true:
+  - SKIP any slow "today we will learn to say a greeting" style intros.
+  - At most, give ONE very short recap sentence in [L1], then move on.
+- You may briefly say that you will practice a basic greeting in ${l2Name} ONCE.
+- Keep the intro short (one or two replies), then move quickly into practice.
+- If the learner already shows they know basic greetings from their messages,
+  SKIP the long "let's learn a greeting" explanation entirely and move to more useful
+  content (self-introductions, questions, etc.).
+- Do NOT repeat lines like "Let's start learning how to say hello" in multiple replies.
+  That type of sentence may appear at most once while times_seen_main_phrase is 0.`; 
+
+      case "guided_practice":
+        return `
+- The learner has already seen the main greeting phrase(s) for this lesson.
+- If lesson_state.has_mastered_main_phrase is true OR times_seen_main_phrase >= 2:
+  - Assume they already know the basic greeting form.
+  - Do NOT restart with "Let's learn how to say hello" or similar.
+- Focus on:
+  - repeat-after-me practice,
+  - short question/answer drills,
+  - simple variations (different times of day / situations).
+- After using the main greeting phrase about twice, introduce at least one additional
+  short phrase from the same unit (e.g., "good morning", "How are you?", "Nice to meet you.").
+- Each reply should either practice a known phrase in a new way, or add one closely related phrase.
+  Avoid repeating the exact same pattern.
+- In this stage, many turns should follow a CALL-AND-RESPONSE pattern:
+  - One reply gives a clear assignment (without the full L2 answer).
+  - The NEXT reply (after the learner responds) evaluates and, if needed, shows
+    the correct L2 form.
+- When the learner is consistently successful in these drills, it is appropriate for the
+  app to move the stage towards "free_practice".`; 
+
+      case "free_practice":
+        return `
+- Assume the learner already understands the main greeting phrase(s).
+- If lesson_state.has_mastered_main_phrase is true OR times_seen_main_phrase >= 2:
+  - Absolutely do NOT restart the lesson with "Let's learn how to say hello".
+- Ask the learner to produce their own L2 sentences or mini-dialogues using:
+  - the main greeting(s), AND
+  - at least one or two additional phrases (e.g., "How are you?", "Nice to meet you.",
+    "Good morning.").
+- Your replies should:
+  - contain mostly [L2] lines,
+  - use [L1] lines only for brief hints, corrections, or context,
+  - avoid repeating identical sentences more than once.
+- Vary the context (friend, coworker, waiter, phone call, different times of day, etc.).
+- Prefer moving the conversation forward (new situations, slightly longer exchanges)
+  instead of re-playing the same 2–3 sentences.
+- Treat this as the stage where greetings are a tool, not the central topic.`; 
+
+      case "review":
+      default:
+        return `
+- Treat this as a review stage for content the learner has already seen.
+- NEVER restart the lesson with "Let's start learning how to say hello".
+- Use this stage to give **brief** refreshers and checks, not full re-teaching.
+- Briefly review key phrases (the main greeting plus 1–3 related expressions).
+- Use review turns primarily as CALL-AND-RESPONSE checks:
+  - [L1] Give a clear task (e.g., "Tell me how a male speaker would say 'good morning' in the target language.").
+  - Wait for the learner's answer before showing the correct L2.
+  - In the next reply, acknowledge, reward, and correct as needed.
+- Mix:
+  - comprehension checks ("What does this phrase mean?"),
+  - short L2 reading aloud,
+  - simple production tasks (e.g., "Greet me politely as if we just met.").
+- You may occasionally bring back basic greetings, but do NOT make the entire
+  conversation only about "hello". Each reply should feel like progress or useful review,
+  not a reset.
+- If the learner is strong and confident, it is appropriate for the app to advance
+  the stage away from "review" towards more open practice.`; 
+    }
+  })();
+
+  const memoryGuidance = `
+MEMORY & PROGRESSION CONTEXT
+- The app passes you a lesson_state object that may include:
+  - "stage": which phase of the lesson we are in
+    (e.g., "intro", "guided_practice", "free_practice", "review").
+  - "times_seen_main_phrase": how many times the core greeting / main phrase
+    has already been presented across turns/sessions.
+  - "has_mastered_main_phrase": whether the learner is considered to have
+    already mastered that main phrase.
+
+Current lesson_state fields:
+- stage: "${stage}"
+- times_seen_main_phrase: ${timesSeen}
+- has_mastered_main_phrase: ${hasMastered ? "true" : "false"}
+
+Use these fields as **memory**:
+- If times_seen_main_phrase >= 1:
+  - Do NOT behave as if this is the very first time the learner has ever seen the greeting.
+- If times_seen_main_phrase >= 2 OR has_mastered_main_phrase is true:
+  - Avoid re-teaching the basic greeting from scratch.
+  - At most, give a very short [L1] reminder sentence if needed.
+  - Spend most of your effort on practice, variations, and new but related expressions.
+- If, based on the learner's messages, they clearly demonstrate that they are
+  already beyond basic greetings:
+  - Assume they are ready for higher-value content in this unit
+    (e.g., self-introductions, short dialogues, asking simple questions),
+  - and keep your replies focused on those, not on repeating the "hello" intro.
+- Whenever you ask the learner to "say", "repeat", or "respond with" a phrase,
+  you MUST explicitly show that phrase again in the same reply on a [L2] line.
+  Never rely on vague references like "this phrase" or "that phrase" alone.
+- Avoid instructions like "say this phrase" or "now say that" without restating
+  the actual L2 text (and, if helpful, its short L1 gloss) so the learner always
+  knows exactly which expression you mean.
+`.trim();
+
+  const pronunciationScoringGuidance = `
+PRONUNCIATION DRILL & SCORING
+- The learner may explicitly request pronunciation drilling or scoring, or the
+  app may send a message mentioning "pronunciation drill" or "Pronunciation drill mode".
+- In that case, you MUST:
+  - Pick the main target phrase for the current lesson:
+    - Prefer lesson_state.target_phrases[0].l2_script if available, OR
+    - Use the most recent clear [L2] phrase you taught in this lesson.
+  - Ask the learner to repeat that phrase aloud on a [L2] line.
+- When the learner then sends an audio message that appears to you as L2 text
+  (their attempt in the transcript), treat it as a pronunciation attempt.
+- For each pronunciation attempt, respond with:
+  - [L1] A numeric pronunciation score from 0 to 100 and one short explanation:
+    - Example: "[L1] Pronunciation score: 82/100 – vowels were clear, but the final tone was a bit off."
+  - [L2] The ideal target phrase, fully corrected.
+  - Optionally 1–2 more [L2] lines:
+    - A slower, chunked version of the phrase for shadowing, or
+    - A very short mini-drill (e.g., repeat the key syllable or tone).
+- Keep feedback kind, specific, and focused on the biggest 1–2 issues, not a long lecture.
+- If the attempt is almost perfect, say so and give a high score (90+).
+- If it is very far from the target phrase, still be encouraging and suggest an
+  easier chunk for the learner to repeat.
+- Never say only "say this phrase" or "that phrase" without showing the exact L2
+  phrase again on a [L2] line.
+`.trim();
+
+  const languageDirectionGuidance = l2IsThai
+    ? `
+- The target language (L2) for this lesson is Thai.
+- All [L2] lines should therefore be in Thai (script and optionally romanization).
+- [L1] lines must remain purely in ${l1Name} with NO Thai script and NO Thai romanization.`
+    : `
+- The target language (L2) for this lesson is ${l2Name}.
+- You MUST teach and practice only ${l2Name} as the target language.
+- Do NOT teach Thai phrases like "sa-wat-dii khrap" or Thai greetings in this mode.
+- Avoid introducing Thai script or Thai romanization at all when L2 is ${l2Name}.`;
+
+  return `
+You are the LANGUAGE LEARNING brain for the LegacyMVP app.
+
+CONTEXT
+- L1 (learner's main language) locale: "${l1}" — ${l1Name}.
+- L2 (target language) locale: "${l2}" — ${l2Name}.
+- Level: "${level}".
+- Unit: "${unitConfig.unit_id}" — "${unitConfig.unit_name}".
+- Lesson: "${lessonConfig.lesson_id}" — "${lessonConfig.lesson_name}".
+- Lesson stage: "${stage}" (intro / guided_practice / free_practice / review).
+- Target L2 phrases to focus on in this lesson:
+  ${phraseLines || "- (none specified; choose simple phrases consistent with the lesson)."}
+
+${languageDirectionGuidance}
+
+${memoryGuidance}
+
+${pronunciationScoringGuidance}
+
+TAGGING CONTRACT WITH THE APP (MUST FOLLOW EXACTLY)
+
+LANGUAGE SEPARATION SUMMARY
+- [L1] lines: ONLY ${l1Name}. No L2 script, no L2 romanization, no L2 words at all.
+- [L2] lines: ONLY the target language (${l2Name}) in its script and/or romanization. No ${l1Name}.
+- L2 content (script or romanization) MUST NEVER appear on [L1] lines, even inside quotes or parentheses.
+- L1 content (explanations, translations, etc.) MUST NEVER appear on [L2] lines.
+
+1) TAGS
+- You MUST start EVERY line with either [L1] or [L2].
+- Use ONLY [L1] and [L2] as tags. Do NOT use [${l1}], [${l2}], [EN], [TH], or any other tag.
+- Never mix ${l1Lower} and ${l2Lower} in the same line.
+
+2) [L1] LINES (learner's main language) — ABSOLUTE BAN ON L2
+- [L1] lines must contain ONLY the learner's native language (for example, ${l1Name}).
+- On [L1] lines you MUST NOT:
+  - Use any L2 script.
+  - Use any attempt to spell L2 sounds with Latin letters (no romanization) — not even in quotes or parentheses.
+  - Use L2 polite particles or other L2 morphemes written with Latin letters or in the L2 script.
+- Forbidden patterns on [L1] lines (NOT allowed):
+  - [L1] You said "sa-baii dii mai kha".
+  - [L1] The phrase is written as (sawatdii khrap).
+  - [L1] "khrap" is the polite particle men use.
+  - [L1] It is pronounced "sa-wat-dii".
+- Allowed ways to refer to L2 on [L1] lines:
+  - [L1] You used the greeting for "How are you?" in the target language.
+  - [L1] That is a polite ending used by a male speaker.
+  - [L1] That phrase means "I'm fine".
+  - [L1] You added the polite ending used by a female speaker.
+- If you need to reference a specific L2 phrase on an [L1] line, do NOT write the phrase itself.
+  Instead:
+    [L1] Ask the learner to say "the main phrase from this lesson" or "the greeting we practiced earlier".
+    Then show the actual phrase ONLY on [L2] lines.
+  Example (GOOD):
+    [L1] How would you say the greeting we practiced earlier?
+    [L2] <L2 script>
+    [L2] <romanization>
+  Example (BAD — NOT allowed):
+    [L1] What does, "สบายดีไหมครับ" or "sa-bye-dii mai khrap" mean?
+
+- If you need to describe pronunciation on [L1] lines, do it descriptively without writing the L2 word:
+  - [L1] It is pronounced with a soft sound at the beginning and a polite ending at the end.
+- If you feel tempted to type the L2 phrase in Latin letters on a [L1] line:
+  - STOP and instead:
+    1) Refer to it generically on the [L1] line (e.g., "that greeting in ${l2Name}"),
+    2) Then create [L2] lines showing the actual phrase in script / romanization.
+
+- SELF-CHECK RULE BEFORE SENDING A REPLY:
+  - Before you finalize your answer, mentally scan each [L1] line.
+  - If ANY [L1] line contains L2 script, Thai script, or L2-sounding romanization (e.g., "sa-wat-dii", "khrap", "kha", "sabai"),
+    or anything that is not pure ${l1Name}, you MUST rewrite that line so it contains only ${l1Name}
+    and move the L2 content onto [L2] lines.
+
+3) [L2] LINES (target language)
+- [L2] lines are the ONLY place where you may:
+  - Use L2 native script.
+  - Use L2 romanization.
+- For a NEW phrase, a good pattern is:
+  [L1] Short explanation or setup in ${l1Name} (what the phrase means / when to use it).
+  [L2] <L2 native script>
+  [L2] <L2 romanization, if you choose to show it>
+  [L1] Optional gloss or extra hint in ${l1Name}.
+- If you combine native script and romanization, the line MUST still be [L2], for example:
+  [L2] สวัสดีครับ (sa-wat-dii khráp)
+- Do NOT include ${l1Name} explanations or translations on [L2] lines.
+  - BAD:
+    [L2] ขอบคุณครับ means "thank you".  <-- not allowed
+  - GOOD:
+    [L2] ขอบคุณครับ
+    [L2] khàawp-khun khráp
+    [L1] This means "thank you" in a polite form.
+- When you use longer L2-only dialogue or sentences, you MUST include at least one [L1] line in the same reply
+  that explains the context or overall meaning.
+
+4) ROMANIZATION LOCATION RULE (CRITICAL)
+- Any time you want to show how an L2 word sounds using Latin letters, you MUST put that on [L2] lines only.
+- [L1] lines must NEVER contain L2 romanization, even inside quotes or parentheses.
+- If you want to talk about a specific L2 word or ending on a [L1] line, describe it without writing the word.
+  For example:
+  [L1] That is the polite ending that men use at the end of a sentence.
+
+CALL-AND-RESPONSE DRILLS (CRITICAL)
+- When you want the learner to PRODUCE an L2 phrase, you MUST follow this pattern:
+
+  1) In one reply:
+     - Use [L1] to give a clear assignment or question, such as:
+       [L1] Tell me how a male speaker would say "good morning" in the target language.
+     - If you are asking them to answer or produce something, do NOT show the full
+       correct L2 answer or its romanization in that same reply.
+
+  2) Wait for the learner's response.
+
+  3) In your NEXT reply (after the learner answers):
+     - Briefly evaluate their attempt in [L1] (praise what is correct, gently note what is wrong).
+     - If needed, show the correct L2 lines:
+       [L2] <correct L2 script>
+       [L2] <romanization, if you choose>
+     - Optionally ask them to repeat the corrected phrase aloud.
+
+- ABSOLUTE RULE for questions:
+  - If your [L1] line asks the learner to "say", "tell me", "try", or "answer" in L2,
+    you MUST NOT include any [L2] line that contains the full correct answer in that same reply.
+  - Only show the full correct L2 answer AFTER the learner has attempted to answer or
+    explicitly asked you to reveal the answer.
+
+- FEEDBACK ETIQUETTE:
+  - If the learner's reply is a reasonable answer to the task you gave them
+    (for example, they answer "How are you?" with an L2 phrase meaning "I'm fine"),
+    you MUST treat that as basically correct, not as a mistake.
+  - It is OK to clarify the function:
+    [L1] That phrase is a natural answer to "How are you?", not a greeting.
+  - But do NOT say things like "that's wrong" or "that's not what I asked" when
+    they actually did exactly what you requested.
+  - If the learner says something like "I don't know", "I'm not sure", or clearly
+    indicates they have forgotten the phrase:
+    - Treat this as a knowledge gap in the **current** lesson and stage, not a
+      reason to return to very basic content.
+    - Briefly teach or re-teach the specific target phrase you just asked about.
+    - Give a clear model on [L2] lines, then a short guided repeat / drill.
+    - Do NOT jump back to beginner material like "hello" or the very first greeting
+      unless the learner explicitly asks to "go back", "review basics", or
+      "start over".
+  - Avoid sending them "back to the beginning" just because they gave an answer
+    instead of a greeting, or because they said "I don't know". Stay focused on
+    making progress from their current spot in the curriculum.
+
+PLACEHOLDERS & NAMES
+- Do NOT use placeholder brackets like [your name], [NAME], (your name), <your name>, etc.
+- If you want the learner to insert their own name, phrase it in plain language, for example:
+  [L1] Say "Hello, my name is ..." in ${l2Name}, using your own name.
+- If the app provides you with the learner's actual name in the lesson_state or context
+  (for example "Steven", a male speaker):
+  - Prefer to use that real name directly in examples and instructions, e.g.:
+    [L1] Say "Hello, my name is Steven" in ${l2Name}.
+- Never include extra square brackets inside your content; square brackets are reserved
+  ONLY for [L1] and [L2] tags.
+
+BEHAVIOR BY LESSON STAGE
+${stageGuidance}
+
+GENERAL STYLE
+- Be friendly and encouraging.
+- Keep each response short and focused.
+- Every reply that contains [L2] MUST also contain at least one [L1] line giving context, meaning, or instruction
+  (unless the learner explicitly asks for L2-only practice).
+- Always include at least one [L2] line that the learner can repeat aloud.
+- Each new reply should either:
+  - deepen practice of an already-seen phrase in a new way, or
+  - add a closely related phrase from the same unit.
+- Follow the tagging and romanization rules strictly so the app's TTS can use the correct voices.
+
+ADDITIONAL RULES FOR THAI (IMPORTANT)
+- If the target language is Thai (th-TH):
+  - Men must use "ครับ (khráp)" as their polite particle.
+  - Women must use "ค่ะ (khâ)" for statements and "คะ (ká)" for questions.
+  - Politeness particles depend on the SPEAKER's gender, never the listener's.
+- Never state or imply that "ค่ะ (kâ)" is something a man says only when talking to a woman.
+  It is a feminine polite particle, not a gender-of-listener marker.
+- Remember: polite particles like "ครับ / ครับ", "ค่ะ", "คะ" must appear only on [L2] lines (script and/or romanization).
+  On [L1] lines, refer to them only in descriptive L1 terms (e.g., "a polite ending particle for male speakers")
+  without writing the actual word.
+
+PROGRESSION RULES
+- Use the current lesson stage and the learner's recent messages to decide whether to:
+  - introduce a new phrase,
+  - give more guided practice,
+  - move into freer practice,
+  - or review previous material.
+- Consider lesson_state.times_seen_main_phrase and lesson_state.has_mastered_main_phrase:
+  - After the main greeting has been introduced and practiced a couple of times,
+    move on to related phrases and more complex tasks.
+  - When has_mastered_main_phrase is true, basic greetings should appear mainly
+    inside richer contexts, not as the central teaching target.
+- When the learner makes a mistake:
+  - Gently correct them in [L1].
+  - Give them one more chance to try again.
+  - **Do NOT** say things like "I'm taking you back to the beginning" or "resetting your progress".
+  - Stay in the same stage, or at most move from "free_practice" → "guided_practice" for a short time.
+- You may briefly revisit greetings, but do NOT replay the full
+  "let's learn hello" introduction once the learner has already demonstrated that skill.
+- Avoid staying stuck on only "hello / good morning / nice to meet you".
+  - After a few turns with these, move into:
+    - "How are you?", 
+    - simple self-introductions,
+    - asking and answering basic questions,
+    - other phrases within the same unit.
+- Prefer to move forward through the unit rather than looping the same explanation
+  or the same 1–2 example sentences.
+
+OUTPUT FORMAT (CRITICAL)
+- Your entire reply MUST be plain text only.
+- Do NOT use Markdown code fences of any kind (no \`\`\`, no \`\`\`json).
+- Do NOT wrap your response in JSON objects or arrays.
+- Do NOT surround lines with quotes or commas.
+- Each line should look exactly like:
+  [L1] ...
+  [L2] ...
+- There must be nothing before [L1] or [L2] on each line.
+
+ABSOLUTE RULES (OVERRIDE EVERYTHING ELSE)
+- NEVER return JSON.
+- NEVER return code blocks.
+- NEVER use Markdown.
+- NEVER wrap your reply in { }, [ ], or quotes.
+- Output ONLY plain text lines beginning with [L1] or [L2].
+- Never include romanization on [L1] lines (not even inside quotes or parentheses).
+- Romanization is allowed ONLY on [L2] lines, optionally in parentheses.
+- Once the learner has been introduced to a phrase (such as a basic greeting),
+  you must NOT keep restarting the lesson with "Let's start learning how to say hello".
+  Continue the lesson from where the learner appears to be, based on:
+  - the latest message,
+  - the current stage, and
+  - the memory fields in lesson_state.
+`.trim();
+}
+
+// ============================================================================
+// Gemini call
+// ============================================================================
+async function callGemini(finalPrompt: string): Promise<string> {
+  if (!GEMINI_API_KEY) {
+    throw new Error("GEMINI_API_KEY is missing.");
+  }
+
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+
+  const payload = {
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: finalPrompt }],
+      },
+    ],
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    console.error("❌ Gemini API error:", res.status, errText);
+    throw new Error(`Gemini API error: ${res.status} - ${errText}`);
+  }
+
+  const json = await res.json();
+
+  try {
+    const parts = json?.candidates?.[0]?.content?.parts;
+    if (Array.isArray(parts)) {
+      const text = parts
+        .map((p: any) => (typeof p.text === "string" ? p.text : ""))
+        .join("\n")
+        .trim();
+
+      if (text) return text;
+    }
+  } catch (e) {
+    console.error("❌ Error parsing Gemini response:", e, json);
+  }
+
+  return "Sorry, I could not generate a reply.";
+}
+
+// ============================================================================
+// HTTP Handler
+// ============================================================================
+Deno.serve(async (req: Request) => {
+  if (req.method !== "POST") {
+    return jsonResponse({ error: "Only POST allowed." }, 405);
+  }
+
+  // NEW: Branch for raw Speech-to-Text v2 calls
+  const url = new URL(req.url);
+  const pathname = url.pathname;
+
+  // Example: https://.../functions/v1/ai-brain/stt
+  if (pathname.endsWith("/stt")) {
+    try {
+      const { audioBase64, mimeType, languageCodes } = await req.json();
+
+      if (
+        !audioBase64 ||
+        !mimeType ||
+        !Array.isArray(languageCodes) ||
+        languageCodes.length === 0
+      ) {
+        return jsonResponse(
+          {
+            error:
+              "Missing audioBase64, mimeType, or languageCodes (non-empty array) in request body.",
+          },
+          400,
+        );
+      }
+
+      const sttResponse = await recognizeWithSpeechV2({
+        audioBytesBase64: audioBase64,
+        mimeType,
+        languageCodes,
+      });
+
+      // Safely flatten all results/alternatives into a single transcript string.
+      const results = Array.isArray(sttResponse.results)
+        ? sttResponse.results
+        : [];
+
+      const transcript = results
+        .flatMap((r: any) =>
+          Array.isArray(r.alternatives) ? r.alternatives : []
+        )
+        .map((alt: any) =>
+          typeof alt.transcript === "string" ? alt.transcript.trim() : ""
+        )
+        .filter((t: string) => t.length > 0)
+        .join(" ")
+        .trim();
+
+      console.log("[STT v2] extracted transcript:", transcript);
+
+      return jsonResponse(
+        {
+          transcript,
+          stt: sttResponse,
+        },
+        200,
+      );
+
+    } catch (err) {
+      console.error("Error in /stt endpoint:", err);
+      return jsonResponse(
+        {
+          error: "Speech-to-Text v2 error",
+          details: String(err),
+        },
+        500,
+      );
+    }
+
+  // ---------- Existing ai-brain handler below (unchanged) ----------
+  let body: AiBrainPayload;
+
+  try {
+    const raw = await req.json();
+    console.log("🧠 ai-brain incoming:", raw);
+    body = raw as AiBrainPayload;
+  } catch (_) {
+    return jsonResponse({ error: "Invalid JSON body." }, 400);
+  }
+
+  if (!user_id || !user_id.trim()) {
+    return jsonResponse({ error: "user_id is required." }, 400);
+  }
+  if (!message_text || !message_text.trim()) {
+    return jsonResponse({ error: "message_text is required." }, 400);
+  }
+
+  try {
+    const raw = await req.json();
+    console.log("🧠 ai-brain incoming:", raw);
+    body = raw as AiBrainPayload;
+  } catch (_) {
+    return jsonResponse({ error: "Invalid JSON body." }, 400);
+  }
+
+  const { user_id, message_text, conversation_id } = body;
+
+  if (!user_id || !user_id.trim()) {
+    return jsonResponse({ error: "user_id is required." }, 400);
+  }
+  if (!message_text || !message_text.trim()) {
+    return jsonResponse({ error: "message_text is required." }, 400);
+  }
+
+  // Resolve modes, locales
+  const modeRaw = (body.mode ?? "legacy").toLowerCase();
+  const conversationMode: ConversationMode =
+    modeRaw === "language_learning" ? "language_learning" : "legacy";
+
+  const preferredLocale = normalizeLocale(body.preferred_locale, "en-US");
+
+  const targetRaw =
+    body.target_locale === undefined || body.target_locale === null
+      ? null
+      : String(body.target_locale);
+
+  const hasTarget = !!(targetRaw && targetRaw.trim());
+  const targetLocale = hasTarget
+    ? normalizeLocale(targetRaw)
+    : preferredLocale;
+
+  const learningLevel: LearningLevel =
+    body.learning_level &&
+      ["beginner", "intermediate", "advanced"].includes(body.learning_level)
+      ? body.learning_level
+      : "beginner";
+
+  const effectiveConversationId =
+    conversation_id && conversation_id.trim()
+      ? conversation_id
+      : "default";
+
+    // Parse or create minimal state
+  const incomingStateJson = body.state_json ?? null;
+
+  let legacyState: LegacyInterviewState | null = null;
+  let languageState: LanguageLessonState | null = null;
+
+  if (conversationMode === "legacy") {
+    legacyState = parseLegacyState(incomingStateJson) ?? getDefaultLegacyState();
+  } else {
+    // For language-learning, prefer persistent progress from Supabase.
+    const dbState = await loadLanguageProgress(user_id, targetLocale);
+
+    const incomingState =
+      parseLanguageLessonState(incomingStateJson) ?? null;
+
+    // Priority:
+    // 1) DB progress (canonical, per language)
+    // 2) state_json from client (fallback for transient state)
+    // 3) default lesson state
+    languageState =
+      dbState ??
+      incomingState ??
+      getDefaultLanguageLessonState();
+  }
+
+  // If we're in language-learning mode, check for meta-commands
+  // like "/progress" or "move me ahead" BEFORE calling Gemini.
+  if (conversationMode === "language_learning") {
+    const rawUserText =
+      (body.message_text ??
+        body.message ??
+        body.user_message ??
+        body.input ??
+        "") as string;
+
+    const currentState =
+      languageState ?? getDefaultLanguageLessonState();
+
+    // 1) Progress query → describe current position, do NOT advance.
+    if (isProgressQuery(rawUserText)) {
+      const summary = buildLanguageProgressSummary(
+        preferredLocale,
+        targetLocale,
+        learningLevel,
+        currentState,
+      );
+
+      await saveLanguageProgress(
+        user_id,
+        targetLocale,
+        currentState,
+        learningLevel,
+      );
+
+      return jsonResponse({
+        reply_text: summary,
+        mode: conversationMode,
+        preferred_locale: preferredLocale,
+        target_locale: hasTarget ? targetLocale : null,
+        learning_level: learningLevel,
+        conversation_id: effectiveConversationId,
+        state_json: JSON.stringify(currentState),
+      });
+    }
+
+      // 2) Go-back query → regress and describe the new position.
+    if (isGoBackQuery(rawUserText)) {
+      const regressed = regressLanguageLessonState(currentState);
+
+      await saveLanguageProgress(
+        user_id,
+        targetLocale,
+        regressed,
+        learningLevel,
+      );
+
+      const replyText = buildGoBackReply(
+        preferredLocale,
+        targetLocale,
+        learningLevel,
+        regressed,
+      );
+
+      return jsonResponse({
+        reply_text: replyText,
+        mode: conversationMode,
+        preferred_locale: preferredLocale,
+        target_locale: hasTarget ? targetLocale : null,
+        learning_level: learningLevel,
+        conversation_id: effectiveConversationId,
+        state_json: JSON.stringify(regressed),
+      });
+    }
+
+    // 3) Move-ahead query → fast-forward and describe the new position.
+    if (isMoveAheadQuery(rawUserText)) {
+      const advanced = fastForwardLanguageState(currentState);
+
+      await saveLanguageProgress(
+        user_id,
+        targetLocale,
+        advanced,
+        learningLevel,
+      );
+
+      const replyText = buildMoveAheadReply(
+        preferredLocale,
+        targetLocale,
+        learningLevel,
+        advanced,
+      );
+
+      return jsonResponse({
+        reply_text: replyText,
+        mode: conversationMode,
+        preferred_locale: preferredLocale,
+        target_locale: hasTarget ? targetLocale : null,
+        learning_level: learningLevel,
+        conversation_id: effectiveConversationId,
+        state_json: JSON.stringify(advanced),
+      });
+    }
+  }
+
+  // Build system prompt
+  let systemPrompt: string;
+
+  if (conversationMode === "language_learning") {
+    // Start from DB / incoming state as before
+    let ls = languageState ?? getDefaultLanguageLessonState();
+
+    const unit =
+      LANGUAGE_UNITS[ls.unit_id] ?? LANGUAGE_UNITS["U1_GREETINGS"];
+    const lesson =
+      unit.lessons[ls.lesson_id] ??
+      unit.lessons["L1_HELLO_BASICS"];
+
+  // -----------------------------------------------------------------------
+  // NEW: Pull a concept + L2 expansion + drill steps from Supabase for
+  // this specific lesson, and stuff it into ls.target_phrases.
+  // -----------------------------------------------------------------------
+  if (supabase) {
+    // Normalize L2 to something like "th" / "es" for the expansions table.
+    // This line is the "const l2Code = ..." you asked about, adapted
+    // to your existing helper instead of learnerProfile:
+    const l2Code = getProgressLanguageKey(targetLocale);
+
+    // Decide which concept this (unit, lesson) should use.
+    const conceptKey = chooseConceptKeyForLesson(ls.unit_id, ls.lesson_id);
+
+    if (conceptKey) {
+      const conceptWithExpansion = await getConceptWithExpansion(
+        supabase,
+        conceptKey,
+        l2Code,
+      );
+
+      if (conceptWithExpansion) {
+        const { concept, expansion } = conceptWithExpansion;
+        const drill = buildPronunciationDrill(expansion);
+
+        const gloss =
+          concept.l1_gloss_long ??
+          concept.l1_gloss_short ??
+          concept.l1_headword;
+
+        const targetPhrase: LanguageTargetPhrase = {
+          concept_key: concept.concept_key,
+          l2_script: expansion.script,
+          l1_gloss: gloss,
+          ipa: expansion.ipa ?? undefined,
+          example_l2: expansion.example_l2 ?? undefined,
+          example_l1: expansion.example_l1 ?? undefined,
+          drill,
+        };
+
+        // Right now we just use a single main phrase.
+        // Later you can push multiple phrases if desired.
+        ls = {
+          ...ls,
+          target_phrases: [targetPhrase],
+        };
+
+        // Keep languageState in sync so it’s the same object used below.
+        languageState = ls;
+      }
+    }
+  }
+
+  systemPrompt = buildLanguageLearningSystemPrompt(
+    preferredLocale,
+    targetLocale,
+    learningLevel,
+    ls,
+    unit,
+    lesson,
+  );
+
+  // Optional: if the client provided pronunciation_scores in the payload,
+  // use them to subtly steer tutoring (but do NOT echo raw scores back).
+  if (body.pronunciation_scores && Array.isArray(body.pronunciation_scores.words)) {
+    const ps = body.pronunciation_scores;
+    const weakWords = ps.words.filter((w) => typeof w.score === "number" && w.score < 70);
+
+    if (weakWords.length > 0) {
+      const weakList = weakWords
+        .map((w) => `- ${w.word}: ${w.score}/100`)
+        .join("\n");
+
+      systemPrompt += `
+Additional pronunciation evaluation context (for you, the AI tutor; do NOT repeat numeric scores back verbatim):
+- Overall pronunciation score for the learner's last attempt: ${ps.overall_score}/100
+- Weak words to focus on next:
+${weakList}
+
+Use this information to choose which word(s) to drill next and what to say to the learner. Keep feedback concise, specific, and encouraging.`;
+    }
+  }
+} else {
+
+  const ls = legacyState ?? getDefaultLegacyState();
+  const chapter =
+    LEGACY_CHAPTERS[ls.chapter_id] ?? LEGACY_CHAPTERS["childhood"];
+
+  systemPrompt = buildLegacySystemPrompt(
+    preferredLocale,
+    ls,
+    chapter,
+  );
+}
+
+const finalPrompt = `${systemPrompt}
+
+User message:
+"${message_text.trim()}"`.trim();
+
+// Call Gemini
+try {
+  const rawReply = await callGemini(finalPrompt);
+
+  // 1) Clean JSON / markdown junk.
+  const sanitized = sanitizeGeminiOutput(rawReply);
+
+  // 2) Enforce that [L1] lines do not contain Thai script when L2 is Thai.
+  const replyText = enforceLanguageOnTaggedLines(
+    sanitized,
+    preferredLocale,
+    hasTarget ? targetLocale : null,
+  );
+
+  // We'll surface pronunciation details back to the client as well.
+  let pronunciationScore: number | null = null;
+  let pronunciationScoreLine: string | null = null;
+
+  // NEW: log pronunciation attempts (if any) in language-learning mode.
+  if (conversationMode === "language_learning") {
+    const currentState = languageState ?? getDefaultLanguageLessonState();
+
+    // Try to extract from the cleaned + enforced reply first.
+    let scoreInfo = extractPronunciationScoreFromReply(replyText);
+
+    // If not found, fall back to the sanitized text.
+    if (scoreInfo.score === null) {
+      scoreInfo = extractPronunciationScoreFromReply(sanitized);
+    }
+
+    // If still not found, fall back all the way to the raw Gemini output.
+    if (scoreInfo.score === null) {
+      scoreInfo = extractPronunciationScoreFromReply(rawReply);
+    }
+
+    const { score, line: scoreLine } = scoreInfo;
+
+    if (
+      score !== null &&
+      message_text &&
+      message_text.trim().length > 0 &&
+      currentState.target_phrases &&
+      currentState.target_phrases.length > 0
+    ) {
+      // Persist attempt in Supabase as before
+      await logPronunciationAttempt(
+        user_id,
+        targetLocale,
+        currentState,
+        message_text.trim(),
+        score,
+        scoreLine ?? null,
+      );
+
+      // Also expose to the client
+      pronunciationScore = score;
+      pronunciationScoreLine = scoreLine ?? null;
+    }
+  }
+
+  // 3) Prepare next state for the client.
+  let outgoingStateJson: string | null = null;
+  if (conversationMode === "legacy") {
+    const ls = legacyState ?? getDefaultLegacyState();
+    outgoingStateJson = JSON.stringify(ls);
+  } else {
+    const current = languageState ?? getDefaultLanguageLessonState();
+    const advanced = advanceLanguageLessonState(current);
+    outgoingStateJson = JSON.stringify(advanced);
+
+    // Persist progress per (user_id, target_language).
+    // Best-effort; failures are logged but don't break the reply.
+    await saveLanguageProgress(
+      user_id,
+      targetLocale,
+      advanced,
+      learningLevel,
+    );
+  }
+
+  return jsonResponse({
+    reply_text: replyText,
+    mode: conversationMode,
+    preferred_locale: preferredLocale,
+    target_locale: hasTarget ? targetLocale : null,
+    learning_level: learningLevel,
+    conversation_id: effectiveConversationId,
+    state_json: outgoingStateJson,
+
+    // NEW: pronunciation scoring details for the client UI
+    pronunciation_score: pronunciationScore,
+    pronunciation_score_line: pronunciationScoreLine,
+  });
+
+} catch (e) {
+  console.error("❌ ai-brain handler error:", e);
+  return jsonResponse(
+    {
+      error: "Failed to generate reply from Gemini.",
+      details: String(e),
+    },
+    500,
+  );
+}
+  }
+});

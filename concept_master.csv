@@ -1,0 +1,114 @@
+concept_key,l1_language_code,l1_headword,l1_gloss_short,l1_gloss_long,part_of_speech,semantic_domain
+PRONOUN_I,en,I,first-person singular pronoun,"The speaker referring to themself ('I', 'me').",pronoun,core
+PRONOUN_YOU,en,you,second-person singular pronoun,The listener ('you').,pronoun,core
+PRONOUN_WE,en,we,first-person plural pronoun,"The speaker plus others ('we', 'us').",pronoun,core
+PRONOUN_THEY,en,they,third-person plural pronoun,"Other people ('they', 'them').",pronoun,core
+PRONOUN_HE,en,he,third-person masculine pronoun,A male third person.,pronoun,gendered
+PRONOUN_SHE,en,she,third-person feminine pronoun,A female third person.,pronoun,gendered
+POSSESSIVE_MY,en,my,first-person possessive,Ownership by the speaker.,pronoun,possessive
+POSSESSIVE_YOUR,en,your,second-person possessive,Ownership by the listener.,pronoun,possessive
+NOUN_PERSON,en,person,human person,A generic person or human.,noun,people
+NOUN_FRIEND,en,friend,friend,A friend or companion.,noun,people
+NOUN_FAMILY,en,family,family,A family group.,noun,people
+NOUN_CHILD,en,child,child,A child.,noun,people
+NOUN_MOTHER,en,mother,mother,One's mother.,noun,family
+NOUN_FATHER,en,father,father,One's father.,noun,family
+NOUN_NAME,en,name,name,A person's or thing's name.,noun,identity
+FUNCTION_YES,en,yes,affirmative,General affirmative / 'yes'.,functional,polarity
+FUNCTION_NO,en,no,negative,General negative / 'no'.,functional,polarity
+FUNCTION_NOT,en,not,negation,Grammatical negation marker.,functional,grammar
+FUNCTION_PLEASE,en,please,politeness marker,Polite request softener.,functional,politeness
+FUNCTION_THANK_YOU,en,thank you,thanks,Expression of gratitude.,phrase,politeness
+FUNCTION_SORRY,en,sorry,apology,Expression of apology.,phrase,politeness
+FUNCTION_OKAY,en,okay,agreement,Agreement or acceptance.,functional,agreement
+FUNCTION_CAN,en,can,ability/possibility,Modal for ability or possibility.,functional,modal
+FUNCTION_MUST,en,must,obligation,Modal for strong obligation or necessity.,functional,modal
+FUNCTION_WANT_TO,en,want to,desire/intention,Modal-like 'want to do something'.,functional,modal
+QUESTION_WHAT,en,what,question word 'what',Question word asking about things or actions.,functional,question
+QUESTION_WHO,en,who,question word 'who',Question word asking about people.,functional,question
+QUESTION_WHERE,en,where,question word 'where',Question word asking about location.,functional,question
+QUESTION_WHEN,en,when,question word 'when',Question word asking about time.,functional,question
+QUESTION_WHY,en,why,question word 'why',Question word asking about reasons.,functional,question
+QUESTION_HOW,en,how,question word 'how',Question word asking about manner or method.,functional,question
+QUESTION_HOW_MUCH,en,how much,question 'how much',Question about price or mass quantity.,functional,money
+QUESTION_HOW_MANY,en,how many,question 'how many',Question about countable quantity.,functional,number
+QUESTION_WHICH,en,which,question word 'which',Choosing among alternatives.,functional,question
+QUESTION_WHERE_FROM,en,where from,question 'where from',Asking about origin or where someone is from.,functional,origin
+VERB_BE_IDENTIFIER,en,be (identity),copular 'be' (identity),Linking subject with identity or category.,verb,copula
+VERB_BE_LOCATION,en,be (location),be (location/exist),Being or existing in a location.,verb,location
+VERB_HAVE_OWN,en,have,have/own,Owning or possessing something.,verb,possession
+VERB_GO_PHYSICAL,en,go,go / move,Move away from the current place.,verb,movement
+VERB_COME_PHYSICAL,en,come,come,Move toward the speaker or reference point.,verb,movement
+VERB_EAT,en,eat,eat,Eat food.,verb,daily
+VERB_DRINK,en,drink,drink,Drink liquids.,verb,daily
+VERB_SLEEP,en,sleep,sleep,Sleep or go to sleep.,verb,daily
+VERB_LIKE,en,like,like,Enjoy or like something.,verb,feeling
+VERB_WANT,en,want,want,Desire or want something.,verb,desire
+VERB_NEED,en,need,need,Need / necessity.,verb,necessity
+VERB_UNDERSTAND,en,understand,understand,Comprehend information or language.,verb,cognition
+VERB_KNOW_FACT,en,know (fact),know facts,Know information or facts.,verb,cognition
+VERB_KNOW_PERSON,en,know (person),know someone,Be acquainted with a person or place.,verb,cognition
+VERB_SPEAK_LANGUAGE,en,speak,speak (language),Speak a language.,verb,language
+VERB_SAY,en,say,say / tell,Say or tell something.,verb,communication
+VERB_LISTEN,en,listen,listen,Listen actively.,verb,perception
+VERB_HEAR,en,hear,hear,Hear sounds.,verb,perception
+VERB_READ,en,read,read,Read written text.,verb,literacy
+VERB_WRITE,en,write,write,Write text.,verb,literacy
+VERB_STUDY,en,study,study / learn,Study or learn intentionally.,verb,learning
+VERB_WORK,en,work,work (job),Work at a job or occupation.,verb,job
+VERB_LIVE_RESIDE,en,live,live / reside,Live or reside in a place.,verb,location
+VERB_HELP,en,help,help / assist,Help or assist someone.,verb,assistance
+VERB_PAY,en,pay,pay,Pay money for something.,verb,money
+VERB_BUY,en,buy,buy,Purchase something.,verb,money
+VERB_FEEL,en,feel,feel (emotion),"Feel emotionally (happy, sad, etc.).",verb,emotion
+VERB_NEED_HELP_EMERGENCY,en,need help,need help (emergency),Need help urgently.,phrase,emergency
+NOUN_TIME,en,time,time,Time in general.,noun,time
+NOUN_DAY,en,day,day,A day as a unit of time.,noun,time
+NOUN_TODAY,en,today,today,The current day.,noun,time
+NOUN_TOMORROW,en,tomorrow,tomorrow,The day after today.,noun,time
+NOUN_YESTERDAY,en,yesterday,yesterday,The day before today.,noun,time
+NOUN_PLACE,en,place,place,A place or location.,noun,location
+NOUN_HOME,en,home,home,One's home or house.,noun,location
+NOUN_WORKPLACE,en,workplace,workplace,Workplace or office.,noun,location
+NOUN_RESTAURANT,en,restaurant,restaurant,Restaurant or place to eat out.,noun,location
+NOUN_BATHROOM,en,bathroom,bathroom,Bathroom / toilet.,noun,location
+NOUN_FOOD,en,food,food,Food in general.,noun,food
+NOUN_WATER,en,water,water,Drinking water.,noun,drink
+NOUN_MONEY,en,money,money,Money or currency.,noun,money
+NOUN_PRICE,en,price,price / cost,Price or cost of something.,noun,money
+NOUN_NUMBER,en,number,number,Numbers / counting.,noun,number
+NOUN_LANGUAGE,en,language,language,A human language.,noun,language
+NOUN_COUNTRY,en,country,country,A country or nation.,noun,location
+NOUN_CITY,en,city,city,A city or town.,noun,location
+NOUN_ROOM,en,room,room,A room or indoor space.,noun,location
+NOUN_DIRECTION,en,direction,direction,"Direction (e.g., left/right).",noun,location
+ADJ_GOOD,en,good,good,Positive quality.,adjective,quality
+ADJ_BAD,en,bad,bad,Negative quality.,adjective,quality
+ADJ_BIG,en,big,big,Large in size.,adjective,size
+ADJ_SMALL,en,small,small,Small in size.,adjective,size
+ADJ_EASY,en,easy,easy,Not difficult.,adjective,difficulty
+ADJ_DIFFICULT,en,difficult,difficult,Hard or difficult.,adjective,difficulty
+ADJ_EXPENSIVE,en,expensive,expensive,High in price.,adjective,money
+ADJ_CHEAP,en,cheap,cheap,Low in price.,adjective,money
+ADJ_HUNGRY,en,hungry,hungry,Feeling hunger.,adjective,feeling
+ADJ_THIRSTY,en,thirsty,thirsty,Feeling thirst.,adjective,feeling
+GREET_HELLO,en,hello,basic greeting,Neutral greeting used at most times of day.,phrase,greeting
+GREET_GOOD_MORNING,en,good morning,morning greeting,Greeting used in the morning.,phrase,greeting
+GREET_GOOD_AFTERNOON,en,good afternoon,afternoon greeting,Greeting used in the afternoon.,phrase,greeting
+GREET_GOOD_EVENING,en,good evening,evening greeting,Greeting used in the evening.,phrase,greeting
+PHRASE_HOW_ARE_YOU,en,how are you,ask about well-being,Polite question about how someone is doing.,phrase,small_talk
+PHRASE_IM_FINE,en,I'm fine,respond about well-being,Standard positive response to 'How are you?'.,phrase,small_talk
+PHRASE_WHATS_YOUR_NAME,en,what's your name,ask someone's name,Asking someone for their name.,phrase,identity
+PHRASE_MY_NAME_IS,en,my name is,tell one's name,Introducing one's name.,phrase,identity
+PHRASE_NICE_TO_MEET_YOU,en,nice to meet you,polite intro phrase,Polite phrase after introductions.,phrase,politeness
+PHRASE_I_DONT_UNDERSTAND,en,I don't understand,can't understand,Saying that you do not understand something.,phrase,learning
+PHRASE_PLEASE_REPEAT,en,please repeat,ask to repeat,Asking someone to repeat what they said.,phrase,learning
+PHRASE_SPEAK_MORE_SLOWLY,en,speak more slowly,ask slower speech,Asking someone to speak more slowly.,phrase,learning
+PHRASE_WHERE_IS_BATHROOM,en,where is the bathroom,ask for bathroom,Asking where the bathroom is.,phrase,survival
+PHRASE_HOW_MUCH_IS_THIS,en,how much is this,ask item price,Asking for the price of a specific item.,phrase,shopping
+PHRASE_I_WANT_THIS,en,I want this,want specific item,Saying that you want this particular thing.,phrase,shopping
+PHRASE_CAN_YOU_HELP_ME,en,can you help me,ask for help,Asking someone to help you.,phrase,assistance
+PHRASE_EXCUSE_ME_GET_ATTENTION,en,excuse me,get attention,Polite way to get attention or pass by.,phrase,politeness
+PHRASE_IM_SORRY,en,I'm sorry,apologize,Full phrase apology.,phrase,apology
+PHRASE_THANK_YOU_VERY_MUCH,en,thank you very much,strong thanks,Stronger expression of gratitude.,phrase,politeness
+PHRASE_WHAT_DOES_THIS_MEAN,en,what does this mean,ask meaning,Asking for the meaning or definition of something.,phrase,learning

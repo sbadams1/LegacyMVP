@@ -1,0 +1,1108 @@
+import 'dart:convert';
+
+import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+class StoryLibraryScreen extends StatefulWidget {
+  const StoryLibraryScreen({super.key});
+
+  @override
+  State<StoryLibraryScreen> createState() => _StoryLibraryScreenState();
+}
+
+class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
+  final SupabaseClient _client = Supabase.instance.client;
+  bool _loading = true;
+  String? _error;
+  List<Map<String, dynamic>> _rows = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadStories();
+  }
+
+  Map<String, dynamic>? _parseSessionInsights(dynamic raw) {
+  if (raw is Map<String, dynamic>) return raw;
+  if (raw is String && raw.trim().isNotEmpty) {
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map<String, dynamic>) return decoded;
+    } catch (_) {}
+  }
+  return null;
+  }
+
+  Widget _buildInsightsChips(dynamic raw) {
+  final si = _parseSessionInsights(raw);
+  if (si == null) return const SizedBox.shrink();
+
+  final keySentence = (si['key_sentence'] as String? ?? '').trim();
+  final items = (si['items'] as List<dynamic>? ?? const []);
+
+  // If nothing meaningful, show nothing.
+  if (keySentence.isEmpty && items.isEmpty) return const SizedBox.shrink();
+
+  // Build up to 2 compact chips from item kinds (trait/theme/lesson/etc)
+  final kinds = <String>[];
+  for (final it in items.take(6)) {
+    if (it is Map) {
+      final k = (it['kind'] as String? ?? '').trim();
+      if (k.isNotEmpty && !kinds.contains(k)) kinds.add(k);
+    }
+    if (kinds.length >= 2) break;
+  }
+
+  // Fallback chip if kinds are absent but key_sentence exists
+  if (kinds.isEmpty && keySentence.isNotEmpty) {
+    kinds.add('insight');
+  }
+
+  return Wrap(
+    spacing: 6,
+    runSpacing: -8,
+    children: kinds.map((k) {
+      return Chip(
+        visualDensity: VisualDensity.compact,
+        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        label: Text(k),
+      );
+    }).toList(),
+  );
+  }
+
+  Future<void> _loadStories() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    final user = _client.auth.currentUser;
+    if (user == null) {
+      setState(() {
+        _loading = false;
+        _error = 'You must be logged in to view your stories.';
+      });
+      return;
+    }
+
+    try {
+      // Load session-level summaries instead of individual raw turns.
+      final res = await _client
+          .from('memory_summary')
+          .select('id, short_summary, full_summary, observations, session_insights, created_at')
+          .eq('user_id', user.id)
+          .order('created_at', ascending: false);
+
+      final rawList = (res as List<dynamic>? ?? <dynamic>[]);
+
+      // Convert to a typed list of maps.
+      final rows =
+          rawList.map((e) => e as Map<String, dynamic>).toList();
+
+      // Default: show everything we have.
+      List<Map<String, dynamic>> filtered = rows;
+
+      // Try to filter out obvious dev / debug / non-legacy sessions.
+      // If the filter would remove *everything*, we fall back to the full list.
+      try {
+        final tmp = <Map<String, dynamic>>[];
+
+        for (final row in rows) {
+          final shortSummary =
+              (row['short_summary'] as String? ?? '').trim();
+          final fullSummary =
+              (row['full_summary'] as String? ?? '').trim();
+          final combined = ('$shortSummary $fullSummary').trim();
+
+          // If there's literally no text, skip it.
+          if (combined.isEmpty) continue;
+
+          // Try to parse observations metadata.
+          Map<String, dynamic>? obs;
+          final rawObs = row['observations'];
+          if (rawObs is Map<String, dynamic>) {
+            obs = rawObs;
+          } else if (rawObs is String && rawObs.isNotEmpty) {
+            try {
+              final decoded = jsonDecode(rawObs);
+              if (decoded is Map<String, dynamic>) {
+                obs = decoded;
+              }
+            } catch (_) {
+              // ignore JSON parse errors, we'll just treat as no observations
+            }
+          }
+
+          final conversationMode =
+              (obs?['conversation_mode'] as String? ?? '').toLowerCase();
+          final isDev = (obs?['is_dev'] as bool?) ?? false;
+
+          // 1) Drop obvious dev / diagnostic sessions.
+          if (isDev) continue;
+
+          // 2) If we know the mode, keep only legacy storytelling sessions.
+          if (conversationMode.isNotEmpty &&
+              conversationMode != 'legacy') {
+            continue;
+          }
+
+          // 3) Heuristic: hide clearly technical summaries.
+          final lower = combined.toLowerCase();
+          const debugHints = [
+            'stt ',
+            'speech-to-text',
+            'coverage screen',
+            'coverage map',
+            'debug',
+            'ai-brain error',
+            'supabase',
+            'recognizer',
+            'jwt',
+          ];
+          bool looksDebug = false;
+          for (final hint in debugHints) {
+            if (lower.contains(hint)) {
+              looksDebug = true;
+              break;
+            }
+          }
+          if (looksDebug) continue;
+
+          // 4) Require at least a bit of narrative (e.g. ~6+ words).
+          if (combined.split(RegExp(r'\\s+')).length < 6) {
+            continue;
+          }
+
+          tmp.add(row);
+        }
+
+        // Only adopt the filtered subset if it leaves us with *something*.
+        if (tmp.isNotEmpty) {
+          filtered = tmp;
+        }
+      } catch (_) {
+        // If any error happens in the filtering logic, we safely fall back
+        // to showing all rows.
+      }
+
+      setState(() {
+        _rows = filtered;
+        _loading = false;
+      });
+    } catch (e) {
+      setState(() {
+        _error = 'Failed to load stories: $e';
+        _loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Story library'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.insights),
+            tooltip: 'View insights',
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => const InsightsScreen(),
+                ),
+              );
+            },
+          ),
+        ],
+      ),
+      body: RefreshIndicator(
+        onRefresh: _loadStories,
+        child: _loading
+            ? const Center(child: CircularProgressIndicator())
+            : _error != null
+                ? ListView(
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Text(
+                          _error!,
+                          style: theme.textTheme.bodyMedium,
+                        ),
+                      ),
+                    ],
+                  )
+                : _rows.isEmpty
+                    ? ListView(
+                        children: const [
+                          Padding(
+                            padding: EdgeInsets.all(16),
+                            child: Text(
+                              'No memories saved yet.\n\n'
+                              'Record a story in legacy mode and it will appear here.',
+                            ),
+                          ),
+                        ],
+                      )
+                    : ListView.builder(
+                        itemCount: _rows.length,
+                        itemBuilder: (context, index) {
+                          final row = _rows[index];
+
+                          final shortSummary =
+                              (row['short_summary'] as String? ?? '').trim();
+                          final fullSummary =
+                              (row['full_summary'] as String? ?? '').trim();
+
+                          // Observations JSON may contain the session_key we use
+                          // to delete the correct memory_raw rows later.
+                          final obs =
+                              row['observations'] as Map<String, dynamic>?;
+                          final rawSessionKey =
+                              obs != null ? obs['session_key'] as String? : null;
+                          final sessionKey =
+                              (rawSessionKey ?? '').trim().isEmpty
+                                  ? null
+                                  : rawSessionKey!.trim();
+
+                          // Build a human-readable date label
+                          final createdAtStr =
+                              row['created_at'] as String? ?? '';
+                          String dateLabel = '';
+                          if (createdAtStr.isNotEmpty) {
+                            final createdAt =
+                                DateTime.tryParse(createdAtStr)?.toLocal();
+                            if (createdAt != null) {
+                              dateLabel =
+                                  '${createdAt.year}-${createdAt.month.toString().padLeft(2, '0')}-${createdAt.day.toString().padLeft(2, '0')} '
+                                  '${createdAt.hour.toString().padLeft(2, '0')}:${createdAt.minute.toString().padLeft(2, '0')}';
+                            } else {
+                              dateLabel = createdAtStr;
+                            }
+                          }
+
+                          // What we show as the preview text in the list.
+                          // Prefer the short_summary as a compact, story-like title.
+                          String preview;
+                          if (shortSummary.isNotEmpty) {
+                            preview = shortSummary;
+                          } else if (fullSummary.isNotEmpty) {
+                            preview = fullSummary;
+                          } else {
+                            preview = '(Tap to curate this session)';
+                          }
+                          if (preview.length > 160) {
+                            preview = '${preview.substring(0, 160)}…';
+                          }
+
+                          // Fallbacks for the session detail screen
+                          final fallbackTitle = shortSummary.isNotEmpty
+                              ? shortSummary
+                              : (fullSummary.isNotEmpty
+                                  ? fullSummary.split('\n').first
+                                  : (dateLabel.isNotEmpty
+                                      ? dateLabel
+                                      : 'Legacy session'));
+
+                          final fallbackBody = fullSummary.isNotEmpty
+                              ? fullSummary
+                              : (shortSummary.isNotEmpty
+                                  ? shortSummary
+                                  : '(No summary yet for this session.)');
+
+                          // --- Session insights badge (chips) ---
+                          final rawSi = row['session_insights'];
+                          final chips = _buildInsightsChips(rawSi);
+
+                          return Card(
+                            elevation: 1,
+                            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(12),
+                              onTap: () async {
+                                final changed = await Navigator.of(context).push<bool>(
+                                  MaterialPageRoute(
+                                    builder: (_) => StoryDetailScreen(
+                                      memorySummaryId: row['id'] as String,
+                                      sessionKey: sessionKey,
+                                      dateLabel: dateLabel.isNotEmpty ? dateLabel : 'Session',
+                                      fallbackTitle: fallbackTitle,
+                                      fallbackBody: fallbackBody,
+                                      shortSummary: shortSummary,
+                                      fullSummary: fullSummary,
+                                      sessionInsights: rawSi,
+                                    ),
+                                  ),
+                                );
+
+                                if (changed == true) {
+                                  _loadStories();
+                                }
+                              },
+                              child: Padding(
+                                padding: const EdgeInsets.all(12),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    // Top row: title + chevron
+                                    Row(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Expanded(
+                                          child: Text(
+                                          preview,
+                                          style: Theme.of(context).textTheme.titleMedium,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      const Icon(Icons.chevron_right),
+                                    ],
+                                  ),
+
+                                  if (dateLabel.isNotEmpty) ...[
+                                    const SizedBox(height: 6),
+                                    Text(
+                                      dateLabel,
+                                      style: Theme.of(context).textTheme.bodySmall,
+                                    ),
+                                  ],
+
+                                  // Insight chips row
+                                  if (chips is! SizedBox) ...[
+                                    const SizedBox(height: 10),
+                                    chips,
+                                  ],
+                                ],
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                     ),
+      ),
+    );
+  }
+}
+
+class StoryDetailScreen extends StatefulWidget {
+  final String memorySummaryId;
+  final String? sessionKey; // from observations.session_key
+  final String dateLabel;
+  final String fallbackTitle;
+  final String fallbackBody;
+  final dynamic sessionInsights;
+
+  // NEW: the values that the Story Library list used.
+  final String shortSummary;
+  final String fullSummary;
+
+  const StoryDetailScreen({
+  super.key,
+  required this.memorySummaryId,
+  required this.sessionKey,
+  required this.dateLabel,
+  required this.fallbackTitle,
+  required this.fallbackBody,
+  required this.shortSummary,
+  required this.fullSummary,
+  required this.sessionInsights, // ✅ REQUIRED
+});
+
+  @override
+  State<StoryDetailScreen> createState() => _StoryDetailScreenState();
+}
+
+class _StoryDetailScreenState extends State<StoryDetailScreen> {
+  final SupabaseClient _client = Supabase.instance.client;
+  final TextEditingController _controller = TextEditingController();
+  bool _loading = true;
+  bool _saving = false;
+  bool _deleting = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadCuratedOrSummary();
+  }
+
+  Widget _buildSessionInsightsSection(ThemeData theme) {
+  Map<String, dynamic>? si;
+
+  final raw = widget.sessionInsights;
+  if (raw is Map<String, dynamic>) {
+    si = raw;
+  } else if (raw is String && raw.trim().isNotEmpty) {
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map<String, dynamic>) si = decoded;
+    } catch (_) {}
+  }
+
+  if (si == null || si.isEmpty) return const SizedBox.shrink();
+
+  final keySentence = (si['key_sentence'] as String? ?? '').trim();
+  final items = (si['items'] as List<dynamic>? ?? const []);
+
+  if (keySentence.isEmpty && items.isEmpty) return const SizedBox.shrink();
+
+  // Collect “tags” from kinds
+  final tags = <String>{};
+  for (final it in items) {
+    if (it is Map) {
+      final kind = (it['kind'] as String? ?? '').trim();
+      if (kind.isNotEmpty) tags.add(kind);
+    }
+  }
+
+  return Container(
+    margin: const EdgeInsets.only(bottom: 12),
+    decoration: BoxDecoration(
+      border: Border.all(color: theme.dividerColor),
+      borderRadius: BorderRadius.circular(12),
+    ),
+    child: ExpansionTile(
+      title: Text(
+        'Open full session insights',
+        style: theme.textTheme.titleMedium,
+      ),
+      childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+      children: [
+        if (keySentence.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Text(
+            keySentence,
+            style: theme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600),
+          ),
+        ],
+
+        if (tags.isNotEmpty) ...[
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 6,
+            runSpacing: -8,
+            children: tags.take(8).map((t) {
+              return Chip(
+                visualDensity: VisualDensity.compact,
+                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                label: Text(t),
+              );
+            }).toList(),
+          ),
+        ],
+
+        if (items.isNotEmpty) ...[
+          const SizedBox(height: 10),
+          ...items.take(10).map((it) {
+            if (it is! Map) return const SizedBox.shrink();
+            final text = (it['text'] as String? ?? '').trim();
+            final kind = (it['kind'] as String? ?? '').trim();
+            if (text.isEmpty) return const SizedBox.shrink();
+
+            final prefix = kind.isNotEmpty ? '${kind.toUpperCase()}: ' : '';
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('•  '),
+                  Expanded(child: Text('$prefix$text')),
+                ],
+              ),
+            );
+          }),
+        ],
+      ],
+    ),
+  );
+}
+
+  Future<void> _loadCuratedOrSummary() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    final user = _client.auth.currentUser;
+    if (user == null) {
+      setState(() {
+        _loading = false;
+        _error = 'You must be logged in.';
+      });
+      return;
+    }
+
+    try {
+      // 1) Load the latest summary text for this session from memory_summary.
+      Map<String, dynamic>? summaryRes;
+      try {
+        final res = await _client
+            .from('memory_summary')
+            .select('short_summary, full_summary')
+            .eq('id', widget.memorySummaryId)
+            .eq('user_id', user.id)
+            .maybeSingle();
+
+        if (res != null && res is Map<String, dynamic>) {
+          summaryRes = res;
+        }
+      } catch (_) {
+        // If this fetch fails for any reason, we'll fall back to the values
+        // passed in from the Story Library list.
+      }
+
+      final shortSummaryFromDb =
+          (summaryRes?['short_summary'] as String? ?? '').trim();
+      final fullSummaryFromDb =
+          (summaryRes?['full_summary'] as String? ?? '').trim();
+
+      final effectiveShortSummary = shortSummaryFromDb.isNotEmpty
+          ? shortSummaryFromDb
+          : widget.shortSummary.trim();
+
+      final effectiveFullSummary = fullSummaryFromDb.isNotEmpty
+          ? fullSummaryFromDb
+          : widget.fullSummary.trim();
+
+      String initialText;
+      if (effectiveFullSummary.isNotEmpty) {
+        initialText = effectiveFullSummary;
+      } else if (effectiveShortSummary.isNotEmpty) {
+        initialText = effectiveShortSummary;
+      } else {
+        // Last resort: whatever fallback we computed earlier.
+        initialText = widget.fallbackBody;
+      }
+
+      _controller.text = initialText;
+
+      setState(() {
+        _loading = false;
+      });
+    } catch (e) {
+      setState(() {
+        _loading = false;
+        _error = 'Failed to load story: $e';
+      });
+    }
+  }
+
+  void _showSnack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  Future<void> _saveCurated() async {
+    final user = _client.auth.currentUser;
+    if (user == null) {
+      _showSnack('You must be logged in to save.');
+      return;
+    }
+
+    final text = _controller.text;
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) {
+      _showSnack('Story text cannot be empty.');
+      return;
+    }
+
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
+
+    try {
+      // 1) Upsert into memory_curated
+      await _client.from('memory_curated').upsert(
+        {
+          'user_id': user.id,
+          'memory_summary_id': widget.memorySummaryId,
+          'curated_text': trimmed,
+        },
+        onConflict: 'user_id, memory_summary_id',
+      );
+
+      // 2) Update memory_summary.full_summary so downstream systems see curated text
+      await _client
+          .from('memory_summary')
+          .update({'full_summary': trimmed})
+          .eq('id', widget.memorySummaryId)
+          .eq('user_id', user.id);
+
+      // 3) Kick off an insights rebuild
+      try {
+        await _client.functions
+            .invoke('rebuild-insights', body: {'user_id': user.id});
+      } catch (e) {
+        // Non-fatal
+        // ignore: avoid_print
+        print('rebuild-insights failed: $e');
+      }
+
+      _showSnack('Curated story saved.');
+
+      setState(() {
+        _saving = false;
+      });
+
+      if (mounted) {
+        Navigator.of(context).pop(true);
+      }
+    } catch (e) {
+      setState(() {
+        _saving = false;
+        _error = 'Failed to save curated story: $e';
+      });
+    }
+  }
+
+  Future<void> _deleteSession() async {
+    final user = _client.auth.currentUser;
+    if (user == null) {
+      _showSnack('You must be logged in to delete.');
+      return;
+    }
+
+    // Confirm with the user
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete this session?'),
+        content: const Text(
+          'This will delete the curated story, the session summary, and '
+          'the underlying memories associated with this session. '
+          'This cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) {
+      return;
+    }
+
+    setState(() {
+      _deleting = true;
+      _error = null;
+    });
+
+    try {
+      // 1) Delete from memory_curated (if exists)
+      await _client
+          .from('memory_curated')
+          .delete()
+          .eq('user_id', user.id)
+          .eq('memory_summary_id', widget.memorySummaryId);
+
+      // 2) Delete from memory_raw using the sessionKey if we have it
+      if (widget.sessionKey != null && widget.sessionKey!.isNotEmpty) {
+        await _client
+            .from('memory_raw')
+            .delete()
+            .eq('user_id', user.id)
+            .eq('conversation_id', widget.sessionKey!);
+      }
+
+      // 3) Delete from memory_summary
+      await _client
+          .from('memory_summary')
+          .delete()
+          .eq('id', widget.memorySummaryId)
+          .eq('user_id', user.id);
+
+      // 4) Trigger insights rebuild (best-effort)
+      try {
+        await _client.functions
+            .invoke('rebuild-insights', body: {'user_id': user.id});
+      } catch (e) {
+        // Non-fatal
+        // ignore: avoid_print
+        print('rebuild-insights after delete failed: $e');
+      }
+
+      _showSnack('Story deleted.');
+
+      if (mounted) {
+        Navigator.of(context).pop(true);
+      }
+    } catch (e) {
+      setState(() {
+        _deleting = false;
+        _error = 'Failed to delete story: $e';
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Session: ${widget.dateLabel}'),
+      ),
+      body: _loading
+          ? const Center(
+              child: CircularProgressIndicator(),
+            )
+          : _error != null
+              ? Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(
+                    _error!,
+                    style: theme.textTheme.bodyMedium,
+                  ),
+                )
+              : Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      _buildSessionInsightsSection(theme),
+                      Text(
+                        'Your story for this session',
+                        style: theme.textTheme.titleMedium,
+                      ),
+                      const SizedBox(height: 8),
+                      Expanded(
+                        child: TextField(
+                          controller: _controller,
+                          maxLines: null,
+                          minLines: 8,
+                          decoration: const InputDecoration(
+                            border: OutlineInputBorder(),
+                            alignLabelWithHint: true,
+                          ),
+                          style: theme.textTheme.bodyMedium,
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      if (_error != null) ...[
+                        Text(
+                          _error!,
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            color: theme.colorScheme.error,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                      ],
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          TextButton.icon(
+                            onPressed: _deleting ? null : _deleteSession,
+                            icon: _deleting
+                                ? const SizedBox(
+                                    width: 16,
+                                    height: 16,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : const Icon(Icons.delete_outline),
+                            label: const Text('Delete'),
+                          ),
+                          ElevatedButton.icon(
+                            onPressed: _saving ? null : _saveCurated,
+                            icon: _saving
+                                ? const SizedBox(
+                                    width: 16,
+                                    height: 16,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : const Icon(Icons.save),
+                            label: const Text('Save curated story'),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+    );
+  }
+}
+
+class MemoryEditorScreen extends StatefulWidget {
+  final String memoryId;
+  final String initialText;
+  final String dateLabel;
+
+  const MemoryEditorScreen({
+    super.key,
+    required this.memoryId,
+    required this.initialText,
+    required this.dateLabel,
+  });
+
+  @override
+  State<MemoryEditorScreen> createState() => _MemoryEditorScreenState();
+}
+
+class _MemoryEditorScreenState extends State<MemoryEditorScreen> {
+  final SupabaseClient _client = Supabase.instance.client;
+  late TextEditingController _controller;
+  bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initialText);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    setState(() {
+      _saving = true;
+    });
+
+    try {
+      // 1) Update the memory text and mark as user-edited
+      await _client
+          .from('memory_raw')
+          .update({
+            'content': _controller.text,
+            'user_edited': true,
+          })
+          .eq('id', widget.memoryId);
+
+      // 2) Fire-and-forget: rebuild insights for this user
+      try {
+        final user = _client.auth.currentUser;
+        if (user != null) {
+          await _client.functions
+              .invoke('rebuild-insights', body: {'user_id': user.id});
+        }
+      } catch (e) {
+        // Don't block the save if insights rebuild fails
+        print('rebuild-insights failed after memory edit: $e');
+      }
+
+      if (!mounted) return;
+      Navigator.of(context).pop(true);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to save memory: $e'),
+        ),
+      );
+      setState(() {
+        _saving = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(
+          widget.dateLabel.isNotEmpty
+              ? 'Edit memory – ${widget.dateLabel}'
+              : 'Edit memory',
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.save),
+            onPressed: _saving ? null : _save,
+          ),
+        ],
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: TextField(
+          controller: _controller,
+          maxLines: null,
+          minLines: 8,
+          decoration: const InputDecoration(
+            border: OutlineInputBorder(),
+            labelText: 'Memory text',
+            alignLabelWithHint: true,
+          ),
+          style: theme.textTheme.bodyMedium,
+        ),
+      ),
+    );
+  }
+}
+
+// Simple “insights” view built on memory_insights
+class InsightsScreen extends StatefulWidget {
+  const InsightsScreen({super.key});
+
+  @override
+  State<InsightsScreen> createState() => _InsightsScreenState();
+}
+
+class _InsightsScreenState extends State<InsightsScreen> {
+  final SupabaseClient _client = Supabase.instance.client;
+  bool _loading = true;
+  String? _error;
+  List<Map<String, dynamic>> _insights = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadInsights();
+  }
+
+  Future<void> _loadInsights() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    final user = _client.auth.currentUser;
+    if (user == null) {
+      setState(() {
+        _loading = false;
+        _error = 'You must be logged in to view insights.';
+      });
+      return;
+    }
+
+    try {
+      final res = await _client
+          .from('memory_insights')
+          .select(
+            // New schema from rebuild-insights:
+            // - short_title: brief label
+            // - insight_text: main descriptive text
+            // - insight_type / confidence / tags: optional metadata
+            'id, short_title, insight_text, insight_type, confidence, tags, created_at, source_session_ids',
+          )
+          .eq('user_id', user.id)
+          .order('created_at', ascending: false);
+
+      final list = (res as List<dynamic>? ?? <dynamic>[]);
+
+      setState(() {
+        _insights = list.map((e) => e as Map<String, dynamic>).toList();
+        _loading = false;
+      });
+    } catch (e) {
+
+      setState(() {
+        _error = 'Failed to load insights: $e';
+        _loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Insights'),
+      ),
+      body: RefreshIndicator(
+        onRefresh: _loadInsights,
+        child: _loading
+            ? const Center(
+                child: CircularProgressIndicator(),
+              )
+            : _error != null
+                ? ListView(
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Text(
+                          _error!,
+                          style: theme.textTheme.bodyMedium,
+                        ),
+                      ),
+                    ],
+                  )
+                : _insights.isEmpty
+                    ? ListView(
+                        children: const [
+                          Padding(
+                            padding: EdgeInsets.all(16),
+                            child: Text(
+                              'No insights yet. As you record more memories, '
+                              'this screen will show patterns and themes.',
+                            ),
+                          ),
+                        ],
+                      )
+                    : ListView.builder(
+                        itemCount: _insights.length,
+                        itemBuilder: (context, index) {
+                          final row = _insights[index];
+
+                          // New schema from rebuild-insights:
+                          // - short_title: brief label for the insight
+                          // - insight_text: full descriptive text
+                          final title =
+                              (row['short_title'] as String? ?? '').trim();
+                          final summary =
+                              (row['insight_text'] as String? ?? '').trim();
+
+                          final createdAtStr =
+                              row['created_at'] as String? ?? '';
+                          String dateLabel = '';
+                          if (createdAtStr.isNotEmpty) {
+                            final createdAt =
+                                DateTime.tryParse(createdAtStr)?.toLocal();
+                            if (createdAt != null) {
+                              dateLabel =
+                                  '${createdAt.year}-${createdAt.month.toString().padLeft(2, '0')}-${createdAt.day.toString().padLeft(2, '0')}';
+                            } else {
+                              dateLabel = createdAtStr;
+                            }
+                          }
+
+                          return ListTile(
+                            title: Text(
+                              title.isNotEmpty ? title : '(Untitled insight)',
+                              style: theme.textTheme.titleMedium,
+                            ),
+                            subtitle: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                if (dateLabel.isNotEmpty)
+                                  Text(
+                                    dateLabel,
+                                    style: theme.textTheme.bodySmall,
+                                  ),
+                                if (summary.isNotEmpty) ...[
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    summary,
+                                    style: theme.textTheme.bodyMedium,
+                                  ),
+                                ],
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+      ),
+    );
+  }
+}

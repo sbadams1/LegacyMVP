@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "speech-hub": {
+      "entrypoint": "index.ts"
+    }
+  }
+}

@@ -11,6 +11,8 @@
 // - sanitizeGeminiOutput() to strip code fences / JSON wrappers
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.48.0";
 import {
   chooseExpansionForConcept,
@@ -57,9 +59,6 @@ interface AiBrainPayload {
   user_id: string;
   conversation_id?: string;
   message_text: string;
-
-  end_session?: boolean;
-
   mode?: ConversationMode;
   preferred_locale?: string;
   target_locale?: string | null;
@@ -86,179 +85,74 @@ interface LegacyTranscriptTurn {
   text: string;
 }
 
-// Summarizer Contract
-type SummarizerContext = {
-  session_key?: string | null;
-  chapter_id?: string | null;
-  chapter_title?: string | null;
-  preferred_locale?: string | null;
-  target_locale?: string | null;
-  learning_level?: string | null;
-};
-
-function tryExtractJsonObject(rawText: string): any | null {
-  if (!rawText) return null;
-
-  let text = rawText.trim();
-
-  // Strip code fences if present
-  if (text.startsWith("```")) {
-    const firstBrace = text.indexOf("{");
-    const lastBrace = text.lastIndexOf("}");
-    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-      text = text.slice(firstBrace, lastBrace + 1);
-    }
-  }
-
-  // Try direct parse
-  try {
-    return JSON.parse(text);
-  } catch {
-    // Fallback: attempt to extract first JSON object block
-    const first = text.indexOf("{");
-    const last = text.lastIndexOf("}");
-    if (first !== -1 && last !== -1 && last > first) {
-      try {
-        return JSON.parse(text.slice(first, last + 1));
-      } catch {
-        return null;
-      }
-    }
-  }
-
-  return null;
-}
-
+/**
+ * Ask Gemini for a session-level summary of a legacy conversation.
+ * Returns { short_summary, full_summary }.
+ * If Gemini is unavailable, falls back to a naive summary.
+ */
 async function summarizeLegacySessionWithGemini(
   transcript: LegacyTranscriptTurn[],
-  ctx?: SummarizerContext,
-): Promise<{
-  short_summary: string;
-  full_summary: string;
-  observations: MemorySummaryObservations | null;
-  session_insights: SessionInsightsJson | null;
-} | null> {
-  if (!transcript?.length) return null;
-
-  // If Gemini not configured, fallback to something deterministic.
-  if (!GEMINI_API_KEY) {
-    const joined = transcript
-      .map((t) => `${t.role === "user" ? "USER" : "AI"}: ${t.text}`)
-      .join("\n");
-    const trimmed = joined.trim();
+): Promise<{ short_summary: string; full_summary: string }> {
+  // Naive fallback if we have nothing or no Gemini key.
+  if (!transcript.length || !GEMINI_API_KEY) {
+    const joined = transcript.map((t) => t.text).join(" ");
+    const trimmed = joined.replace(/\s+/g, " ").trim();
     const shortSummary =
       trimmed.length > 160 ? `${trimmed.slice(0, 157)}...` : trimmed || "Legacy session";
     const fullSummary =
       trimmed.length > 400 ? `${trimmed.slice(0, 397)}...` : trimmed || shortSummary;
-
-    return {
-      short_summary: shortSummary,
-      full_summary: fullSummary,
-      observations: {
-        chapter_keys: [],
-        themes: [],
-        word_count_estimate: Math.max(0, Math.floor(trimmed.split(/\s+/).length)),
-      },
-      session_insights: null,
-    };
+    return { short_summary: shortSummary, full_summary: fullSummary };
   }
 
-  // Trim transcript to keep prompt size under control.
-  const MAX_CHARS = 9000;
-  const trimmedTurns: LegacyTranscriptTurn[] = [];
+  // Trim the transcript to keep prompt size under control (approx char-based).
+  const MAX_CHARS = 8000;
+  const trimmed: LegacyTranscriptTurn[] = [];
   let total = 0;
+  // Walk from the end backwards, then reverse to restore chronological order.
   for (let i = transcript.length - 1; i >= 0; i--) {
     const t = transcript[i];
-    const len = (t.text || "").length;
-    if (total + len > MAX_CHARS && trimmedTurns.length > 0) break;
-    trimmedTurns.push(t);
+    const len = t.text.length;
+    if (total + len > MAX_CHARS && trimmed.length > 0) break;
+    trimmed.push(t);
     total += len;
   }
-  trimmedTurns.reverse();
+  trimmed.reverse();
 
-  const transcriptText = trimmedTurns
+  const transcriptText = trimmed
     .map((t) => `${t.role === "user" ? "USER" : "AI"}: ${t.text}`)
     .join("\n");
-
-  const allowedChapterKeys = [
-    "early_childhood",
-    "adolescence",
-    "early_adulthood",
-    "midlife",
-    "later_life",
-    "family_relationships",
-    "work_career",
-    "education",
-    "health_wellbeing",
-    "hobbies_interests",
-    "beliefs_values",
-    "major_events",
-  ];
-
-  const sessionKey = ctx?.session_key ?? null;
-  const chapterId = ctx?.chapter_id ?? null;
-  const chapterTitle = ctx?.chapter_title ?? null;
 
   const prompt = `
 You are an expert autobiographical editor summarizing a *legacy preservation* interview.
 
-You will receive a transcript of a single session between a PERSON (USER) and an AI assistant (AI).
-Your job is to ignore technical chatter (e.g., apps, STT, Supabase, Gemini, tests, coverage maps, debugging)
-and focus on the person's life experiences, memories, and feelings.
+You will receive a transcript of a single session between a PERSON (USER) and an AI assistant (AI). 
+Your job is to ignore technical chatter (e.g., about apps, STT, Supabase, Gemini, tests, coverage maps, debugging)
+and focus purely on the person's life experiences, memories, and feelings.
 
-Context (may be null):
-- session_key: ${sessionKey ?? "null"}
-- chapter_id: ${chapterId ?? "null"}
-- chapter_title: ${chapterTitle ?? "null"}
+From the transcript below, produce:
+1) "short_summary": ONE clear sentence in third person that captures the core of what the person talked about.
+2) "full_summary": 1–3 short paragraphs in third person that capture the key memories, details, and themes.
+   - Focus on biographical facts (places, dates, careers, relationships, important events).
+   - Do NOT mention that this is an app, AI, debugging, or testing.
+   - Do NOT say things like "In this conversation, they talked about..."; just tell the story directly.
 
-ALLOWED chapter_keys (choose 1–3 that best fit, or [] if truly no biographical content):
-${allowedChapterKeys.map((k) => `- "${k}"`).join("\n")}
-
-Return ONLY a valid JSON object with this exact shape (NO extra keys, NO prose):
-
+Return ONLY a valid JSON object with this exact shape:
 {
-  "short_summary": "ONE clear sentence in third person capturing the core topic.",
-  "full_summary": "1–3 short paragraphs in third person capturing key memories, details, and themes.",
-  "observations": {
-    "chapter_keys": ["family_relationships", "major_events"],
-    "themes": ["food", "family teasing"],
-    "insight_tags": ["resilience", "humor"],
-    "word_count_estimate": 1234,
-    "narrative_depth_score": 0.0,
-    "emotional_depth_score": 0.0,
-    "reflection_score": 0.0,
-    "distinctiveness_score": 0.0,
-    "stereotype_risk_flags": []
-  },
-  "session_insights": {
-    "session_id": "${sessionKey ?? ""}",
-    "conversation_id": "${sessionKey ?? ""}",
-    "key_sentence": "One sentence that captures what mattered most in this session.",
-    "items": [
-      { "id": "i1", "kind": "theme", "text": "short insight text", "strength": 0.7 }
-    ]
-  }
+  "short_summary": "...",
+  "full_summary": "..."
 }
-
-Rules:
-- DO NOT mention that this is an app, AI, debugging, or testing.
-- DO NOT say “In this conversation...”.
-- When the USER asks a direct question or requests an opinion:
-  - Give a direct, helpful answer first (2–8 sentences).
-  - Then optionally ask ONE follow-up question if it would materially improve the story.
-- Do not dodge by only asking questions.
-- If session is mostly technical with no life story content:
-  - still return the same JSON shape,
-  - use a neutral short_summary/full_summary,
-  - set observations.chapter_keys to [],
-  - session_insights.items can be [].
 
 Transcript:
 ${transcriptText}
 `.trim();
 
   const body = {
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: prompt }],
+      },
+    ],
   };
 
   try {
@@ -277,7 +171,7 @@ ${transcriptText}
         resp.status,
         await resp.text(),
       );
-      return null;
+      throw new Error(`Gemini error ${resp.status}`);
     }
 
     const json = await resp.json();
@@ -286,34 +180,36 @@ ${transcriptText}
       json?.candidates?.[0]?.content?.parts?.[0]?.rawText ??
       "";
 
-    const parsed = tryExtractJsonObject(text);
-    if (!parsed) {
-      console.error("summarizeLegacySessionWithGemini: failed to parse JSON");
-      return null;
+    let parsed: any;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      // Sometimes Gemini wraps JSON in prose; try to extract a JSON block.
+      const match = String(text).match(/\{[\s\S]*\}/);
+      if (!match) throw new Error("No JSON block found in Gemini text");
+      parsed = JSON.parse(match[0]);
     }
 
-    const short_summary = typeof parsed.short_summary === "string" ? parsed.short_summary.trim() : "";
-    const full_summary = typeof parsed.full_summary === "string" ? parsed.full_summary.trim() : "";
+    const shortSummary =
+      (parsed?.short_summary as string | undefined)?.trim() ?? "";
+    const fullSummary =
+      (parsed?.full_summary as string | undefined)?.trim() ?? "";
 
-    // observations is optional but strongly preferred
-    const observations: MemorySummaryObservations | null =
-      parsed.observations && typeof parsed.observations === "object" ? parsed.observations : null;
-
-    // session_insights is optional but strongly preferred
-    const session_insights: SessionInsightsJson | null =
-      parsed.session_insights && typeof parsed.session_insights === "object"
-        ? parsed.session_insights
-        : null;
-
-    if (!short_summary || !full_summary) {
-      console.error("summarizeLegacySessionWithGemini: missing summaries");
-      return null;
+    if (!shortSummary || !fullSummary) {
+      throw new Error("Missing short_summary or full_summary in Gemini JSON");
     }
 
-    return { short_summary, full_summary, observations, session_insights };
+    return { short_summary: shortSummary, full_summary: fullSummary };
   } catch (err) {
-    console.error("summarizeLegacySessionWithGemini: unexpected error", err);
-    return null;
+    console.error("summarizeLegacySessionWithGemini failed, using fallback:", err);
+
+    const joined = transcript.map((t) => t.text).join(" ");
+    const trimmed = joined.replace(/\s+/g, " ").trim();
+    const shortSummary =
+      trimmed.length > 160 ? `${trimmed.slice(0, 157)}...` : trimmed || "Legacy session";
+    const fullSummary =
+      trimmed.length > 400 ? `${trimmed.slice(0, 397)}...` : trimmed || shortSummary;
+    return { short_summary: shortSummary, full_summary: fullSummary };
   }
 }
 
@@ -358,137 +254,6 @@ async function fetchLegacySessionTranscript(
   } catch (err) {
     console.error("fetchLegacySessionTranscript exception:", err);
     return [];
-  }
-}
-
-// --- Legacy transcript + curated story helpers ------------------------------
-
-interface StorySeed {
-  story_key: string;
-  title: string;
-  body: string;
-  tags?: string[];
-  traits?: string[];
-}
-
-/**
- * Upsert curated stories for a given legacy conversation into memory_curated.
- * Best-effort: logs errors but never throws.
- *
- * NOTE: This assumes memory_curated has at least:
- *   user_id, story_key, title, curated_text, tags, traits, metadata (jsonb)
- */
-async function upsertCuratedStoriesForConversation(
-  client: SupabaseClient,
-  userId: string,
-  conversationId: string,
-  transcript: LegacyTranscriptTurn[],
-): Promise<void> {
-  if (!transcript.length) return;
-
-  const transcriptText = transcript
-    .map((t) => `${t.role === "user" ? "USER" : "AI"}: ${t.text}`)
-    .join("\n");
-
-  // Try to extract structured stories with Gemini.
-  let seeds = await extractStoriesFromTranscript(transcriptText);
-
-  // Fallback: if Gemini returns no stories, still capture a simple
-  // session-level story so memory_curated always gets something.
-  if (!seeds.length) {
-    const fallbackKey = `session_${conversationId}`;
-    const fallbackTitle = "Session recap";
-
-    seeds = [
-      {
-        story_key: fallbackKey,
-        title: fallbackTitle,
-        body: transcriptText.slice(0, 4000),
-        tags: ["fallback", "session_recap"],
-        traits: [],
-      },
-    ];
-  }
-
-  for (const seed of seeds) {
-    // existing loop body unchanged...
-
-    try {
-      const { data: existing, error: existingError } = await client
-        .from("memory_curated")
-        .select("id, story_key, metadata")
-        .eq("user_id", userId)
-        .eq("story_key", seed.story_key)
-        .limit(1)
-        .maybeSingle();
-
-      if (existingError) {
-        console.error(
-          "upsertCuratedStoriesForConversation select error:",
-          existingError,
-        );
-        continue;
-      }
-
-      if (existing) {
-        const metadata = (existing.metadata as any) ?? {};
-        const existingSessions: string[] = Array.isArray(
-          metadata.conversation_ids,
-        )
-          ? metadata.conversation_ids
-          : [];
-        const mergedSessions = Array.from(
-          new Set([...existingSessions, conversationId]),
-        );
-
-        const { error: updateError } = await client
-          .from("memory_curated")
-          .update({
-            title: seed.title,
-            curated_text: seed.body,
-            tags: seed.tags ?? null,
-            traits: seed.traits ?? null,
-            metadata: {
-              ...metadata,
-              conversation_ids: mergedSessions,
-            },
-          })
-          .eq("id", existing.id);
-
-        if (updateError) {
-          console.error(
-            "upsertCuratedStoriesForConversation update error:",
-            updateError,
-          );
-        }
-      } else {
-        const { error: insertError } = await client
-          .from("memory_curated")
-          .insert({
-            user_id: userId,
-            story_key: seed.story_key,
-            title: seed.title,
-            curated_text: seed.body,
-            tags: seed.tags ?? null,
-            traits: seed.traits ?? null,
-            metadata: {
-              conversation_ids: [conversationId],
-            },
-          });
-
-        if (insertError) {
-          console.error(
-            "upsertCuratedStoriesForConversation insert error:",
-            insertError,
-          );
-        }
-      }
-    } catch (err) {
-      console.error(
-        "upsertCuratedStoriesForConversation unexpected error:",
-        err,
-      );
-    }
   }
 }
 
@@ -751,105 +516,6 @@ interface MemorySummaryRow {
   short_summary: string | null;
   full_summary: string | null;
   observations: MemorySummaryObservations | null;
-}
-
-interface SessionInsightItem {
-  id: string;
-  kind: "trait" | "theme" | "value" | "behavior";
-  text: string;
-  strength?: number;
-}
-
-interface SessionInsightsJson {
-  session_id: string;
-  conversation_id: string;
-  key_sentence: string;
-  items: SessionInsightItem[];
-}
-
-async function extractStoriesFromTranscript(
-  transcriptText: string,
-): Promise<StorySeed[]> {
-  if (!transcriptText.trim() || !GEMINI_API_KEY) return [];
-
-  const prompt = `
-You are an expert autobiographical editor.
-You will be given a transcript of a conversation containing one or more personal anecdotes.
-
-Identify distinct STORIES in the transcript. A story is a concrete remembered event (time, place, people, actions).
-
-Return ONLY valid JSON of this shape:
-
-{
-  "stories": [
-    {
-      "story_key": "suckling_pig_story",
-      "title": "The Suckling Pig Nobody Ate",
-      "body": "Write the story in clear, narrative form...",
-      "tags": ["food", "family", "dad", "teenage_years"],
-      "traits": ["playful_teasing", "squeamish_about_raw_meat"]
-    }
-  ]
-}
-
-Rules:
-- Keep 1–5 stories max.
-- Use concise, snake_case story_key values.
-- Make body suitable to be saved as a standalone story for a memory library.
-- Do not invent new events that aren't implied by the transcript.
-
-Transcript:
-${transcriptText}
-`.trim();
-
-  const body = {
-    contents: [
-      { role: "user", parts: [{ text: prompt }] },
-    ],
-  };
-
-  try {
-    const resp = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      },
-    );
-
-    if (!resp.ok) {
-      console.error("extractStoriesFromTranscript Gemini error", resp.status, await resp.text());
-      return [];
-    }
-
-    const json = await resp.json();
-    const text =
-      json?.candidates?.[0]?.content?.parts?.[0]?.text ??
-      json?.candidates?.[0]?.content?.parts?.[0]?.rawText ??
-      "";
-
-    let parsed: any;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      const match = String(text).match(/\{[\s\S]*\}/);
-      if (!match) return [];
-      parsed = JSON.parse(match[0]);
-    }
-
-    const rawStories = Array.isArray(parsed?.stories) ? parsed.stories : [];
-    return rawStories.map((s: any): StorySeed => ({
-      story_key: String(s.story_key ?? "").trim(),
-      title: String(s.title ?? "").trim(),
-      body: String(s.body ?? "").trim(),
-      tags: Array.isArray(s.tags) ? s.tags.map((t: any) => String(t)) : [],
-      traits: Array.isArray(s.traits) ? s.traits.map((t: any) => String(t)) : [],
-    })).filter((s) => s.story_key && s.title && s.body);
-  } catch (err) {
-    console.error("extractStoriesFromTranscript failed:", err);
-    return [];
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1146,183 +812,6 @@ function normalizeCoverageChapterKey(
   }
 }
 
-async function extractSessionInsightsFromSummary(
-  fullSummary: string,
-  conversationId: string,
-  sessionId: string,
-): Promise<SessionInsightsJson | null> {
-  const trimmed = fullSummary.trim();
-  if (!trimmed || !GEMINI_API_KEY) return null;
-
-const prompt = `
-You are an expert biographer and personality analyst.
-
-You will be given a narrative description of ONE conversation session.
-Extract insights that are:
-- personally specific (use concrete phrases from the session when possible),
-- non-generic,
-- and useful for understanding enduring traits/patterns.
-
-Return ONLY valid JSON of this exact shape (no extra keys, no prose):
-
-{
-  "key_sentence": "...",
-  "items": [
-    { "id": "playful_teasing", "kind": "trait", "text": "...", "strength": 0.9 }
-  ]
-}
-
-Rules:
-- key_sentence must be meaningful and specific (no platitudes).
-- items: 3–8 items (not 1–5), each short and specific.
-- Prefer "trait" and "behavior" items when the person demonstrates a pattern (humor, teasing, risk-taking, discipline, etc.).
-- If the session contains a named anecdote (e.g. “murder crabs”, “suckling pig”), include it as a "theme" item.
-- strength: 0.55–0.95; use higher only when strongly supported.
-
-Session summary:
-${trimmed}
-`.trim();
-
-  const body = {
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: prompt }],
-      },
-    ],
-  };
-
-  try {
-    const resp = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      },
-    );
-
-    if (!resp.ok) {
-      console.error("extractSessionInsightsFromSummary: Gemini error", resp.status, await resp.text());
-      return null;
-    }
-
-    const json = await resp.json();
-    const text =
-      json?.candidates?.[0]?.content?.parts?.[0]?.text ??
-      json?.candidates?.[0]?.content?.parts?.[0]?.rawText ??
-      "";
-
-    let parsed: any;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      const match = String(text).match(/\{[\s\S]*\}/);
-      if (!match) return null;
-      parsed = JSON.parse(match[0]);
-    }
-
-    const keySentence = (parsed?.key_sentence as string | undefined)?.trim();
-    const items = Array.isArray(parsed?.items) ? parsed.items : [];
-
-    if (!keySentence || !items.length) return null;
-
-    const insights: SessionInsightsJson = {
-      session_id: sessionId,
-      conversation_id: conversationId,
-      key_sentence: keySentence,
-      items: items.map((it: any): SessionInsightItem => ({
-        id: String(it.id ?? "unknown"),
-        kind:
-          it.kind === "theme" ||
-          it.kind === "value" ||
-          it.kind === "behavior"
-            ? it.kind
-            : "trait",
-        text: String(it.text ?? "").trim(),
-        strength:
-          typeof it.strength === "number" ? it.strength : undefined,
-      })),
-    };
-
-    return insights;
-  } catch (err) {
-    console.error("extractSessionInsightsFromSummary failed:", err);
-    return null;
-  }
-}
-
-async function upsertCuratedStoriesForSession(
-  client: SupabaseClient,
-  userId: string,
-  sessionId: string,        // memory_summary.id
-  conversationId: string,   // conversation_id / session_key
-  transcriptText: string,
-) {
-  const seeds = await extractStoriesFromTranscript(transcriptText);
-  if (!seeds.length) return;
-
-  for (const seed of seeds) {
-    // Check if this story_key already exists for this user
-    const { data: existing, error: selectError } = await client
-      .from("memory_curated")
-      .select("id, source_session_ids")
-      .eq("user_id", userId)
-      .eq("story_key", seed.story_key)
-      .maybeSingle();
-
-    if (selectError) {
-      console.error("upsertCuratedStoriesForSession select error:", selectError);
-      continue;
-    }
-
-    if (existing) {
-      // Merge session into source_session_ids and update body/title/tags/traits
-      const existingSessions: string[] =
-        (existing.source_session_ids as string[] | null) ?? [];
-      const mergedSessions = Array.from(
-        new Set([...existingSessions, sessionId]),
-      );
-
-      const { error: updateError } = await client
-        .from("memory_curated")
-        .update({
-          title: seed.title,
-          curated_text: seed.body,
-          tags: seed.tags ?? null,
-          traits: seed.traits ?? null,
-          source_session_ids: mergedSessions,
-        })
-        .eq("id", existing.id);
-
-      if (updateError) {
-        console.error("upsertCuratedStoriesForSession update error:", updateError);
-      }
-    } else {
-      // Insert a new curated story
-      const { error: insertError } = await client
-        .from("memory_curated")
-        .insert({
-          user_id: userId,
-          memory_summary_id: sessionId,
-          story_key: seed.story_key,
-          title: seed.title,
-          curated_text: seed.body,
-          tags: seed.tags ?? null,
-          traits: seed.traits ?? null,
-          source_session_ids: [sessionId],
-          metadata: {
-            conversation_id: conversationId,
-          },
-        });
-
-      if (insertError) {
-        console.error("upsertCuratedStoriesForSession insert error:", insertError);
-      }
-    }
-  }
-}
-
 async function classifyCoverageFromStoryText(
   storyText: string,
 ): Promise<{ chapterKeys: CoverageChapterKey[]; themes: string[] } | null> {
@@ -1406,7 +895,7 @@ export interface LifetimeProfile {
   last_updated: string;
   core_identity: {
     legal_name?: string;
-    display_name?: string;
+    preferred_name?: string;
     birth_date?: string;
     birth_year_estimate?: number;
     birth_place?: string;
@@ -2983,10 +2472,7 @@ Context block (how to use it):
 - Treat those bullet points as things you genuinely remember this person telling you.
 - When it is naturally relevant (roughly every 3–5 turns), you may weave in a light callback such as:
   - "Last time you told me about ..." or
-  - "I remember you mentioned ...".
-- Do NOT start every message with the same phrase.
-- Vary your callbacks: sometimes use a memory reference, sometimes not.
-- Never reuse an identical stock sentence across multiple turns; rephrase or skip it entirely.
+  - "I remember you mentioned ..."
 - Prefer callbacks that reference vivid or unique stories (for example, unusual food, memorable trips, or intense moments),
   especially when the user is talking about a related topic again (e.g. food, travel, relationships).
 - If the user explicitly asks you to recap or retell a story ("remind me what I told you about my suckling pig story"),
@@ -4225,7 +3711,7 @@ export async function recomputeLifetimeProfileForUser(
     const { data: profileRow, error: profileError } = await supabase
     .from("profiles")
     .select(
-      "id, display_name, birth_year, home_city, home_country, current_city, current_country"
+      "id, display_name, preferred_name, birth_year, home_city, home_country, current_city, current_country"
     )
     .eq("id", userId)
     .maybeSingle();
@@ -4240,7 +3726,7 @@ export async function recomputeLifetimeProfileForUser(
   const birthYear: number | undefined = prof.birth_year ?? undefined;
 
   const displayName: string | undefined =
-    prof.display_name ??
+    prof.preferred_name ??
     prof.display_name ??
     undefined;
 
@@ -4272,7 +3758,7 @@ export async function recomputeLifetimeProfileForUser(
     last_updated: now.toISOString(),
     core_identity: {
       display_name: displayName,
-      legal_name: preferredName,
+      preferred_name: preferredName,
       birth_date: undefined,
       birth_year_estimate: birthYear,
       birth_place: birthPlace,
@@ -4331,775 +3817,746 @@ export async function recomputeUserKnowledgeGraphs(
   }
 }
 
-
-  // ============================================================================
-  // HTTP Handler
-  // ============================================================================
-  Deno.serve(async (req: Request) => {
-    try {
-      if (req.method !== "POST") {
-        return jsonResponse({ error: "Only POST allowed." }, 405);
-      }
-
-      let body: AiBrainPayload;
-      try {
-        const raw = await req.json();
-        console.log("🧠 ai-brain incoming:", raw);
-        body = raw as AiBrainPayload;
-      } catch (_err) {
-        return jsonResponse({ error: "Invalid JSON body." }, 400);
-      }
-
-      const { user_id, conversation_id } = body;
-
-      // Make message_text mutable (we may normalize it)
-      let message_text = (body as any).message_text as string | undefined;
-
-      // Treat the hidden token as an end-session trigger too.
-      const isEndSession =
-        (body as any).end_session === true ||
-        (body as any).action === "end_session" ||
-        (typeof message_text === "string" && message_text.trim() === "__END_SESSION__");
-
-      // Allow end_session calls to omit message_text (client may send empty).
-      if (isEndSession && (!message_text || !String(message_text).trim())) {
-        message_text = "__END_SESSION__";
+// ============================================================================
+// HTTP Handler
+// ============================================================================
+Deno.serve(async (req: Request) => {
+  try {
+    if (req.method !== "POST") {
+      return jsonResponse({ error: "Only POST allowed." }, 405);
     }
 
-      // -----------------------------------------------------------------------
-      // 1) Resolve mode, persona, locales, conversation id
-      // -----------------------------------------------------------------------
-      const requestedMode = (body.mode ?? "legacy") as ConversationMode;
-      const conversationMode: ConversationMode =
-        requestedMode === "language_learning" || requestedMode === "avatar"
-          ? requestedMode
-          : "legacy";
+    let body: AiBrainPayload;
+    try {
+      const raw = await req.json();
+      console.log("🧠 ai-brain incoming:", raw);
+      body = raw as AiBrainPayload;
+    } catch (_err) {
+      return jsonResponse({ error: "Invalid JSON body." }, 400);
+    }
 
-      const personaRaw =
-        (body.conversation_persona ?? (body as any).persona ?? null) as
-          | string
-          | null;
+    const { user_id, message_text, conversation_id } = body;
 
-      let conversationPersona: ConversationPersona = "adaptive";
-      if (typeof personaRaw === "string" && personaRaw.trim()) {
-        const lower = personaRaw.trim().toLowerCase();
-        if (lower === "playful") {
-          conversationPersona = "playful";
-        } else if (lower === "somber" || lower === "grounded") {
-          // allow older clients that still send "grounded"
-          conversationPersona = "somber";
-        } else {
-          conversationPersona = "adaptive";
+    const isEndSession =
+      (body as any).end_session === true ||
+      (body as any).action === "end_session";
+    
+    if (!user_id || !user_id.trim()) {
+      return jsonResponse({ error: "user_id is required." }, 400);
+    }
+    if (!message_text || !message_text.trim()) {
+      if (!isEndSession) {
+        return jsonResponse({ error: "message_text is required." }, 400);
         }
-      }
+    }
 
-      const preferredLocale = normalizeLocale(body.preferred_locale, "en-US");
+    // -----------------------------------------------------------------------
+    // 1) Resolve mode, persona, locales, conversation id
+    // -----------------------------------------------------------------------
+    const requestedMode = (body.mode ?? "legacy") as ConversationMode;
+    const conversationMode: ConversationMode =
+      requestedMode === "language_learning" || requestedMode === "avatar"
+        ? requestedMode
+        : "legacy";
 
-      const targetRaw =
-        body.target_locale === undefined || body.target_locale === null
-          ? null
-          : String(body.target_locale);
+    const personaRaw =
+      (body.conversation_persona ?? (body as any).persona ?? null) as
+        | string
+        | null;
 
-      const hasTarget = !!(targetRaw && targetRaw.trim());
-      const targetLocale = hasTarget ? normalizeLocale(targetRaw) : preferredLocale;
-
-      const learningLevel: LearningLevel =
-        body.learning_level &&
-        ["beginner", "intermediate", "advanced"].includes(body.learning_level)
-          ? body.learning_level
-          : "beginner";
-
-      // ✅ NEVER use "default" as a real session key.
-      // If the client didn't send a conversation_id, generate one.
-      const effectiveConversationId =
-        (conversation_id && conversation_id.trim() && conversation_id.trim() !== "default")
-          ? conversation_id.trim()
-          : crypto.randomUUID();
-
-      const incomingStateJson = body.state_json ?? null;
-
-      let legacyState: LegacyInterviewState | null = null;
-      let languageState: LanguageLessonState | null = null;
-
-      if (conversationMode === "language_learning") {
-        // Prefer canonical progress from Supabase if available.
-        const dbState = await loadLanguageProgress(user_id, targetLocale);
-        const incomingState = parseLanguageLessonState(incomingStateJson);
-
-        languageState =
-          dbState ??
-          incomingState ??
-          getDefaultLanguageLessonState();
+    let conversationPersona: ConversationPersona = "adaptive";
+    if (typeof personaRaw === "string" && personaRaw.trim()) {
+      const lower = personaRaw.trim().toLowerCase();
+      if (lower === "playful") {
+        conversationPersona = "playful";
+      } else if (lower === "somber" || lower === "grounded") {
+        // allow older clients that still send "grounded"
+        conversationPersona = "somber";
       } else {
-        // Legacy and avatar share the LegacyInterviewState shape.
-        legacyState =
-          parseLegacyState(incomingStateJson) ?? getDefaultLegacyState();
+        conversationPersona = "adaptive";
       }
+    }
 
-      // -----------------------------------------------------------------------
-      // 2) Handle language-learning meta-commands before calling Gemini
-      // -----------------------------------------------------------------------
-      if (conversationMode === "language_learning") {
-        const rawUserText =
-          (body.message_text ??
-            (body as any).message ??
-            (body as any).user_message ??
-            (body as any).input ??
-            "") as string;
+    const preferredLocale = normalizeLocale(body.preferred_locale, "en-US");
 
-        const currentState =
-          languageState ?? getDefaultLanguageLessonState();
+    const targetRaw =
+      body.target_locale === undefined || body.target_locale === null
+        ? null
+        : String(body.target_locale);
 
-        // 2a) Progress query – describe current position, do NOT advance.
-        if (isProgressQuery(rawUserText)) {
-          const summary = buildLanguageProgressSummary(
-            preferredLocale,
-            targetLocale,
-            learningLevel,
-            currentState,
-          );
+    const hasTarget = !!(targetRaw && targetRaw.trim());
+    const targetLocale = hasTarget
+      ? normalizeLocale(targetRaw)
+      : preferredLocale;
 
-          await saveLanguageProgress(
-            user_id,
-            targetLocale,
-            currentState,
-            learningLevel,
-          );
+    const learningLevel: LearningLevel =
+      body.learning_level &&
+      ["beginner", "intermediate", "advanced"].includes(body.learning_level)
+        ? body.learning_level
+        : "beginner";
 
-          return jsonResponse({
-            reply_text: summary,
-            mode: conversationMode,
-            preferred_locale: preferredLocale,
-            target_locale: hasTarget ? targetLocale : null,
-            learning_level: learningLevel,
-            conversation_id: effectiveConversationId,
-            state_json: JSON.stringify(currentState),
-          });
-        }
+    const effectiveConversationId =
+      conversation_id && conversation_id.trim()
+        ? conversation_id
+        : "default";
 
-        // 2b) Go-back query – regress and describe the new position.
-        if (isGoBackQuery(rawUserText)) {
-          const regressed = regressLanguageLessonState(currentState);
+    const incomingStateJson = body.state_json ?? null;
 
-          await saveLanguageProgress(
-            user_id,
-            targetLocale,
-            regressed,
-            learningLevel,
-          );
+    let legacyState: LegacyInterviewState | null = null;
+    let languageState: LanguageLessonState | null = null;
 
-          const replyText = buildGoBackReply(
-            preferredLocale,
-            targetLocale,
-            learningLevel,
-            regressed,
-          );
+    if (conversationMode === "language_learning") {
+      // Prefer canonical progress from Supabase if available.
+      const dbState = await loadLanguageProgress(user_id, targetLocale);
+      const incomingState = parseLanguageLessonState(incomingStateJson);
 
-          return jsonResponse({
-            reply_text: replyText,
-            mode: conversationMode,
-            preferred_locale: preferredLocale,
-            target_locale: hasTarget ? targetLocale : null,
-            learning_level: learningLevel,
-            conversation_id: effectiveConversationId,
-            state_json: JSON.stringify(regressed),
-          });
-        }
+      languageState =
+        dbState ??
+        incomingState ??
+        getDefaultLanguageLessonState();
+    } else {
+      // Legacy and avatar share the LegacyInterviewState shape.
+      legacyState =
+        parseLegacyState(incomingStateJson) ?? getDefaultLegacyState();
+    }
 
-        // 2c) Move-ahead query – fast-forward and describe the new position.
-        if (isMoveAheadQuery(rawUserText)) {
-          const advancedState = fastForwardLanguageState(currentState);
-
-          await saveLanguageProgress(
-            user_id,
-            targetLocale,
-            advancedState,
-            learningLevel,
-          );
-
-          const replyText = buildMoveAheadReply(
-            preferredLocale,
-            targetLocale,
-            learningLevel,
-            advancedState,
-          );
-
-          return jsonResponse({
-            reply_text: replyText,
-            mode: conversationMode,
-            preferred_locale: preferredLocale,
-            target_locale: hasTarget ? targetLocale : null,
-            learning_level: learningLevel,
-            conversation_id: effectiveConversationId,
-            state_json: JSON.stringify(advancedState),
-          });
-        }
-      }
-
-      // -----------------------------------------------------------------------
-      // 3) Build system prompt + context block
-      // -----------------------------------------------------------------------
-      let systemPrompt: string;
-      let contextBlock = "";
-
-      if (conversationMode === "language_learning") {
-        const ls = languageState ?? getDefaultLanguageLessonState();
-
-        // Safely pick a unit + lesson from the curriculum.
-        const fallbackUnit = LANGUAGE_UNITS["U1_GREETINGS"];
-        const unit =
-          LANGUAGE_UNITS[ls.unit_id] ?? fallbackUnit;
-
-        const fallbackLesson =
-          (Object.values(fallbackUnit.lessons)[0] as LanguageLessonConfig) ??
-          {
-            lesson_id: "L1_HELLO_BASICS",
-            lesson_name: "Basic greetings",
-            default_stage: "intro",
-            default_target_phrases: [],
-          };
-
-        const lesson =
-          (unit.lessons[ls.lesson_id] as LanguageLessonConfig) ?? fallbackLesson;
-
-        systemPrompt = buildLanguageLearningSystemPrompt(
-          preferredLocale, // L1
-          targetLocale,    // L2
-          learningLevel,
-          ls,
-          unit,
-          lesson,
-        );
-
-        if (supabase) {
-          contextBlock = await buildLanguageLearningContextBlock(
-            supabase as SupabaseClient,
-            user_id,
-            effectiveConversationId,
-          );
-        }
-      } else if (conversationMode === "avatar") {
-        systemPrompt = buildAvatarSystemPrompt(preferredLocale);
-
-        if (supabase) {
-          contextBlock = await buildLegacyContextBlock(user_id);
-        }
-      } else {
-        // Legacy storytelling mode.
-        const ls = legacyState ?? getDefaultLegacyState();
-        const chapter =
-          LEGACY_CHAPTERS[ls.chapter_id] ?? LEGACY_CHAPTERS["childhood"];
-
-        const legacyCtx: LegacyPromptContext = {
-          persona: conversationPersona,
-          preferredLocale,
-          targetLocale: hasTarget ? targetLocale : null,
-          legacyState: ls,
-          currentChapter: chapter,
-          userDisplayName: undefined,
-          coverageSummary: undefined,
-        };
-
-        systemPrompt = buildLegacySystemPrompt(legacyCtx);
-
-        if (supabase) {
-          contextBlock = await buildLegacyContextBlock(user_id);
-        }
-      }
-
-      // -----------------------------------------------------------------------
-      // 4) Call Gemini
-      // -----------------------------------------------------------------------
-      const rawUserMessageForPrompt =
+    // -----------------------------------------------------------------------
+    // 2) Handle language-learning meta-commands before calling Gemini
+    // -----------------------------------------------------------------------
+    if (conversationMode === "language_learning") {
+      const rawUserText =
         (body.message_text ??
           (body as any).message ??
           (body as any).user_message ??
           (body as any).input ??
           "") as string;
 
-      const userMessageForPrompt =
-        conversationMode === "avatar"
-          ? rawUserMessageForPrompt
-          : (message_text ?? rawUserMessageForPrompt);
+      const currentState =
+        languageState ?? getDefaultLanguageLessonState();
 
-      const finalPrompt = `${systemPrompt}
+      // 2a) Progress query – describe current position, do NOT advance.
+      if (isProgressQuery(rawUserText)) {
+        const summary = buildLanguageProgressSummary(
+          preferredLocale,
+          targetLocale,
+          learningLevel,
+          currentState,
+        );
+
+        await saveLanguageProgress(
+          user_id,
+          targetLocale,
+          currentState,
+          learningLevel,
+        );
+
+        return jsonResponse({
+          reply_text: summary,
+          mode: conversationMode,
+          preferred_locale: preferredLocale,
+          target_locale: hasTarget ? targetLocale : null,
+          learning_level: learningLevel,
+          conversation_id: effectiveConversationId,
+          state_json: JSON.stringify(currentState),
+        });
+      }
+
+      // 2b) Go-back query – regress and describe the new position.
+      if (isGoBackQuery(rawUserText)) {
+        const regressed = regressLanguageLessonState(currentState);
+
+        await saveLanguageProgress(
+          user_id,
+          targetLocale,
+          regressed,
+          learningLevel,
+        );
+
+        const replyText = buildGoBackReply(
+          preferredLocale,
+          targetLocale,
+          learningLevel,
+          regressed,
+        );
+
+        return jsonResponse({
+          reply_text: replyText,
+          mode: conversationMode,
+          preferred_locale: preferredLocale,
+          target_locale: hasTarget ? targetLocale : null,
+          learning_level: learningLevel,
+          conversation_id: effectiveConversationId,
+          state_json: JSON.stringify(regressed),
+        });
+      }
+
+      // 2c) Move-ahead query – fast-forward and describe the new position.
+      if (isMoveAheadQuery(rawUserText)) {
+        const advancedState = fastForwardLanguageState(currentState);
+
+        await saveLanguageProgress(
+          user_id,
+          targetLocale,
+          advancedState,
+          learningLevel,
+        );
+
+        const replyText = buildMoveAheadReply(
+          preferredLocale,
+          targetLocale,
+          learningLevel,
+          advancedState,
+        );
+
+        return jsonResponse({
+          reply_text: replyText,
+          mode: conversationMode,
+          preferred_locale: preferredLocale,
+          target_locale: hasTarget ? targetLocale : null,
+          learning_level: learningLevel,
+          conversation_id: effectiveConversationId,
+          state_json: JSON.stringify(advancedState),
+        });
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // 3) Build system prompt + context block
+    // -----------------------------------------------------------------------
+    let systemPrompt: string;
+    let contextBlock = "";
+
+    if (conversationMode === "language_learning") {
+      const ls = languageState ?? getDefaultLanguageLessonState();
+
+      // Safely pick a unit + lesson from the curriculum.
+      const fallbackUnit = LANGUAGE_UNITS["U1_GREETINGS"];
+      const unit =
+        LANGUAGE_UNITS[ls.unit_id] ?? fallbackUnit;
+
+      const fallbackLesson =
+        (Object.values(fallbackUnit.lessons)[0] as LanguageLessonConfig) ??
+        {
+          lesson_id: "L1_HELLO_BASICS",
+          lesson_name: "Basic greetings",
+          default_stage: "intro",
+          default_target_phrases: [],
+        };
+
+      const lesson =
+        (unit.lessons[ls.lesson_id] as LanguageLessonConfig) ?? fallbackLesson;
+
+      systemPrompt = buildLanguageLearningSystemPrompt(
+        preferredLocale, // L1
+        targetLocale,    // L2
+        learningLevel,
+        ls,
+        unit,
+        lesson,
+      );
+
+      if (supabase) {
+        contextBlock = await buildLanguageLearningContextBlock(
+          supabase as SupabaseClient,
+          user_id,
+          effectiveConversationId,
+        );
+      }
+    } else if (conversationMode === "avatar") {
+      systemPrompt = buildAvatarSystemPrompt(preferredLocale);
+
+      if (supabase) {
+        contextBlock = await buildLegacyContextBlock(user_id);
+      }
+    } else {
+      // Legacy storytelling mode.
+      const ls = legacyState ?? getDefaultLegacyState();
+      const chapter =
+        LEGACY_CHAPTERS[ls.chapter_id] ?? LEGACY_CHAPTERS["childhood"];
+
+      const legacyCtx: LegacyPromptContext = {
+        persona: conversationPersona,
+        preferredLocale,
+        targetLocale: hasTarget ? targetLocale : null,
+        legacyState: ls,
+        currentChapter: chapter,
+        userDisplayName: undefined,
+        coverageSummary: undefined,
+      };
+
+      systemPrompt = buildLegacySystemPrompt(legacyCtx);
+
+      if (supabase) {
+        contextBlock = await buildLegacyContextBlock(user_id);
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // 4) Call Gemini
+    // -----------------------------------------------------------------------
+    const rawUserMessageForPrompt =
+      (body.message_text ??
+        (body as any).message ??
+        (body as any).user_message ??
+        (body as any).input ??
+        "") as string;
+
+    const userMessageForPrompt =
+      conversationMode === "avatar"
+        ? rawUserMessageForPrompt
+        : (message_text ?? rawUserMessageForPrompt);
+
+    const finalPrompt = `${systemPrompt}
 
 ${contextBlock}
 
 User message:
 "${userMessageForPrompt.trim()}"`.trim();
 
-      const rawReply = await callGemini(finalPrompt);
+    const rawReply = await callGemini(finalPrompt);
 
-      // Clean Gemini output.
-      const sanitized = sanitizeGeminiOutput(rawReply);
+    // Clean Gemini output.
+    const sanitized = sanitizeGeminiOutput(rawReply);
 
-      // Enforce language tags.
-      let replyText = enforceLanguageOnTaggedLines(
-        sanitized,
-        preferredLocale,
-        hasTarget ? targetLocale : null,
-      );
+    // Enforce language tags.
+    let replyText = enforceLanguageOnTaggedLines(
+      sanitized,
+      preferredLocale,
+      hasTarget ? targetLocale : null,
+    );
 
-      // -----------------------------------------------------------------------
-      // 5) Optional pronunciation scoring (language-learning only)
-      // -----------------------------------------------------------------------
-      let pronunciationScore: number | null = null;
-      let pronunciationScoreLine: string | null = null;
+    // -----------------------------------------------------------------------
+    // 5) Optional pronunciation scoring (language-learning only)
+    // -----------------------------------------------------------------------
+    let pronunciationScore: number | null = null;
+    let pronunciationScoreLine: string | null = null;
 
-      if (
-        conversationMode === "language_learning" &&
-        hasTarget &&
-        languageState &&
-        languageState.target_phrases &&
-        languageState.target_phrases.length > 0
-      ) {
-        const main = languageState.target_phrases[0];
-        const targetScript = main.l2_script;
-        const targetIpa = main.ipa ?? null;
+    if (
+      conversationMode === "language_learning" &&
+      hasTarget &&
+      languageState &&
+      languageState.target_phrases &&
+      languageState.target_phrases.length > 0
+    ) {
+      const main = languageState.target_phrases[0];
+      const targetScript = main.l2_script;
+      const targetIpa = main.ipa ?? null;
 
-        const learnerTranscript =
-          (body as any).learner_transcript as string | undefined;
+      const learnerTranscript =
+        (body as any).learner_transcript as string | undefined;
 
-        if (learnerTranscript && learnerTranscript.trim().length > 0) {
-          try {
-            const scoring = await scorePronunciationWithGemini(
-              targetScript,
-              targetIpa,
-              learnerTranscript,
-              preferredLocale,
+      if (learnerTranscript && learnerTranscript.trim().length > 0) {
+        try {
+          const scoring = await scorePronunciationWithGemini(
+            targetScript,
+            targetIpa,
+            learnerTranscript,
+            preferredLocale,
+            targetLocale,
+          );
+
+          if (scoring) {
+            pronunciationScore = scoring.overallScore;
+            pronunciationScoreLine = scoring.scoreLine;
+
+            await logPronunciationAttempt(
+              user_id,
               targetLocale,
+              languageState,
+              learnerTranscript,
+              pronunciationScore,
+              pronunciationScoreLine,
             );
+          }
+        } catch (err) {
+          console.error("Pronunciation scoring error:", err);
+        }
+      }
+    }
 
-            if (scoring) {
-              pronunciationScore = scoring.overallScore;
-              pronunciationScoreLine = scoring.scoreLine;
+    // -----------------------------------------------------------------------
+    // 6) Prepare next state for the client
+    // -----------------------------------------------------------------------
+    let outgoingStateJson: string | null = null;
 
-              await logPronunciationAttempt(
+    if (conversationMode === "language_learning") {
+      const current = languageState ?? getDefaultLanguageLessonState();
+      const advanced = advanceLanguageLessonState(current);
+      outgoingStateJson = JSON.stringify(advanced);
+
+      await saveLanguageProgress(
+        user_id,
+        targetLocale,
+        advanced,
+        learningLevel,
+      );
+    } else {
+      const ls = legacyState ?? getDefaultLegacyState();
+      outgoingStateJson = JSON.stringify(ls);
+    }
+
+    // -----------------------------------------------------------------------
+    // 7) Persistence: legacy + language-learning logging
+    // -----------------------------------------------------------------------
+    if (conversationMode === "legacy" && supabase) {
+      try {
+        const client = supabase as SupabaseClient;
+        const ls = legacyState ?? getDefaultLegacyState();
+
+        const userText = (message_text ?? "").trim();
+        const aiText = replyText.trim();
+        const combined = `${userText}\n\n[AI reply]\n${aiText}`.trim();
+
+        // 7a) Derive coverage chapters (classifier may override fallback).
+        const fallbackCoverageChapters: CoverageChapterKey[] = (() => {
+          switch (ls.chapter_id) {
+            case "childhood":
+              return ["early_childhood", "family_relationships", "education"];
+            case "early_career":
+              return ["early_adulthood", "work_career", "major_events"];
+            case "midlife":
+              return ["midlife", "family_relationships", "health_wellbeing"];
+            case "later_life":
+              return ["later_life", "health_wellbeing", "major_events"];
+            default:
+              return ["major_events"];
+          }
+        })();
+
+        let coverageChapters: CoverageChapterKey[] =
+          fallbackCoverageChapters;
+        let classifierThemes: string[] = [];
+
+        try {
+          const inferred = inferChapterKeysForLegacySummary(combined, []);
+          if (inferred && inferred.length > 0) {
+            const merged = new Set<CoverageChapterKey>([
+              ...coverageChapters,
+              ...(inferred as CoverageChapterKey[]),
+            ]);
+            coverageChapters = Array.from(merged);
+          }
+        } catch (err) {
+          console.error("Heuristic coverage inference error:", err);
+        }
+
+        // Build a one-line session label.
+        // Prefer the first sentence of the AI reply (which usually summarizes
+        // the session), then fall back to the user's text, then a generic label.
+        let shortSummaryBase = "Untitled memory";
+
+        if (aiText && aiText.trim().length > 0) {
+          const aiTrimmed = aiText.replace(/\s+/g, " ").trim();
+
+          // Roughly take the first sentence.
+          const firstSentence =
+            aiTrimmed.split(/(?<=[\.!?])\s+/)[0] ?? aiTrimmed;
+
+          shortSummaryBase =
+            firstSentence.length > 180
+              ? `${firstSentence.slice(0, 177)}...`
+              : firstSentence;
+        } else if (userText && userText.trim().length > 0) {
+          const userTrimmed = userText.replace(/\s+/g, " ").trim();
+          shortSummaryBase =
+            userTrimmed.length > 240
+              ? `${userTrimmed.slice(0, 237)}...`
+              : userTrimmed;
+        }
+
+        const userWordCount = userText ? userText.split(/\s+/).length : 0;
+        const aiWordCount = aiText ? aiText.split(/\s+/).length : 0;
+        const wordCountThisTurn = userWordCount + aiWordCount;
+
+        const nowIso = new Date().toISOString();
+
+        // 7b) Write raw user + AI messages into memory_raw and capture raw_id.
+        let rawIdThisTurn: string | null = null;
+
+        try {
+          const rawRows: any[] = [];
+
+          if (userText) {
+            rawRows.push({
+              user_id,
+              content: userText,
+              source: "legacy_user",
+              conversation_id: effectiveConversationId,
+              role: "user",
+              context: {
+                mode: "legacy",
+                chapter_id: ls.chapter_id,
+                chapter_title: ls.chapter_title,
+              },
+              tags: ["legacy"],
+              created_at: nowIso,
+              chapter_key:
+                (coverageChapters && coverageChapters[0]) || "major_events",
+              word_count_estimate: userWordCount,
+              is_legacy_story: true,
+              user_edited: false,
+            });
+          }
+
+          if (aiText) {
+            rawRows.push({
+              user_id,
+              content: aiText,
+              source: "legacy_ai",
+              conversation_id: effectiveConversationId,
+              role: "assistant",
+              context: {
+                mode: "legacy",
+                chapter_id: ls.chapter_id,
+                chapter_title: ls.chapter_title,
+              },
+              tags: ["legacy", "ai_reply"],
+              created_at: nowIso,
+              chapter_key:
+                (coverageChapters && coverageChapters[0]) || "major_events",
+              word_count_estimate: aiWordCount,
+              is_legacy_story: true,
+              user_edited: false,
+            });
+          }
+
+          if (rawRows.length > 0) {
+            const { data: insertedRaw, error: mrError } = await client
+              .from("memory_raw")
+              .insert(rawRows)
+              .select("id, role");
+
+            if (mrError) {
+              console.error("Error inserting into memory_raw:", mrError);
+            } else if (insertedRaw && insertedRaw.length > 0) {
+              const userRow =
+                insertedRaw.find((r: any) => r.role === "user") ??
+                insertedRaw[0];
+              rawIdThisTurn = userRow?.id ?? null;
+            }
+          }
+        } catch (mrErr) {
+          console.error("Exception inserting into memory_raw:", mrErr);
+        }
+
+        // 7c) Upsert session-level summary in memory_summary.
+        if (!rawIdThisTurn) {
+          console.warn(
+            "memory_summary: rawIdThisTurn could not be determined; skipping session summary.",
+          );
+        } else {
+          const legacyThemes: string[] = [];
+          if (ls.chapter_id) {
+            legacyThemes.push(ls.chapter_id);
+          }
+          legacyThemes.push("legacy_interview");
+          for (const key of coverageChapters) {
+            legacyThemes.push(`chapter:${key}`);
+          }
+
+          const baseObs: MemorySummaryObservations = {
+            chapter_keys: coverageChapters,
+            coverage_chapters: coverageChapters.map((key) => ({
+              key,
+              weight: 1,
+              confidence: 0.7,
+            })),
+            word_count_estimate: wordCountThisTurn,
+            themes: [...legacyThemes, ...classifierThemes],
+            // Extra session metadata stored as loose fields.
+            // Cast to any so we can store richer data than the TS interface.
+            ...( {
+              session_key: effectiveConversationId,
+              mode: "legacy",
+              chapter_id: ls.chapter_id,
+              chapter_title: ls.chapter_title,
+              progress_percent: ls.progress_percent ?? 0,
+              focus_topic: ls.focus_topic ?? null,
+              ai_model: GEMINI_MODEL,
+              preferred_locale: preferredLocale,
+              target_locale: hasTarget ? targetLocale : null,
+              learning_level: learningLevel,
+              turn_count: 1,
+            } as any ),
+          } as any;
+
+          const { data: existingSummary, error: existingSummaryError } =
+            await client
+              .from("memory_summary")
+              .select(
+                "id, raw_id, short_summary, full_summary, observations, created_at",
+              )
+              .eq("user_id", user_id)
+              .contains("observations", {
+                session_key: effectiveConversationId,
+              } as any)
+              .order("created_at", { ascending: false })
+              .limit(1)
+              .maybeSingle();
+
+          if (existingSummaryError) {
+            console.error(
+              "Error looking up existing memory_summary:",
+              existingSummaryError,
+            );
+          }
+
+          const existingObs =
+            (existingSummary?.observations as any) ?? {};
+
+          const mergedObs: MemorySummaryObservations = {
+            ...existingObs,
+            ...baseObs,
+            chapter_keys: coverageChapters,
+            word_count_estimate:
+              (existingObs.word_count_estimate ?? 0) + wordCountThisTurn,
+            turn_count: (existingObs.turn_count ?? 0) + 1,
+          } as any;
+
+          const fullSummary =
+            sessionFullSummary && sessionFullSummary.trim().length > 0
+              ? sessionFullSummary
+              : (combined.length > 0 ? combined.slice(0, 4000) : null);
+
+          const shortSummary =
+            sessionShortSummary && sessionShortSummary.trim().length > 0
+              ? sessionShortSummary
+              : shortSummaryBase;
+
+          if (existingSummary && existingSummary.id) {
+            const { error: updateError } = await client
+              .from("memory_summary")
+              .update({
+                short_summary: shortSummary,
+                full_summary: fullSummary,
+                observations: mergedObs,
+              })
+              .eq("id", existingSummary.id);
+
+            if (updateError) {
+              console.error("Error updating memory_summary:", updateError);
+            }
+          } else {
+            const { error: insertSummaryError } = await client
+              .from("memory_summary")
+              .insert({
                 user_id,
-                targetLocale,
-                languageState,
-                learnerTranscript,
-                pronunciationScore,
-                pronunciationScoreLine,
+                raw_id: rawIdThisTurn,
+                short_summary: shortSummary,
+                full_summary: fullSummary,
+                observations: mergedObs,
+              });
+
+            if (insertSummaryError) {
+              console.error(
+                "Error inserting into memory_summary:",
+                insertSummaryError,
               );
             }
-          } catch (err) {
-            console.error("Pronunciation scoring error:", err);
           }
         }
+
+        // 7d) Recompute coverage map + lifetime profile + insights.
+        try {
+          await recomputeUserKnowledgeGraphs(client, user_id);
+
+          await client.functions.invoke("rebuild-insights", {
+            body: { user_id },
+          });
+        } catch (err) {
+          console.error(
+            "Error recomputing coverage / lifetime_profile or rebuild-insights:",
+            err,
+          );
+        }
+      } catch (err) {
+        console.error("Unexpected legacy logging error:", err);
       }
+    }
 
-      // -----------------------------------------------------------------------
-      // 6) Prepare next state for the client
-      // -----------------------------------------------------------------------
-      let outgoingStateJson: string | null = null;
-
-      if (conversationMode === "language_learning") {
-        const current = languageState ?? getDefaultLanguageLessonState();
-        const advanced = advanceLanguageLessonState(current);
-        outgoingStateJson = JSON.stringify(advanced);
-
-        await saveLanguageProgress(
-          user_id,
-          targetLocale,
-          advanced,
-          learningLevel,
-        );
-      } else {
-        const ls = legacyState ?? getDefaultLegacyState();
-        outgoingStateJson = JSON.stringify(ls);
-      }
-
-      // -----------------------------------------------------------------------
-      // 7) Persistence: legacy + language-learning logging
-      // -----------------------------------------------------------------------
-      if (supabase) {
+    // Log language-learning turns into memory_raw (no summaries yet).
+    if (conversationMode === "language_learning" && supabase) {
+      try {
         const client = supabase as SupabaseClient;
+        const userText = (message_text ?? "").trim();
+        const aiText = replyText.trim();
+        const nowIso = new Date().toISOString();
 
-        // 7a) Legacy interview persistence (memory_raw + optional summary)
-        if (conversationMode === "legacy") {
-          try {
-            const ls = legacyState ?? getDefaultLegacyState();
-            let userText = (message_text ?? "").trim();
-            if (userText === "__END_SESSION__") userText = "";
+        const rows: any[] = [];
 
-            const aiText = replyText.trim();
-            const nowIso = new Date().toISOString();
-
-            // Write user + AI turns into memory_raw
-            const legacyRows: any[] = [];
-
-            const coverageChapters: CoverageChapterKey[] = (() => {
-              switch (ls.chapter_id) {
-                case "childhood":
-                  return ["early_childhood", "family_relationships", "education"];
-                case "early_career":
-                  return ["early_adulthood", "work_career", "major_events"];
-                case "midlife":
-                  return ["midlife", "family_relationships", "health_wellbeing"];
-                case "later_life":
-                  return ["later_life", "health_wellbeing", "major_events"];
-                default:
-                  return ["major_events"];
-              }
-            })();
-
-            const userWordCount = userText.length > 0
-              ? Math.max(1, Math.round(userText.split(/\s+/).length))
-              : 0;
-            const aiWordCount = aiText.length > 0
-              ? Math.max(1, Math.round(aiText.split(/\s+/).length))
-              : 0;
-            const wordCountThisTurn = userWordCount + aiWordCount;
-
-            if (userText) {
-              legacyRows.push({
-                user_id,
-                content: userText,
-                source: "legacy_user",
-                conversation_id: effectiveConversationId,
-                role: "user",
-                context: {
-                  mode: "legacy",
-                  chapter_id: ls.chapter_id,
-                  chapter_title: ls.chapter_title,
-                },
-                tags: ["legacy"],
-                created_at: nowIso,
-                chapter_key:
-                  (coverageChapters && coverageChapters[0]) || "major_events",
-                word_count_estimate: userWordCount,
-                is_legacy_story: true,
-                user_edited: false,
-              });
-            }
-
-            if (aiText) {
-              legacyRows.push({
-                user_id,
-                content: aiText,
-                source: "legacy_ai",
-                conversation_id: effectiveConversationId,
-                role: "assistant",
-                context: {
-                  mode: "legacy",
-                  chapter_id: ls.chapter_id,
-                  chapter_title: ls.chapter_title,
-                },
-                tags: ["legacy"],
-                created_at: nowIso,
-                chapter_key:
-                  (coverageChapters && coverageChapters[0]) || "major_events",
-                word_count_estimate: aiWordCount,
-                is_legacy_story: true,
-                user_edited: false,
-              });
-            }
-
-            let rawIdThisTurn: string | null = null;
-            if (legacyRows.length > 0) {
-              const { data: inserted, error: insertError } = await client
-                .from("memory_raw")
-                .insert(legacyRows)
-                .select("id")
-                .limit(1);
-
-              if (insertError) {
-                console.error(
-                  "Error inserting legacy rows into memory_raw:",
-                  insertError,
-                );
-              } else if (inserted && inserted.length > 0) {
-                rawIdThisTurn = (inserted[0] as any).id as string;
-              }
-            }
-
-            // Only do the expensive summarisation when this is an explicit end-session.
-            if (isEndSession) {
-              console.log("END_SESSION SUMMARY ATTEMPT", {
-                user_id,
-                conversation_id: effectiveConversationId,
-                rawIdThisTurn,
-              });
-
-              // 1) Find an anchor raw_id for this session (required: memory_summary.raw_id is NOT NULL)
-              const { data: anchorRow, error: anchorErr } = await client
-                .from("memory_raw")
-                .select("id, created_at")
-                .eq("user_id", user_id)
-                .eq("conversation_id", effectiveConversationId)
-                .order("created_at", { ascending: false })
-                .limit(1)
-                .maybeSingle();
-
-              if (anchorErr) {
-                console.error("Error finding session anchor raw_id:", anchorErr);
-              }
-
-              const anchorRawId = (anchorRow as any)?.id as string | undefined;
-
-              console.log("END_SESSION ANCHOR RESULT", {
-                user_id,
-                conversation_id: effectiveConversationId,
-                anchorRawId,
-              });
-
-              if (!anchorRawId) {
-                console.warn(
-                  "No anchorRawId found for end_session; cannot write memory_summary.",
-                );
-              } else {
-                // 2) Build transcript
-                const transcript = await fetchLegacySessionTranscript(
-                  client,
-                  user_id,
-                  effectiveConversationId,
-                );
-
-                console.log("END_SESSION: transcript fetched", {
-                  conversation_id: effectiveConversationId,
-                  transcript_length: transcript?.length ?? 0,
-                });
-
-                // 3) Summarize with Gemini
-                const summary = await summarizeLegacySessionWithGemini(
-                  transcript,
-                  {
-                    session_key: effectiveConversationId,
-                    chapter_id: ls.chapter_id,
-                    chapter_title: ls.chapter_title,
-                    preferred_locale: preferredLocale,
-                    target_locale: hasTarget ? targetLocale : null,
-                    learning_level: learningLevel,
-                  },
-                );
-
-                if (!summary) {
-                  console.warn(
-                    "END_SESSION: summarizeLegacySessionWithGemini returned null",
-                    { conversation_id: effectiveConversationId },
-                  );
-                } else {
-                  // ✅ include session_insights from the summarizer output
-                  const { short_summary, full_summary, observations, session_insights } = summary;
-
-                  // ------------------------------------------------------------------
-                  // Quiet chapter classification (only if Gemini didn't return any)
-                  // ------------------------------------------------------------------
-                  let obsOut: any = observations ?? {};
-                  const existingKeys = Array.isArray(obsOut?.chapter_keys) ? obsOut.chapter_keys : [];
-
-                  if (existingKeys.length === 0) {
-                    try {
-                      // Uses your existing helper that classifies from text
-                      const classified = await classifyCoverageFromStoryText(full_summary);
-
-                      const keys = Array.isArray(classified?.chapter_keys) ? classified.chapter_keys : [];
-                      const themes = Array.isArray(classified?.themes) ? classified.themes : [];
-
-                      if (keys.length > 0) {
-                        obsOut = {
-                          ...obsOut,
-                          chapter_keys: keys,
-                          themes: themes.length ? themes : obsOut.themes,
-                          coverage_classified_at: new Date().toISOString(),
-                          coverage_classified_from: "full_summary",
-                        };
-
-                        // Primary chapter_key = first key
-                        const primaryChapterKey = keys[0];
-
-                        // Update all memory_raw rows for this session so Coverage Map reflects reality.
-                        // Best-effort only.
-                        const { error: mrUpdErr } = await client
-                          .from("memory_raw")
-                          .update({
-                            chapter_key: primaryChapterKey,
-                          })
-                          .eq("user_id", user_id)
-                          .eq("conversation_id", effectiveConversationId);
-
-                        if (mrUpdErr) {
-                          console.error("END_SESSION: memory_raw chapter_key update failed:", mrUpdErr);
-                        } else {
-                          console.log("END_SESSION: memory_raw chapter_key updated", {
-                            conversation_id: effectiveConversationId,
-                            chapter_key: primaryChapterKey,
-                          });
-                        }
-                      }
-                    } catch (e) {
-                      console.error("END_SESSION: classifyCoverageFromStoryText failed:", e);
-                    }
-                  }
-                  console.log("END_SESSION: writing memory_summary", {
-                    conversation_id: effectiveConversationId,
-                    raw_id: anchorRawId,
-                  });
-
-                  // 4) Upsert by raw_id (since raw_id is NOT NULL and is the real anchor)
-                  const { data: existingSummary, error: summaryFetchError } =
-                    await client
-                      .from("memory_summary")
-                      .select("id")
-                      .eq("raw_id", anchorRawId)
-                      .limit(1)
-                      .maybeSingle();
-
-                  if (summaryFetchError) {
-                    console.error(
-                      "Error reading existing memory_summary row:",
-                      summaryFetchError,
-                    );
-                  } else if (existingSummary?.id) {
-                    const { error: updateError } = await client
-                      .from("memory_summary")
-                      .update({
-                        short_summary,
-                        full_summary,
-                        observations: obsOut,
-                        session_insights,
-                        updated_at: new Date().toISOString(),
-                      })
-                      .eq("id", existingSummary.id);
-
-                    if (updateError) {
-                      console.error("Error updating memory_summary:", updateError);
-                    }
-                  } else {
-                    const { error: insertSummaryError } = await client
-                      .from("memory_summary")
-                      .insert({
-                        user_id,
-                        raw_id: anchorRawId,
-                        short_summary,
-                        full_summary,
-                        observations: obsOut,
-                        session_insights,
-                     });
-
-                    if (insertSummaryError) {
-                      console.error(
-                        "Error inserting into memory_summary:",
-                        insertSummaryError,
-                      );
-                    }
-                  }
-
-                  // 5) Heavy stuff only on end_session
-                  try {
-                    await recomputeUserKnowledgeGraphs(client, user_id);
-
-                    const { error: rebuildErr } = await client.functions.invoke(
-                      "rebuild-insights",
-                      { body: { user_id } },
-                    );
-                    if (rebuildErr) {
-                      console.error("rebuild-insights invoke FAILED:", rebuildErr);
-                    } else {
-                      console.log("rebuild-insights invoke OK");
-                    }
-                  } catch (err) {
-                    console.error("Error recomputing coverage / insights:", err);
-                  }
-                }
-              }
-            }
-          } catch (err) {
-            console.error("Legacy persistence error:", err);
-          }
+        if (userText) {
+          rows.push({
+            user_id,
+            content: userText,
+            source: "language_learning_user",
+            conversation_id: effectiveConversationId,
+            role: "user",
+            context: {
+              mode: "language_learning",
+              target_locale: targetLocale,
+              learning_level: learningLevel,
+            },
+            tags: ["language_learning"],
+            created_at: nowIso,
+          });
         }
 
-        // 7b) Language-learning logging into memory_raw (no summaries yet).
-        if (conversationMode === "language_learning") {
-          try {
-            let userText = (message_text ?? "").trim();
+        if (aiText) {
+          rows.push({
+            user_id,
+            content: aiText,
+            source: "language_learning_ai",
+            conversation_id: effectiveConversationId,
+            role: "assistant",
+            context: {
+              mode: "language_learning",
+              target_locale: targetLocale,
+              learning_level: learningLevel,
+            },
+            tags: ["language_learning", "ai_reply"],
+            created_at: nowIso,
+          });
+        }
 
-            // If the client sent the hidden end-session token, treat it as no user text.
-            if (userText === "__END_SESSION__") {
-              userText = "";
-            }
-
-            const aiText = replyText.trim();
-            const nowIso = new Date().toISOString();
-
-            const rows: any[] = [];
-
-            if (userText) {
-              rows.push({
-                user_id,
-                content: userText,
-                source: "language_learning_user",
-                conversation_id: effectiveConversationId,
-                role: "user",
-                context: {
-                  mode: "language_learning",
-                  target_locale: targetLocale,
-                  learning_level: learningLevel,
-                },
-                tags: ["language_learning"],
-                created_at: nowIso,
-              });
-            }
-
-            if (aiText) {
-              rows.push({
-                user_id,
-                content: aiText,
-                source: "language_learning_ai",
-                conversation_id: effectiveConversationId,
-                role: "assistant",
-                context: {
-                  mode: "language_learning",
-                  target_locale: targetLocale,
-                  learning_level: learningLevel,
-                },
-                tags: ["language_learning"],
-                created_at: nowIso,
-              });
-            }
-
-            if (rows.length > 0) {
-              const { error } = await client.from("memory_raw").insert(rows);
-              if (error) {
-                console.error(
-                  "Error inserting language-learning rows into memory_raw:",
-                  error,
-                );
-              }
-            }
-          } catch (err) {
+        if (rows.length > 0) {
+          const { error } = await client.from("memory_raw").insert(rows);
+          if (error) {
             console.error(
-              "Exception inserting language-learning rows into memory_raw:",
-              err,
+              "Error inserting language-learning rows into memory_raw:",
+              error,
             );
           }
         }
+      } catch (err) {
+        console.error(
+          "Exception inserting language-learning rows into memory_raw:",
+          err,
+        );
       }
-
-      // -----------------------------------------------------------------------
-      // 8) Final response to the client
-      // -----------------------------------------------------------------------
-      return jsonResponse({
-        reply_text: replyText,
-        mode: conversationMode,
-        preferred_locale: preferredLocale,
-        target_locale: hasTarget ? targetLocale : null,
-        learning_level: learningLevel,
-        conversation_id: effectiveConversationId,
-        state_json: outgoingStateJson,
-        pronunciation_score: pronunciationScore,
-        pronunciation_score_line: pronunciationScoreLine,
-      });
-    } catch (e) {
-      console.error("❌ ai-brain handler error:", e);
-      return jsonResponse(
-        {
-          error: "Failed to generate reply from Gemini.",
-          details: String(e),
-        },
-        500,
-      );
     }
-  });
+
+    // -----------------------------------------------------------------------
+    // 8) Final response to the client
+    // -----------------------------------------------------------------------
+    return jsonResponse({
+      reply_text: replyText,
+      mode: conversationMode,
+      preferred_locale: preferredLocale,
+      target_locale: hasTarget ? targetLocale : null,
+      learning_level: learningLevel,
+      conversation_id: effectiveConversationId,
+      state_json: outgoingStateJson,
+      pronunciation_score: pronunciationScore,
+      pronunciation_score_line: pronunciationScoreLine,
+    });
+  } catch (e) {
+    console.error("❌ ai-brain handler error:", e);
+    return jsonResponse(
+      {
+        error: "Failed to generate reply from Gemini.",
+        details: String(e),
+      },
+      500,
+    );
+  }
+});

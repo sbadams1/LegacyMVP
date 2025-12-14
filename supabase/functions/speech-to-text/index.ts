@@ -12,6 +12,13 @@
 //       - We build a GCS URI:  gs://<bucket>/<gcs_object_name>
 //       - We DO NOT set encoding; Google infers it from the file.
 //
+// NEW IN THIS VERSION:
+//   - Supports multi-language auto-detection for L1/L2:
+//       • Client can send:
+//           language_code: primary language bias (e.g. L1 or L2)
+//           alt_language_codes: string[] of additional languages (e.g. [L2, L1])
+//       • We pass these as languageCode + alternativeLanguageCodes to STT v1.
+//
 // REQUIREMENTS:
 //   - Set GOOGLE_SPEECH_API_KEY in your Supabase project env vars.
 //   - Turn verify_jwt OFF for this function if you don't need auth checking.
@@ -48,7 +55,18 @@ serve(async (req: Request): Promise<Response> => {
   const mime_type = payload.mime_type as string | undefined;
   const gcs_object_name = payload.gcs_object_name as string | undefined;
   const bucket = payload.bucket as string | undefined;
+
+  // Primary language bias (L1 or L2) – should be sent by the client.
   const language_code = payload.language_code as string | undefined;
+
+  // NEW: additional languages (e.g., the "other side" of L1/L2) for auto-detection.
+  const alt_language_codes_raw = payload.alt_language_codes;
+
+  const altLanguageCodes: string[] = Array.isArray(alt_language_codes_raw)
+    ? alt_language_codes_raw
+        .map((x) => (typeof x === "string" ? x.trim() : ""))
+        .filter((x) => x.length > 0)
+    : [];
 
   if (!user_id) {
     return jsonResponse({ error: "user_id is required" }, 400);
@@ -61,7 +79,13 @@ serve(async (req: Request): Promise<Response> => {
     );
   }
 
-  const languageCode = language_code || "en-US";
+  // We stay language-agnostic: use whatever the client sends.
+  // If nothing is provided, fall back to "en-US" as a safe default
+  // (Google requires a primary languageCode).
+  const languageCode =
+    typeof language_code === "string" && language_code.trim().length > 0
+      ? language_code.trim()
+      : "en-US";
 
   let audio: Record<string, unknown>;
   let config: Record<string, unknown>;
@@ -78,13 +102,21 @@ serve(async (req: Request): Promise<Response> => {
       mime_type,
       "user=",
       user_id,
+      "languageCode=",
+      languageCode,
+      "altLanguageCodes=",
+      altLanguageCodes,
     );
 
     audio = { uri };
 
     // Let Google infer encoding from the file (MP4, MOV, etc).
     config = {
-      languageCode: languageCode,
+      languageCode,
+      // Multi-language auto-detection: include any alt codes the client sent.
+      ...(altLanguageCodes.length > 0 && {
+        alternativeLanguageCodes: altLanguageCodes,
+      }),
       enableAutomaticPunctuation: true,
     };
   } else if (audio_base64) {
@@ -95,14 +127,21 @@ serve(async (req: Request): Promise<Response> => {
         " mime_type=" +
         mime_type +
         " user=" +
-        user_id,
+        user_id +
+        " languageCode=" +
+        languageCode +
+        " altLanguageCodes=" +
+        JSON.stringify(altLanguageCodes),
     );
 
     audio = { content: audio_base64 };
 
     // THE MP3 LIE: we always say MP3 so AAC wrapped from FlutterSound is accepted.
     config = {
-      languageCode: languageCode,
+      languageCode,
+      ...(altLanguageCodes.length > 0 && {
+        alternativeLanguageCodes: altLanguageCodes,
+      }),
       enableAutomaticPunctuation: true,
       encoding: "MP3",
     };
@@ -191,14 +230,35 @@ serve(async (req: Request): Promise<Response> => {
       );
     }
 
+    // Try to surface the language that Google actually decided on
+    // (useful when we gave it multiple options).
+    let detectedLanguageCode: string | undefined;
+    try {
+      const firstAlt = results[0]?.alternatives?.[0];
+      if (firstAlt && typeof firstAlt.languageCode === "string") {
+        detectedLanguageCode = firstAlt.languageCode;
+      }
+    } catch {
+      // If anything goes wrong here, just ignore and fall back below.
+    }
+
+    if (!detectedLanguageCode) {
+      detectedLanguageCode = languageCode;
+    }
+
     console.log(
       "✅ STT success for user " +
         user_id +
         " transcript length=" +
-        transcript.length,
+        transcript.length +
+        " detectedLanguageCode=" +
+        detectedLanguageCode,
     );
 
-    return jsonResponse({ transcript: transcript });
+    return jsonResponse({
+      transcript,
+      detected_language_code: detectedLanguageCode,
+    });
   } catch (err) {
     console.error("❌ STT function exception", err);
     return jsonResponse(
