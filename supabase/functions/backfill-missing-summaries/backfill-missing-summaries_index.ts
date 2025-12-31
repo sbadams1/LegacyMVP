@@ -14,7 +14,7 @@
 // }
 //
 // Notes:
-// - Uses SERVICE ROLE key (SUPABASE_SERVICE_ROLE_KEY) because this is maintenance/admin.
+// - Uses SERVICE ROLE key (SB_SECRET_KEY) because this is maintenance/admin.
 // - Avoids raw_id anchoring problems by selecting memory_summary rows by conversation_id,
 //   then updating any rows with empty insights.
 // - Adds time/call caps to reduce 503 risk.
@@ -23,7 +23,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const SB_SECRET_KEY = Deno.env.get("SB_SECRET_KEY")!;
 
 const GEMINI_API_KEY =
   Deno.env.get("GEMINI_API_KEY") ?? Deno.env.get("GEMINI_API_KEY_EDGE") ?? "";
@@ -374,7 +374,7 @@ Deno.serve(async (req) => {
   let geminiCalls = 0;
 
   try {
-    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+    const supabase = createClient(SUPABASE_URL, SB_SECRET_KEY);
 
     const body = await req.json().catch(() => ({}));
     const userId = safeTrim((body as any)?.user_id);

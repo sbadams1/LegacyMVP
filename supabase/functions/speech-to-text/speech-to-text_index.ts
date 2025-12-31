@@ -38,6 +38,40 @@ function jsonResponse(body: unknown, status: number = 200): Response {
   });
 }
 
+/**
+ * Google STT v1 expects BCP-47 language tags (ex: "en-US", "th-TH").
+ * Your app/settings may store shorter tags ("en", "th") or underscore forms ("en_US").
+ * This normalizes common cases while staying language-agnostic.
+ */
+function normalizeSttLang(input: unknown, fallback = "en-US"): string {
+  const raw = String(input ?? "").trim();
+  if (!raw) return fallback;
+
+  // common formatting fixes: en_US -> en-US
+  const s = raw.replace(/_/g, "-");
+
+  // map common short codes used by apps/settings
+  const lower = s.toLowerCase();
+  if (lower === "en") return "en-US";
+  if (lower === "th") return "th-TH";
+
+  return s;
+}
+
+function normalizeAltLangs(list: unknown): string[] {
+  const arr = Array.isArray(list) ? list : [];
+  const out: string[] = [];
+
+  for (const x of arr) {
+    const norm = normalizeSttLang(x, "");
+    if (!norm) continue;
+    out.push(norm);
+  }
+
+  // de-dupe while preserving order
+  return Array.from(new Set(out));
+}
+
 serve(async (req: Request): Promise<Response> => {
   if (req.method !== "POST") {
     return jsonResponse({ error: "Method not allowed" }, 405);
@@ -59,33 +93,38 @@ serve(async (req: Request): Promise<Response> => {
   // Primary language bias (L1 or L2) – should be sent by the client.
   const language_code = payload.language_code as string | undefined;
 
-  // NEW: additional languages (e.g., the "other side" of L1/L2) for auto-detection.
+  // Additional languages (for auto-detection).
   const alt_language_codes_raw = payload.alt_language_codes;
-
-  const altLanguageCodes: string[] = Array.isArray(alt_language_codes_raw)
-    ? alt_language_codes_raw
-        .map((x) => (typeof x === "string" ? x.trim() : ""))
-        .filter((x) => x.length > 0)
-    : [];
 
   if (!user_id) {
     return jsonResponse({ error: "user_id is required" }, 400);
   }
 
   if (!GOOGLE_SPEECH_API_KEY) {
-    return jsonResponse(
-      { error: "Server is missing GOOGLE_SPEECH_API_KEY" },
-      500,
-    );
+    return jsonResponse({ error: "Server is missing GOOGLE_SPEECH_API_KEY" }, 500);
   }
 
-  // We stay language-agnostic: use whatever the client sends.
-  // If nothing is provided, fall back to "en-US" as a safe default
-  // (Google requires a primary languageCode).
-  const languageCode =
-    typeof language_code === "string" && language_code.trim().length > 0
-      ? language_code.trim()
-      : "en-US";
+  // Language-agnostic:
+  // 1) prefer explicit language_code
+  // 2) else fall back to device_locale (client-provided)
+  // 3) else last-resort "en-US" because Google STT requires *some* primary languageCode
+  const device_locale = payload.device_locale as string | undefined;
+
+  const fallbackLocale = normalizeSttLang(device_locale, "en-US");
+  const languageCode = normalizeSttLang(language_code, fallbackLocale);
+
+  const altLanguageCodes: string[] = []; // force single-language recognition
+
+  console.log(
+    "🧩 STT languageCode=",
+    languageCode,
+    "altLanguageCodes=",
+    altLanguageCodes,
+    "mime_type=",
+    mime_type,
+    "user=",
+    user_id,
+  );
 
   let audio: Record<string, unknown>;
   let config: Record<string, unknown>;
@@ -95,78 +134,38 @@ serve(async (req: Request): Promise<Response> => {
     const bucketName = bucket || "legacy-user-media";
     const uri = `gs://${bucketName}/${gcs_object_name}`;
 
-    console.log(
-      "🎬 STT via GCS URI",
-      uri,
-      "mime_type=",
-      mime_type,
-      "user=",
-      user_id,
-      "languageCode=",
-      languageCode,
-      "altLanguageCodes=",
-      altLanguageCodes,
-    );
-
     audio = { uri };
 
     // Let Google infer encoding from the file (MP4, MOV, etc).
     config = {
       languageCode,
-      // Multi-language auto-detection: include any alt codes the client sent.
-      ...(altLanguageCodes.length > 0 && {
-        alternativeLanguageCodes: altLanguageCodes,
-      }),
       enableAutomaticPunctuation: true,
     };
+
   } else if (audio_base64) {
     // ---------- INLINE AUDIO PATH (MP3 LIE) ----------
-    console.log(
-      "🎙️ STT inline audio length=" +
-        audio_base64.length +
-        " mime_type=" +
-        mime_type +
-        " user=" +
-        user_id +
-        " languageCode=" +
-        languageCode +
-        " altLanguageCodes=" +
-        JSON.stringify(altLanguageCodes),
-    );
-
     audio = { content: audio_base64 };
 
     // THE MP3 LIE: we always say MP3 so AAC wrapped from FlutterSound is accepted.
     config = {
       languageCode,
-      ...(altLanguageCodes.length > 0 && {
-        alternativeLanguageCodes: altLanguageCodes,
-      }),
       enableAutomaticPunctuation: true,
       encoding: "MP3",
     };
+
   } else {
-    return jsonResponse(
-      { error: "audio_base64 or gcs_object_name is required" },
-      400,
-    );
+    return jsonResponse({ error: "audio_base64 or gcs_object_name is required" }, 400);
   }
 
-  const requestBody = {
-    config,
-    audio,
-  };
+  const requestBody = { config, audio };
 
   try {
     const url =
-      "https://speech.googleapis.com/v1/speech:recognize?key=" +
-      GOOGLE_SPEECH_API_KEY;
+      "https://speech.googleapis.com/v1/speech:recognize?key=" + GOOGLE_SPEECH_API_KEY;
 
     const googleRes = await fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(requestBody),
     });
 
@@ -175,11 +174,8 @@ serve(async (req: Request): Promise<Response> => {
     if (!googleRes.ok) {
       console.error("❌ Google STT error", googleRes.status, bodyText);
 
-      const shortBody =
-        bodyText.length > 400 ? bodyText.slice(0, 400) : bodyText;
-
-      const errMsg =
-        "Google STT error (status " + googleRes.status + "): " + shortBody;
+      const shortBody = bodyText.length > 400 ? bodyText.slice(0, 400) : bodyText;
+      const errMsg = "Google STT error (status " + googleRes.status + "): " + shortBody;
 
       // Return 200 so Flutter can still parse and show a friendly message
       return jsonResponse(
@@ -207,9 +203,7 @@ serve(async (req: Request): Promise<Response> => {
       );
     }
 
-    const results = Array.isArray(googleJson.results)
-      ? googleJson.results
-      : [];
+    const results = Array.isArray(googleJson.results) ? googleJson.results : [];
 
     const transcript = results
       .map((r: any) => {
@@ -221,30 +215,11 @@ serve(async (req: Request): Promise<Response> => {
 
     if (!transcript) {
       console.warn("⚠️ No transcript returned from Google STT", googleJson);
-      return jsonResponse(
-        {
-          error: "No transcript from Google STT",
-          google_raw: googleJson,
-        },
-        200,
-      );
+      return jsonResponse({ error: "No transcript from Google STT", google_raw: googleJson }, 200);
     }
 
-    // Try to surface the language that Google actually decided on
-    // (useful when we gave it multiple options).
-    let detectedLanguageCode: string | undefined;
-    try {
-      const firstAlt = results[0]?.alternatives?.[0];
-      if (firstAlt && typeof firstAlt.languageCode === "string") {
-        detectedLanguageCode = firstAlt.languageCode;
-      }
-    } catch {
-      // If anything goes wrong here, just ignore and fall back below.
-    }
-
-    if (!detectedLanguageCode) {
-      detectedLanguageCode = languageCode;
-    }
+    // 🔒 Single-language mode: we always report the requested languageCode.
+    const detectedLanguageCode = languageCode;
 
     console.log(
       "✅ STT success for user " +
@@ -261,9 +236,6 @@ serve(async (req: Request): Promise<Response> => {
     });
   } catch (err) {
     console.error("❌ STT function exception", err);
-    return jsonResponse(
-      { error: "Internal STT error", details: String(err) },
-      500,
-    );
+    return jsonResponse({ error: "Internal STT error", details: String(err) }, 500);
   }
 });

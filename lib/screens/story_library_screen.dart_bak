@@ -22,6 +22,55 @@ class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
     _loadStories();
   }
 
+  Map<String, dynamic>? _parseSessionInsights(dynamic raw) {
+  if (raw is Map<String, dynamic>) return raw;
+  if (raw is String && raw.trim().isNotEmpty) {
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map<String, dynamic>) return decoded;
+    } catch (_) {}
+  }
+  return null;
+  }
+
+  Widget _buildInsightsChips(dynamic raw) {
+  final si = _parseSessionInsights(raw);
+  if (si == null) return const SizedBox.shrink();
+
+  final keySentence = (si['key_sentence'] as String? ?? '').trim();
+  final items = (si['items'] as List<dynamic>? ?? const []);
+
+  // If nothing meaningful, show nothing.
+  if (keySentence.isEmpty && items.isEmpty) return const SizedBox.shrink();
+
+  // Build up to 2 compact chips from item kinds (trait/theme/lesson/etc)
+  final kinds = <String>[];
+  for (final it in items.take(6)) {
+    if (it is Map) {
+      final k = (it['kind'] as String? ?? '').trim();
+      if (k.isNotEmpty && !kinds.contains(k)) kinds.add(k);
+    }
+    if (kinds.length >= 2) break;
+  }
+
+  // Fallback chip if kinds are absent but key_sentence exists
+  if (kinds.isEmpty && keySentence.isNotEmpty) {
+    kinds.add('insight');
+  }
+
+  return Wrap(
+    spacing: 6,
+    runSpacing: -8,
+    children: kinds.map((k) {
+      return Chip(
+        visualDensity: VisualDensity.compact,
+        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        label: Text(k),
+      );
+    }).toList(),
+  );
+  }
+
   Future<void> _loadStories() async {
     setState(() {
       _loading = true;
@@ -41,7 +90,7 @@ class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
       // Load session-level summaries instead of individual raw turns.
       final res = await _client
           .from('memory_summary')
-          .select('id, short_summary, full_summary, observations, created_at')
+          .select('id, short_summary, full_summary, observations, session_insights, created_at')
           .eq('user_id', user.id)
           .order('created_at', ascending: false);
 
@@ -264,37 +313,75 @@ class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
                                   ? shortSummary
                                   : '(No summary yet for this session.)');
 
-                          return ListTile(
-                            title: Text(preview),
-                            subtitle:
-                                dateLabel.isNotEmpty ? Text(dateLabel) : null,
-                            trailing: const Icon(Icons.chevron_right),
-                            onTap: () async {
-                              final changed =
-                                  await Navigator.of(context).push<bool>(
-                                MaterialPageRoute(
-                                  builder: (_) => StoryDetailScreen(
-                                    memorySummaryId: row['id'] as String,
-                                    sessionKey: sessionKey,
-                                    dateLabel: dateLabel.isNotEmpty
-                                        ? dateLabel
-                                        : 'Session',
-                                    fallbackTitle: fallbackTitle,
-                                    fallbackBody: fallbackBody,
-                                    // Pass through the values the list used.
-                                    shortSummary: shortSummary,
-                                    fullSummary: fullSummary,
-                                  ),
-                                ),
-                              );
+                          // --- Session insights badge (chips) ---
+                          final rawSi = row['session_insights'];
+                          final chips = _buildInsightsChips(rawSi);
 
-                              if (changed == true) {
-                                _loadStories();
-                              }
-                            },
-                          );
-                        },
-                      ),
+                          return Card(
+                            elevation: 1,
+                            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(12),
+                              onTap: () async {
+                                final changed = await Navigator.of(context).push<bool>(
+                                  MaterialPageRoute(
+                                    builder: (_) => StoryDetailScreen(
+                                      memorySummaryId: row['id'] as String,
+                                      sessionKey: sessionKey,
+                                      dateLabel: dateLabel.isNotEmpty ? dateLabel : 'Session',
+                                      fallbackTitle: fallbackTitle,
+                                      fallbackBody: fallbackBody,
+                                      shortSummary: shortSummary,
+                                      fullSummary: fullSummary,
+                                      sessionInsights: rawSi,
+                                    ),
+                                  ),
+                                );
+
+                                if (changed == true) {
+                                  _loadStories();
+                                }
+                              },
+                              child: Padding(
+                                padding: const EdgeInsets.all(12),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    // Top row: title + chevron
+                                    Row(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Expanded(
+                                          child: Text(
+                                          preview,
+                                          style: Theme.of(context).textTheme.titleMedium,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      const Icon(Icons.chevron_right),
+                                    ],
+                                  ),
+
+                                  if (dateLabel.isNotEmpty) ...[
+                                    const SizedBox(height: 6),
+                                    Text(
+                                      dateLabel,
+                                      style: Theme.of(context).textTheme.bodySmall,
+                                    ),
+                                  ],
+
+                                  // Insight chips row
+                                  if (chips is! SizedBox) ...[
+                                    const SizedBox(height: 10),
+                                    chips,
+                                  ],
+                                ],
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                     ),
       ),
     );
   }
@@ -306,21 +393,23 @@ class StoryDetailScreen extends StatefulWidget {
   final String dateLabel;
   final String fallbackTitle;
   final String fallbackBody;
+  final dynamic sessionInsights;
 
   // NEW: the values that the Story Library list used.
   final String shortSummary;
   final String fullSummary;
 
   const StoryDetailScreen({
-    super.key,
-    required this.memorySummaryId,
-    required this.sessionKey,
-    required this.dateLabel,
-    required this.fallbackTitle,
-    required this.fallbackBody,
-    required this.shortSummary,
-    required this.fullSummary,
-  });
+  super.key,
+  required this.memorySummaryId,
+  required this.sessionKey,
+  required this.dateLabel,
+  required this.fallbackTitle,
+  required this.fallbackBody,
+  required this.shortSummary,
+  required this.fullSummary,
+  required this.sessionInsights, // ✅ REQUIRED
+});
 
   @override
   State<StoryDetailScreen> createState() => _StoryDetailScreenState();
@@ -339,6 +428,91 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
     super.initState();
     _loadCuratedOrSummary();
   }
+
+  Widget _buildSessionInsightsSection(ThemeData theme) {
+  Map<String, dynamic>? si;
+
+  final raw = widget.sessionInsights;
+  if (raw is Map<String, dynamic>) {
+    si = raw;
+  } else if (raw is String && raw.trim().isNotEmpty) {
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map<String, dynamic>) si = decoded;
+    } catch (_) {}
+  }
+
+  if (si == null || si.isEmpty) return const SizedBox.shrink();
+
+  final keySentence = (si['key_sentence'] as String? ?? '').trim();
+  final items = (si['items'] as List<dynamic>? ?? const []);
+
+  if (keySentence.isEmpty && items.isEmpty) return const SizedBox.shrink();
+
+  // Collect “tags” from kinds
+  final tags = <String>{};
+  for (final it in items) {
+    if (it is Map) {
+      final kind = (it['kind'] as String? ?? '').trim();
+      if (kind.isNotEmpty) tags.add(kind);
+    }
+  }
+
+  return Container(
+    margin: const EdgeInsets.only(bottom: 12),
+    decoration: BoxDecoration(
+      border: Border.all(color: theme.dividerColor),
+      borderRadius: BorderRadius.circular(12),
+    ),
+    child: ExpansionTile(
+      title: Text(
+        'Open full session insights',
+        style: theme.textTheme.titleMedium,
+      ),
+      childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+      children: [
+        if (keySentence.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Text(
+            keySentence,
+            style: theme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600),
+          ),
+        ],
+
+        if (tags.isNotEmpty) ...[
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 6,
+            runSpacing: -8,
+            children: tags.take(8).map((t) {
+              return Chip(
+                visualDensity: VisualDensity.compact,
+                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                label: Text(t),
+              );
+            }).toList(),
+          ),
+        ],
+
+        if (items.isNotEmpty) ...[
+          const SizedBox(height: 10),
+          ...items.take(10).map((it) {
+            if (it is! Map) return const SizedBox.shrink();
+            final text = (it['text'] as String? ?? '').trim();
+            final kind = (it['kind'] as String? ?? '').trim();
+            if (text.isEmpty) return const SizedBox.shrink();
+
+            final prefix = kind.isNotEmpty ? '${kind.toUpperCase()}: ' : '';
+            return Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Text("• $prefix$text"),
+            );
+            }),
+        ],
+      ],
+    ),
+  );
+}
 
   Future<void> _loadCuratedOrSummary() async {
     setState(() {
@@ -592,6 +766,7 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
+                      _buildSessionInsightsSection(theme),
                       Text(
                         'Your story for this session',
                         style: theme.textTheme.titleMedium,
@@ -690,31 +865,79 @@ class _MemoryEditorScreenState extends State<MemoryEditorScreen> {
     super.dispose();
   }
 
+
   Future<void> _save() async {
     setState(() {
       _saving = true;
     });
 
     try {
-      // 1) Update the memory text and mark as user-edited
-      await _client
-          .from('memory_raw')
-          .update({
-            'content': _controller.text,
-            'user_edited': true,
-          })
-          .eq('id', widget.memoryId);
+      final user = _client.auth.currentUser;
+      if (user == null) {
+        throw Exception('You must be logged in to save edits.');
+      }
 
-      // 2) Fire-and-forget: rebuild insights for this user
+      final edited = _controller.text.trim();
+      if (edited.isEmpty) {
+        throw Exception('Edit cannot be empty.');
+      }
+
+      // Look up conversation_id (session key) for optional targeted rebuild
+      String? conversationId;
       try {
-        final user = _client.auth.currentUser;
-        if (user != null) {
-          await _client.functions
-              .invoke('rebuild-insights', body: {'user_id': user.id});
+        final row = await _client
+            .from('memory_raw')
+            .select('conversation_id')
+            .eq('id', widget.memoryId)
+            .maybeSingle();
+        conversationId = (row?['conversation_id'] as String?)?.trim();
+      } catch (_) {
+        // Non-fatal; we'll fall back to rebuild-insights below.
+      }
+
+      // 1) Supersede any prior current edit for this raw_id
+      await _client
+          .from('memory_raw_edits')
+          .update({
+            'is_current': false,
+            'superseded_at': DateTime.now().toIso8601String(),
+          })
+          .eq('user_id', user.id)
+          .eq('raw_id', widget.memoryId)
+          .eq('is_current', true);
+
+      // 2) Insert the new current edit (memory_raw remains authoritative)
+      await _client.from('memory_raw_edits').insert({
+        'user_id': user.id,
+        'raw_id': widget.memoryId,
+        'edited_content': edited,
+        'editor_user_id': user.id,
+        'is_current': true,
+      });
+
+      // 3) Best-effort: rebuild only this session summary (preferred).
+      if (conversationId != null && conversationId!.isNotEmpty) {
+        try {
+          await _client.functions.invoke(
+            'rebuild-session-summary',
+            body: {'user_id': user.id, 'conversation_id': conversationId},
+          );
+        } catch (e) {
+          // Don't block save if rebuild fails
+          // ignore: avoid_print
+          print('rebuild-session-summary failed after edit: $e');
         }
-      } catch (e) {
-        // Don't block the save if insights rebuild fails
-        print('rebuild-insights failed after memory edit: $e');
+      } else {
+        // Fallback: previous behavior (heavier) if we couldn't identify session
+        try {
+          await _client.functions.invoke(
+            'rebuild-insights',
+            body: {'user_id': user.id},
+          );
+        } catch (e) {
+          // ignore: avoid_print
+          print('rebuild-insights failed after memory edit: $e');
+        }
       }
 
       if (!mounted) return;

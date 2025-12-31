@@ -6,16 +6,44 @@
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { geminiGenerateContent, extractGeminiTextFromResponse, parseJsonSafely } from "../_shared/gemini.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const SUPABASE_SERVICE_ROLE_KEY =
+  Deno.env.get("SB_SECRET_KEY") ?? Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+if (!SUPABASE_SERVICE_ROLE_KEY) {
+  console.error("❌ Missing service role key: set SB_SECRET_KEY or SUPABASE_SERVICE_ROLE_KEY");
+}
+
 
 // Match ai-brain: accept either GEMINI_API_KEY or GEMINI_API_KEY_EDGE
 const GEMINI_API_KEY =
   Deno.env.get("GEMINI_API_KEY") ?? Deno.env.get("GEMINI_API_KEY_EDGE");
 
 const GEMINI_MODEL =
-  Deno.env.get("GEMINI_MODEL") ?? "models/gemini-1.5-flash";
+  Deno.env.get("GEMINI_MODEL") ?? "models/gemini-2.0-flash-exp";
+
+// ------------------------
+// Shared helpers (match ai-brain behavior)
+// ------------------------
+// ---------------------------------------------------------------------------
+// Gemini helpers (delegating to ../_shared/gemini.ts)
+// ---------------------------------------------------------------------------
+async function geminiGenerateText(prompt: string): Promise<string> {
+  const payload = { contents: [{ role: "user", parts: [{ text: prompt }] }] };
+  const res = await geminiGenerateContent(payload);
+  if (!res.ok || !res.json) {
+    console.error("❌ Gemini non-OK response:", res.status, res.text);
+    return "";
+  }
+  return extractGeminiTextFromResponse(res.json);
+}
+
+async function geminiGenerateJson<T = any>(prompt: string): Promise<T | null> {
+  const txt = await geminiGenerateText(prompt);
+  return parseJsonSafely<T>(txt);
+}
+
 
 interface MemorySummaryRow {
   id: string;
@@ -36,6 +64,18 @@ interface LifeThemesResult {
   summary_sentence: string;
   master_page: string;
   themes: LifeTheme[];
+}
+
+function requireInternalKey(req: Request) {
+  const got = req.headers.get("x-internal-key") || "";
+  const expect = Deno.env.get("INTERNAL_FUNCTION_KEY") || "";
+  if (!expect || got !== expect) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  return null;
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -85,7 +125,94 @@ async function backfillSessionSummariesFromMemoryRaw(
     content: string | null;
   }>;
 
-  // Group by conversation_id
+  // ------------------------------------------------------------
+// ------------------------------------------------------------
+  // Overlay current donor edits (memory_raw_edits) without changing memory_raw
+  // This ensures backfilled summaries reflect donor corrections.
+  //
+  // IMPORTANT:
+  // - Some projects may not have all columns (e.g. is_current) or may have RLS / API quirks.
+  // - Large IN() lists can trigger PostgREST "Bad Request" (URL length / parser limits).
+  //   So we chunk rawIds and we retry without optional columns/filters when needed.
+  // ------------------------------------------------------------
+  const rawIds = rows.map((r) => r.id).filter(Boolean);
+
+  async function fetchEditsOverlayForRawIds(ids: string[]) {
+    // Try the "ideal" query first (with is_current), then fall back.
+    const tryQueries: Array<() => Promise<{ data: any[] | null; error: any | null }>> = [
+      async () =>
+        await supabase
+          .from("memory_raw_edits")
+          .select("raw_id, edited_content, use_for, is_current")
+          .eq("user_id", userId)
+          .eq("status", "active")
+          .contains("use_for", ["summarization"])
+          .in("raw_id", ids)
+          .eq("is_current", true),
+      async () =>
+        await supabase
+          .from("memory_raw_edits")
+          .select("raw_id, edited_content, use_for")
+          .eq("user_id", userId)
+          .eq("status", "active")
+          .in("raw_id", ids),
+      async () =>
+        await supabase
+          .from("memory_raw_edits")
+          .select("*")
+          .eq("user_id", userId)
+          .in("raw_id", ids),
+    ];
+
+    let lastErr: any | null = null;
+
+    for (const q of tryQueries) {
+      const { data, error } = await q();
+      if (!error) return { data: (data ?? []) as any[], error: null };
+      lastErr = error;
+    }
+
+    return { data: [] as any[], error: lastErr };
+  }
+
+  if (rawIds.length) {
+    const editsByRawId = new Map<string, { edited: string; use_for: string[] }>();
+
+    // Chunk to avoid PostgREST "Bad Request" from large IN() lists / long URLs.
+    const CHUNK = 80; // smaller to avoid PostgREST 400 on long IN() lists
+    for (let i = 0; i < rawIds.length; i += CHUNK) {
+      const chunk = rawIds.slice(i, i + CHUNK);
+
+      const { data: editsChunk, error: e2 } = await fetchEditsOverlayForRawIds(chunk);
+
+      if (e2) {
+        console.error("backfill: memory_raw_edits fetch error", {
+          message: e2?.message ?? String(e2),
+          details: e2?.details,
+          hint: e2?.hint,
+          code: e2?.code,
+        });
+        // Don't fail the backfill—just skip edits overlay.
+        break;
+      }
+
+      for (const e of (editsChunk ?? []) as any[]) {
+        const rid = safeTrim(e?.raw_id);
+        const edited = typeof e?.edited_content === "string" ? e.edited_content.trim() : "";
+        const useFor = Array.isArray(e?.use_for) ? e.use_for.map((x: any) => String(x)) : [];
+        if (rid && edited) editsByRawId.set(rid, { edited, use_for: useFor });
+      }
+    }
+
+    // Apply edits in-memory (authoritative memory_raw remains untouched)
+    for (const r of rows) {
+      const edit = editsByRawId.get(r.id);
+      const useFor = edit?.use_for ?? [];
+      const canUse = !useFor.length || useFor.includes("summarization");
+      if (edit && canUse && edit.edited) r.content = edit.edited;
+    }
+  }
+// Group by conversation_id
   const bySession = new Map<string, typeof rows>();
   for (const r of rows) {
     const cid = safeTrim(r.conversation_id);
@@ -251,7 +378,8 @@ function tryParseLifeThemesJson(
   }
 
   try {
-    const parsed = JSON.parse(text);
+    const parsed = parseJsonSafely<any>(text);
+      if (!parsed) return null;
 
     if (
       typeof parsed.summary_sentence === "string" &&
@@ -365,29 +493,13 @@ async function buildLifeThemesFromSessions(
   ].join("\n");
 
   try {
-    const resp = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-        }),
-      },
-    );
-
-    if (!resp.ok) {
-      console.error("Gemini error for life_themes:", await resp.text());
+    const text = await geminiGenerateText(prompt);
+    if (!text) {
+      console.error("Gemini returned empty life_themes; using fallback.");
       return fallback;
     }
 
-    const json = await resp.json();
-    const text =
-      json.candidates?.[0]?.content?.parts
-        ?.map((p: { text: string }) => p.text)
-        .join("") ?? "";
-
-    const parsed = tryParseLifeThemesJson(text);
+const parsed = tryParseLifeThemesJson(text);
     if (!parsed) {
       console.error(
         "Gemini returned non-parseable life_themes JSON; using fallback.",
@@ -402,19 +514,142 @@ async function buildLifeThemesFromSessions(
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// Quiet per-session chapter classification (fills observations.chapter_keys)
+// ---------------------------------------------------------------------------
+const ALLOWED_CHAPTER_KEYS = [
+  "early_childhood",
+  "adolescence",
+  "early_adulthood",
+  "midlife",
+  "later_life",
+  "family_relationships",
+  "work_career",
+  "education",
+  "health_wellbeing",
+  "hobbies_interests",
+  "beliefs_values",
+  "major_events",
+] as const;
+
+async function classifyCoverageFromText(text: string): Promise<{ chapter_keys: string[]; themes: string[] } | null> {
+  const trimmed = (text || "").trim();
+  if (!trimmed) return null;
+  if (!GEMINI_API_KEY) return null;
+
+  const prompt = [
+    "You are helping to organise someone's life stories into high-level life chapters.",
+    "",
+    "Allowed chapter keys (choose 1–3 that best fit):",
+    "- ORDER matters: primary first, then secondary, then tertiary.",
+
+    ...ALLOWED_CHAPTER_KEYS.map((k) => `- \"${k}\"`),
+    "",
+    "Return ONLY valid JSON like:",
+    "{ \"chapter_keys\": [\"family_relationships\"], \"themes\": [\"fatherhood\", \"resilience\"] }",
+    "",
+    "Text:",
+    trimmed.slice(0, 8000),
+  ].join("\n");
+
+  try {
+    const parsed = await geminiGenerateJson<any>(prompt);
+    if (!parsed) return null;
+const orderedExplicit = (() => {
+    const primary = typeof (parsed as any)?.primary_chapter_key === "string" ? String((parsed as any).primary_chapter_key).trim() : "";
+    const secondary = typeof (parsed as any)?.secondary_chapter_key === "string" ? String((parsed as any).secondary_chapter_key).trim() : "";
+    const tertiary = typeof (parsed as any)?.tertiary_chapter_key === "string" ? String((parsed as any).tertiary_chapter_key).trim() : "";
+    const seq = [primary, secondary, tertiary].filter(Boolean);
+    const cleaned = seq.filter((k) => ALLOWED_CHAPTER_KEYS.includes(k as any));
+    return Array.from(new Set(cleaned)).slice(0, 3);
+  })();
+
+  const keysFromArray = Array.isArray((parsed as any)?.chapter_keys)
+    ? (parsed as any).chapter_keys
+        .filter((k: any) => typeof k === "string" && ALLOWED_CHAPTER_KEYS.includes(k))
+        .slice(0, 3)
+    : [];
+
+  const keys = orderedExplicit.length ? orderedExplicit : keysFromArray;
+    const themes = Array.isArray(parsed?.themes)
+      ? parsed.themes.filter((t: any) => typeof t === "string").map((t: string) => t.trim()).filter(Boolean).slice(0, 12)
+      : [];
+    return { chapter_keys: keys, themes };
+  } catch (err) {
+    console.error("Gemini request failed in coverage classification:", err);
+    return null;
+  }
+}
+
+async function backfillMissingChapterKeysFromSummaries(
+  supabase: ReturnType<typeof createClient>,
+  userId: string,
+  rows: MemorySummaryRow[],
+) {
+  const missing = rows.filter((r) => {
+    const obs = (r.observations as any) || {};
+    const keys = Array.isArray(obs.chapter_keys) ? obs.chapter_keys : [];
+    return keys.length === 0;
+  }).slice(0, 25);
+
+  let updated = 0;
+  for (const r of missing) {
+    const sourceText = (r.full_summary || r.short_summary || "").trim();
+    const classified = await classifyCoverageFromText(sourceText);
+    if (!classified || classified.chapter_keys.length === 0) continue;
+
+    const obs = ((r.observations as any) || {}) as Record<string, unknown>;
+    const merged = {
+      ...obs,
+      chapter_keys: classified.chapter_keys,
+      themes: classified.themes.length ? classified.themes : (obs as any).themes,
+      coverage_classified_at: new Date().toISOString(),
+      coverage_classified_from: "rebuild-insights/full_summary",
+    };
+
+    const { error: updErr } = await supabase
+      .from("memory_summary")
+      .update({
+        observations: merged,
+        chapter_key: (classified.chapter_keys[0] ?? null),
+        chapter_key_2: (classified.chapter_keys[1] ?? null),
+        chapter_key_3: (classified.chapter_keys[2] ?? null),
+      })
+      .eq("user_id", userId)
+      .eq("id", r.id);
+
+    if (updErr) {
+      console.error("Failed to backfill chapter_keys for summary:", r.id, updErr);
+    } else {
+      updated += 1;
+    }
+  }
+
+  return { scanned: missing.length, updated };
+}
 Deno.serve(async (req: Request) => {
   if (req.method !== "POST") {
     return jsonResponse({ error: "Only POST allowed." }, 405);
   }
+  // Internal-only function: require shared secret header
+  const deny = requireInternalKey(req);
+  if (deny) return deny;
+
 
   let userId: string | null = null;
+  let lite: boolean = true;
 
   try {
     const body = await req.json();
     userId = (body.user_id as string | undefined)?.trim() || null;
+    // lite=true means: do NOT run per-session coverage classification backfill here.
+    // This is the biggest source of many Gemini calls.
+    lite = typeof body.lite === "boolean" ? body.lite : true;
   } catch {
     const url = new URL(req.url);
     userId = url.searchParams.get("user_id");
+    lite = url.searchParams.get("lite") === "false" ? false : true;
   }
 
   if (!userId) {
@@ -441,8 +676,8 @@ const { data, error } = await supabase
 
   if (error) {
     console.error("rebuild-insights: memory_summary error", error);
-    return jsonResponse(
-      { error: "Failed to fetch memory summaries", details: error },
+    return jsonResponse({
+error: "Failed to fetch memory summaries", details: error },
       500,
     );
   }
@@ -450,11 +685,17 @@ const { data, error } = await supabase
   const rows = (data || []) as MemorySummaryRow[];
   if (!rows.length) {
     return jsonResponse(
-      { message: "No memory_summary rows for this user; nothing to rebuild." },
-      200,
-    );
-  }
+      { message: "No memory_summary rows for this user; nothing to rebuild." }, 200);
+}
 
+
+  // 1b) Quietly backfill missing observations.chapter_keys (helps Coverage Map)
+  // NOTE: This step can trigger MANY Gemini calls because it classifies sessions individually.
+  // For end-session flow, keep lite=true (default) to skip this and avoid latency.
+  const chapterBackfill = lite
+    ? { scanned: 0, updated: 0, skipped: true }
+    : await backfillMissingChapterKeysFromSummaries(supabase, userId, rows);
+  console.log("rebuild-insights: chapter backfill", chapterBackfill);
   // 2) Ask Gemini (or fallback) to produce structured life themes.
   const lifeThemes = await buildLifeThemesFromSessions(userId, rows);
   const sourceIds = rows.map((r) => r.id);
@@ -502,9 +743,8 @@ const { data, error } = await supabase
       "rebuild-insights: lifetime_profile upsert error",
       lifetimeUpsertError,
     );
-    return jsonResponse(
-      {
-        error: "Failed to upsert lifetime_profile.life_themes",
+    return jsonResponse({
+error: "Failed to upsert lifetime_profile.life_themes",
         details: lifetimeUpsertError,
       },
       500,
@@ -572,14 +812,12 @@ const { data, error } = await supabase
     );
   }
 
-  return jsonResponse(
-  {
+  return jsonResponse({
     ok: true,
     backfill,
+    lite,
     life_themes: lifeThemes,
     lifetime_profile: upsertedLifetime,
     insights_inserted: insertedInsights,
-  },
-  200,
-);
+  }, 200);
 });

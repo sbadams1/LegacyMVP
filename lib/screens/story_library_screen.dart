@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -12,9 +13,25 @@ class StoryLibraryScreen extends StatefulWidget {
 
 class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
   final SupabaseClient _client = Supabase.instance.client;
+
   bool _loading = true;
   String? _error;
-  List<Map<String, dynamic>> _rows = [];
+
+  // ---------------------------------------------------------------------------
+  // Story seeds (per-session "named stories") + longitudinal insights
+  // ---------------------------------------------------------------------------
+  bool _loadingSeeds = false;
+  String? _seedError;
+  List<Map<String, dynamic>> _storySeeds = const [];
+
+  bool _loadingLongInsights = false;
+  String? _longInsightsError;
+  List<Map<String, dynamic>> _latestInsights = const [];
+  List<Map<String, dynamic>> _rows = const [];
+
+  // Donor UX: suppress summaries/insights until an explicit reveal moment.
+  bool _revealPanels = false;
+  int _revealTapCount = 0;
 
   @override
   void initState() {
@@ -22,53 +39,185 @@ class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
     _loadStories();
   }
 
-  Map<String, dynamic>? _parseSessionInsights(dynamic raw) {
-  if (raw is Map<String, dynamic>) return raw;
-  if (raw is String && raw.trim().isNotEmpty) {
-    try {
-      final decoded = jsonDecode(raw);
-      if (decoded is Map<String, dynamic>) return decoded;
-    } catch (_) {}
-  }
-  return null;
+  void _showSnack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
-  Widget _buildInsightsChips(dynamic raw) {
-  final si = _parseSessionInsights(raw);
-  if (si == null) return const SizedBox.shrink();
-
-  final keySentence = (si['key_sentence'] as String? ?? '').trim();
-  final items = (si['items'] as List<dynamic>? ?? const []);
-
-  // If nothing meaningful, show nothing.
-  if (keySentence.isEmpty && items.isEmpty) return const SizedBox.shrink();
-
-  // Build up to 2 compact chips from item kinds (trait/theme/lesson/etc)
-  final kinds = <String>[];
-  for (final it in items.take(6)) {
-    if (it is Map) {
-      final k = (it['kind'] as String? ?? '').trim();
-      if (k.isNotEmpty && !kinds.contains(k)) kinds.add(k);
+  Map<String, dynamic>? _asJsonMap(dynamic raw) {
+    if (raw == null) return null;
+    if (raw is Map<String, dynamic>) return raw;
+    if (raw is String && raw.trim().isNotEmpty) {
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map<String, dynamic>) return decoded;
+      } catch (_) {}
     }
-    if (kinds.length >= 2) break;
+    return null;
   }
 
-  // Fallback chip if kinds are absent but key_sentence exists
-  if (kinds.isEmpty && keySentence.isNotEmpty) {
-    kinds.add('insight');
+  Map<String, dynamic>? _parseSessionInsights(dynamic raw) => _asJsonMap(raw);
+
+  /// Prefer observations.session_key for "one card per donor session".
+  /// If absent, fall back to memory_summary.conversation_id.
+  String? _sessionKeyForRow(Map<String, dynamic> row) {
+    final obs = _asJsonMap(row['observations']);
+    final sk = (obs?['session_key'] as String? ?? '').trim();
+    if (sk.isNotEmpty) return sk;
+
+    final convId = (row['conversation_id'] as String? ?? '').trim();
+    if (convId.isNotEmpty) return convId;
+
+    return null;
   }
 
-  return Wrap(
-    spacing: 6,
-    runSpacing: -8,
-    children: kinds.map((k) {
-      return Chip(
-        visualDensity: VisualDensity.compact,
-        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-        label: Text(k),
-      );
-    }).toList(),
-  );
+  String _dateLabelForRow(Map<String, dynamic> row) {
+    final createdAt = (row['created_at'] as String? ?? '').trim();
+    if (createdAt.isEmpty) return 'Session';
+    // leave as-is; your backend already formats in ISO; the UI just needs a stable label
+    return createdAt.replaceFirst('T', ' ').split('.').first;
+  }
+
+  bool _isLikelySessionSummaryRow(Map<String, dynamic> row) {
+    final obs = _asJsonMap(row['observations']);
+    final marker = (obs?['summary_level'] ??
+            obs?['level'] ??
+            obs?['kind'] ??
+            obs?['type'] ??
+            '')
+        .toString()
+        .toLowerCase()
+        .trim();
+
+    if (marker.contains('session')) return true;
+    if (marker.contains('turn') || marker.contains('message')) return false;
+
+    final si = _asJsonMap(row['session_insights']);
+    final keySentence = (si?['key_sentence'] as String? ?? '').trim();
+    final items = (si?['items'] as List<dynamic>? ?? const []);
+    if (keySentence.isNotEmpty || items.isNotEmpty) return true;
+
+    final shortSummary = (row['short_summary'] as String? ?? '').trim();
+    final fullSummary = (row['full_summary'] as String? ?? '').trim();
+    final merged = shortSummary.isNotEmpty ? shortSummary : fullSummary;
+
+    // Exclude language-learning tagged outputs if they ever land in memory_summary
+    final lower = merged.toLowerCase();
+    if (lower.contains('[l1]') || lower.contains('[l2]') || lower.contains('[lesson]') ||
+        lower.contains('[vocab]') || lower.contains('[drill]') || lower.contains('[quiz]') ||
+        lower.contains('[rom]')) {
+      return false;
+    }
+
+
+    // filter out the "mini transcript" style rows
+    if (merged.toLowerCase().startsWith('hey gemini')) return false;
+    if (merged.length < 140) return false;
+
+    return true;
+  }
+
+  List<String> _buildHighlightBullets(Map<String, dynamic> row) {
+    // Goal: always show human-readable bullets (no raw Map.toString()) and
+    // surface "stories/themes/threads" when present.
+    final highlights = <String>[];
+
+    String? pickText(dynamic v) {
+      if (v == null) return null;
+      if (v is String) {
+        final s = v.trim();
+        return s.isEmpty ? null : s;
+      }
+      if (v is Map) {
+        // Common shapes: {text: "..."} / {label: "..."} / {name: "..."} / {title: "..."}
+        for (final k in const ['text', 'label', 'name', 'title', 'summary', 'value']) {
+          final val = v[k];
+          if (val is String) {
+            final s = val.trim();
+            if (s.isNotEmpty) return s;
+          }
+        }
+        // Sometimes: {kind: theme, text: ..., strength: 0.8}
+        final kind = (v['kind'] ?? '').toString().trim();
+        final id = (v['id'] ?? '').toString().trim();
+        if (kind.isNotEmpty) {
+          final s = kind;
+          // If we have at least kind/id, but no text, don't dump the map.
+          return id.isNotEmpty ? '$s ($id)' : s;
+        }
+        return null;
+      }
+      // Avoid dumping objects like "{...}" into bullets.
+      return null;
+    }
+
+    void addBullet(dynamic v) {
+      if (highlights.length >= 5) return;
+      final s = pickText(v);
+      if (s == null) return;
+      if (!highlights.contains(s)) highlights.add(s);
+    }
+
+    final obs = _asJsonMap(row['observations']) ?? const <String, dynamic>{};
+
+    // Prefer explicit story/thread/theme lists if present.
+    final stories = (obs['stories'] as List<dynamic>?) ?? const <dynamic>[];
+    for (final st in stories) {
+      if (highlights.length >= 5) break;
+      addBullet(st);
+    }
+
+    final threads = (obs['threads'] as List<dynamic>?) ?? const <dynamic>[];
+    for (final th in threads) {
+      if (highlights.length >= 5) break;
+      addBullet(th);
+    }
+
+    final themes = (obs['themes'] as List<dynamic>?) ?? const <dynamic>[];
+    for (final th in themes) {
+      if (highlights.length >= 5) break;
+      addBullet(th);
+    }
+
+    // Session insights items (often richer than obs lists).
+    final si = _asJsonMap(row['session_insights']);
+    final items = (si?['items'] as List<dynamic>?) ?? const <dynamic>[];
+    for (final it in items) {
+      if (highlights.length >= 5) break;
+      if (it is Map) {
+        // If it has a usable text/label/title, take it.
+        addBullet(it);
+        continue;
+      }
+      addBullet(it);
+    }
+
+    return highlights.take(5).toList();
+  }
+
+  Widget _buildInsightsChip({
+    required ThemeData theme,
+    required dynamic sessionInsights,
+    required VoidCallback onTap,
+  }) {
+    final si = _parseSessionInsights(sessionInsights);
+    if (si == null) return const SizedBox.shrink();
+
+    final keySentence = (si['key_sentence'] as String? ?? '').trim();
+    final items = (si['items'] as List<dynamic>? ?? const []);
+    if (keySentence.isEmpty && items.isEmpty) return const SizedBox.shrink();
+
+    final label = keySentence.isNotEmpty ? keySentence : items.first.toString();
+
+    return ActionChip(
+      label: Text(
+        label,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: theme.textTheme.bodySmall,
+      ),
+      onPressed: onTap,
+    );
   }
 
   Future<void> _loadStories() async {
@@ -87,113 +236,36 @@ class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
     }
 
     try {
-      // Load session-level summaries instead of individual raw turns.
       final res = await _client
           .from('memory_summary')
-          .select('id, short_summary, full_summary, observations, session_insights, created_at')
+          .select(
+              'id, conversation_id, raw_id, short_summary, full_summary, observations, session_insights, created_at')
           .eq('user_id', user.id)
           .order('created_at', ascending: false);
 
-      final rawList = (res as List<dynamic>? ?? <dynamic>[]);
+      final rows = (res as List<dynamic>).cast<Map<String, dynamic>>();
 
-      // Convert to a typed list of maps.
-      final rows =
-          rawList.map((e) => e as Map<String, dynamic>).toList();
+      // Filter out non-session rows (the "mini transcript" one) and dedupe to 1 row per session.
+      final seen = <String, Map<String, dynamic>>{};
+      final deduped = <Map<String, dynamic>>[];
 
-      // Default: show everything we have.
-      List<Map<String, dynamic>> filtered = rows;
-
-      // Try to filter out obvious dev / debug / non-legacy sessions.
-      // If the filter would remove *everything*, we fall back to the full list.
-      try {
-        final tmp = <Map<String, dynamic>>[];
-
-        for (final row in rows) {
-          final shortSummary =
-              (row['short_summary'] as String? ?? '').trim();
-          final fullSummary =
-              (row['full_summary'] as String? ?? '').trim();
-          final combined = ('$shortSummary $fullSummary').trim();
-
-          // If there's literally no text, skip it.
-          if (combined.isEmpty) continue;
-
-          // Try to parse observations metadata.
-          Map<String, dynamic>? obs;
-          final rawObs = row['observations'];
-          if (rawObs is Map<String, dynamic>) {
-            obs = rawObs;
-          } else if (rawObs is String && rawObs.isNotEmpty) {
-            try {
-              final decoded = jsonDecode(rawObs);
-              if (decoded is Map<String, dynamic>) {
-                obs = decoded;
-              }
-            } catch (_) {
-              // ignore JSON parse errors, we'll just treat as no observations
-            }
-          }
-
-          final conversationMode =
-              (obs?['conversation_mode'] as String? ?? '').toLowerCase();
-          final isDev = (obs?['is_dev'] as bool?) ?? false;
-
-          // 1) Drop obvious dev / diagnostic sessions.
-          if (isDev) continue;
-
-          // 2) If we know the mode, keep only legacy storytelling sessions.
-          if (conversationMode.isNotEmpty &&
-              conversationMode != 'legacy') {
-            continue;
-          }
-
-          // 3) Heuristic: hide clearly technical summaries.
-          final lower = combined.toLowerCase();
-          const debugHints = [
-            'stt ',
-            'speech-to-text',
-            'coverage screen',
-            'coverage map',
-            'debug',
-            'ai-brain error',
-            'supabase',
-            'recognizer',
-            'jwt',
-          ];
-          bool looksDebug = false;
-          for (final hint in debugHints) {
-            if (lower.contains(hint)) {
-              looksDebug = true;
-              break;
-            }
-          }
-          if (looksDebug) continue;
-
-          // 4) Require at least a bit of narrative (e.g. ~6+ words).
-          if (combined.split(RegExp(r'\\s+')).length < 6) {
-            continue;
-          }
-
-          tmp.add(row);
-        }
-
-        // Only adopt the filtered subset if it leaves us with *something*.
-        if (tmp.isNotEmpty) {
-          filtered = tmp;
-        }
-      } catch (_) {
-        // If any error happens in the filtering logic, we safely fall back
-        // to showing all rows.
+      for (final row in rows) {
+        if (!_isLikelySessionSummaryRow(row)) continue;
+        final key = _sessionKeyForRow(row);
+        if (key == null) continue;
+        if (seen.containsKey(key)) continue;
+        seen[key] = row;
+        deduped.add(row);
       }
 
       setState(() {
-        _rows = filtered;
+        _rows = deduped;
         _loading = false;
       });
     } catch (e) {
       setState(() {
-        _error = 'Failed to load stories: $e';
         _loading = false;
+        _error = 'Failed to load stories: $e';
       });
     }
   }
@@ -204,188 +276,191 @@ class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Story library'),
+        title: GestureDetector(
+        onTap: () {
+          // Hidden developer toggle: tap title 7x to reveal panels.
+          _revealTapCount++;
+          if (_revealTapCount >= 7) {
+            setState(() {
+              _revealPanels = !_revealPanels;
+              _revealTapCount = 0;
+            });
+            _showSnack(_revealPanels
+                ? 'Reveal panels enabled (dev)'
+                : 'Reveal panels hidden');
+          }
+        },
+        child: const Text('Story Library'),
+      ),
         actions: [
           IconButton(
-            icon: const Icon(Icons.insights),
-            tooltip: 'View insights',
-            onPressed: () {
-              Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => const InsightsScreen(),
-                ),
-              );
-            },
+            tooltip: 'Refresh',
+            icon: const Icon(Icons.refresh),
+            onPressed: _loadStories,
           ),
         ],
       ),
-      body: RefreshIndicator(
-        onRefresh: _loadStories,
-        child: _loading
-            ? const Center(child: CircularProgressIndicator())
-            : _error != null
-                ? ListView(
-                    children: [
-                      Padding(
-                        padding: const EdgeInsets.all(16),
-                        child: Text(
-                          _error!,
-                          style: theme.textTheme.bodyMedium,
-                        ),
-                      ),
-                    ],
-                  )
-                : _rows.isEmpty
-                    ? ListView(
-                        children: const [
-                          Padding(
-                            padding: EdgeInsets.all(16),
-                            child: Text(
-                              'No memories saved yet.\n\n'
-                              'Record a story in legacy mode and it will appear here.',
-                            ),
-                          ),
-                        ],
-                      )
-                    : ListView.builder(
-                        itemCount: _rows.length,
-                        itemBuilder: (context, index) {
-                          final row = _rows[index];
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : (_error != null)
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Text(_error!, textAlign: TextAlign.center),
+                  ),
+                )
+              : (_rows.isEmpty)
+                  ? const Center(child: Text('No sessions yet.'))
+                  : ListView.builder(
+                      padding: const EdgeInsets.all(12),
+                      itemCount: _rows.length,
+                      itemBuilder: (context, index) {
+                        final row = _rows[index];
 
-                          final shortSummary =
-                              (row['short_summary'] as String? ?? '').trim();
-                          final fullSummary =
-                              (row['full_summary'] as String? ?? '').trim();
+                        final memorySummaryId =
+                            (row['id'] as String? ?? '').trim();
+                        final dateLabel = _dateLabelForRow(row);
 
-                          // Observations JSON may contain the session_key we use
-                          // to delete the correct memory_raw rows later.
-                          final obs =
-                              row['observations'] as Map<String, dynamic>?;
-                          final rawSessionKey =
-                              obs != null ? obs['session_key'] as String? : null;
-                          final sessionKey =
-                              (rawSessionKey ?? '').trim().isEmpty
-                                  ? null
-                                  : rawSessionKey!.trim();
+                        final shortSummary =
+                            (row['short_summary'] as String? ?? '').trim();
+                        final fullSummary =
+                            (row['full_summary'] as String? ?? '').trim();
 
-                          // Build a human-readable date label
-                          final createdAtStr =
-                              row['created_at'] as String? ?? '';
-                          String dateLabel = '';
-                          if (createdAtStr.isNotEmpty) {
-                            final createdAt =
-                                DateTime.tryParse(createdAtStr)?.toLocal();
-                            if (createdAt != null) {
-                              dateLabel =
-                                  '${createdAt.year}-${createdAt.month.toString().padLeft(2, '0')}-${createdAt.day.toString().padLeft(2, '0')} '
-                                  '${createdAt.hour.toString().padLeft(2, '0')}:${createdAt.minute.toString().padLeft(2, '0')}';
-                            } else {
-                              dateLabel = createdAtStr;
-                            }
-                          }
+                        final sessionSummary = (shortSummary.isNotEmpty
+                            ? shortSummary
+                            : (fullSummary.isNotEmpty
+                                ? fullSummary
+                                : '(No session summary yet)'));
 
-                          // What we show as the preview text in the list.
-                          // Prefer the short_summary as a compact, story-like title.
-                          String preview;
-                          if (shortSummary.isNotEmpty) {
-                            preview = shortSummary;
-                          } else if (fullSummary.isNotEmpty) {
-                            preview = fullSummary;
-                          } else {
-                            preview = '(Tap to curate this session)';
-                          }
-                          if (preview.length > 160) {
-                            preview = '${preview.substring(0, 160)}…';
-                          }
+                        final obs = _asJsonMap(row['observations']);
+                        final rawSessionKey =
+                            (obs?['session_key'] as String? ?? '').trim();
 
-                          // Fallbacks for the session detail screen
-                          final fallbackTitle = shortSummary.isNotEmpty
-                              ? shortSummary
-                              : (fullSummary.isNotEmpty
-                                  ? fullSummary.split('\n').first
-                                  : (dateLabel.isNotEmpty
-                                      ? dateLabel
-                                      : 'Legacy session'));
+                        // For transcript, we MUST use memory_raw.conversation_id.
+                        final convId =
+                            (row['conversation_id'] as String? ?? '').trim();
+                        final transcriptConversationId =
+                            convId.isNotEmpty ? convId : rawSessionKey;
+                        final rawIdSeed = (row['raw_id'] as String? ?? '').trim();
 
-                          final fallbackBody = fullSummary.isNotEmpty
-                              ? fullSummary
-                              : (shortSummary.isNotEmpty
-                                  ? shortSummary
-                                  : '(No summary yet for this session.)');
+                        final highlights = _buildHighlightBullets(row);
+                        final sessionInsights = row['session_insights'];
 
-                          // --- Session insights badge (chips) ---
-                          final rawSi = row['session_insights'];
-                          final chips = _buildInsightsChips(rawSi);
-
-                          return Card(
-                            elevation: 1,
-                            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                            child: InkWell(
-                              borderRadius: BorderRadius.circular(12),
-                              onTap: () async {
-                                final changed = await Navigator.of(context).push<bool>(
-                                  MaterialPageRoute(
-                                    builder: (_) => StoryDetailScreen(
-                                      memorySummaryId: row['id'] as String,
-                                      sessionKey: sessionKey,
-                                      dateLabel: dateLabel.isNotEmpty ? dateLabel : 'Session',
-                                      fallbackTitle: fallbackTitle,
-                                      fallbackBody: fallbackBody,
-                                      shortSummary: shortSummary,
-                                      fullSummary: fullSummary,
-                                      sessionInsights: rawSi,
-                                    ),
-                                  ),
-                                );
-
-                                if (changed == true) {
-                                  _loadStories();
-                                }
-                              },
-                              child: Padding(
-                                padding: const EdgeInsets.all(12),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    // Top row: title + chevron
-                                    Row(
-                                      crossAxisAlignment: CrossAxisAlignment.start,
-                                      children: [
-                                        Expanded(
-                                          child: Text(
-                                          preview,
-                                          style: Theme.of(context).textTheme.titleMedium,
-                                        ),
-                                      ),
-                                      const SizedBox(width: 8),
-                                      const Icon(Icons.chevron_right),
-                                    ],
-                                  ),
-
-                                  if (dateLabel.isNotEmpty) ...[
-                                    const SizedBox(height: 6),
-                                    Text(
-                                      dateLabel,
-                                      style: Theme.of(context).textTheme.bodySmall,
-                                    ),
-                                  ],
-
-                                  // Insight chips row
-                                  if (chips is! SizedBox) ...[
-                                    const SizedBox(height: 10),
-                                    chips,
-                                  ],
-                                ],
+                        void openDetail() {
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (_) => StoryDetailScreen(
+                                memorySummaryId: memorySummaryId,
+                                sessionKey: rawSessionKey.isNotEmpty
+                                    ? rawSessionKey
+                                    : null,
+                                dateLabel: dateLabel,
+                                fallbackTitle: dateLabel,
+                                fallbackBody: sessionSummary,
+                                shortSummary: shortSummary,
+                                fullSummary: fullSummary,
+                                sessionInsights: sessionInsights,
                               ),
+                            ),
+                          );
+                        }
+
+                        return Card(
+                          margin: const EdgeInsets.only(bottom: 12),
+                          child: Padding(
+                            padding: const EdgeInsets.all(14),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                if (_revealPanels)
+                                  Text(
+                                    sessionSummary,
+                                    style: theme.textTheme.bodyMedium,
+                                  )
+                                else
+                                  Text(
+                                    'Session saved.',
+                                    style: theme.textTheme.bodyMedium,
+                                  ),
+                                const SizedBox(height: 10),
+
+                                // (2) Insight chip (tap opens detail)
+                                _buildInsightsChip(
+                                  theme: theme,
+                                  sessionInsights: sessionInsights,
+                                  onTap: openDetail,
+                                ),
+
+                                // (3) Bullets
+                                if (highlights.isNotEmpty) ...[
+                                  const SizedBox(height: 10),
+                                  for (final h in highlights)
+                                    Padding(
+                                      padding:
+                                          const EdgeInsets.only(bottom: 4),
+                                      child: Row(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          const Text('•  '),
+                                          Expanded(child: Text(h)),
+                                        ],
+                                      ),
+                                    ),
+                                ],
+
+                                const SizedBox(height: 10),
+
+                                // (4) + (5) chips
+                                Wrap(
+                                  spacing: 10,
+                                  runSpacing: 6,
+                                  children: [
+                                    ActionChip(
+                                      label: const Text('Edit summary'),
+                                      onPressed: openDetail,
+                                    ),
+                                    ActionChip(
+                                      label: const Text('Edit transcript'),
+                                      onPressed: () async {
+                                        final conv =
+                                            transcriptConversationId.trim();
+                                        if (conv.isEmpty) {
+                                          _showSnack(
+                                              'No conversation_id found for this session transcript.');
+                                          return;
+                                        }
+                                        await Navigator.of(context).push(
+                                          MaterialPageRoute(
+                                            builder: (_) => TranscriptScreen(
+                                              sessionKey: conv,
+                                               rawIdSeed: rawIdSeed,
+                                              dateLabel: dateLabel.isNotEmpty
+                                                  ? dateLabel
+                                                  : 'Session',
+                                            ),
+                                          ),
+                                        );
+                                      },
+                                    ),
+                                  ],
+                                ),
+
+                                const SizedBox(height: 10),
+                                Text(
+                                  'Session: $dateLabel',
+                                  style: theme.textTheme.bodySmall,
+                                ),
+                              ],
                             ),
                           ),
                         );
                       },
-                     ),
-      ),
+                    ),
     );
   }
 }
+
 
 class StoryDetailScreen extends StatefulWidget {
   final String memorySummaryId;
@@ -421,12 +496,38 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
   bool _loading = true;
   bool _saving = false;
   bool _deleting = false;
+  // Controls whether "reveal" panels (insights/seeds) are visible in this screen.
+  // Default is false to keep donor UX clean.
+  bool _revealPanels = false;
+
   String? _error;
+
+  // ---------------------------------------------------------------------------
+  // Story seeds (per-session "named stories") + longitudinal insights
+  // ---------------------------------------------------------------------------
+  bool _loadingSeeds = false;
+  String? _seedError;
+  List<Map<String, dynamic>> _storySeeds = const [];
+
+  bool _loadingLongInsights = false;
+  String? _longInsightsError;
+  List<Map<String, dynamic>> _latestInsights = const [];
 
   @override
   void initState() {
     super.initState();
     _loadCuratedOrSummary();
+    _kickoffSideLoads();
+  }
+
+  void _kickoffSideLoads() {
+    // Story seeds are per-session (conversation_id == observations.session_key).
+    final sk = (widget.sessionKey ?? '').trim();
+    if (sk.isNotEmpty) {
+      _loadStorySeedsForSession(sk);
+    }
+    // Longitudinal insights are cross-session (latest N for this user).
+    _loadLatestLongitudinalInsights();
   }
 
   Widget _buildSessionInsightsSection(ThemeData theme) {
@@ -504,16 +605,10 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
 
             final prefix = kind.isNotEmpty ? '${kind.toUpperCase()}: ' : '';
             return Padding(
-              padding: const EdgeInsets.only(bottom: 6),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('•  '),
-                  Expanded(child: Text('$prefix$text')),
-                ],
-              ),
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Text("• $prefix$text"),
             );
-          }),
+            }),
         ],
       ],
     ),
@@ -597,6 +692,268 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
     );
   }
 
+  // ---------------------------------------------------------------------------
+  // Story seeds + longitudinal insights loaders
+  // ---------------------------------------------------------------------------
+  Future<void> _loadStorySeedsForSession(String conversationId) async {
+    final user = _client.auth.currentUser;
+    if (user == null) return;
+
+    setState(() {
+      _loadingSeeds = true;
+      _seedError = null;
+    });
+
+    try {
+      final res = await _client
+          .from('story_seeds')
+          .select('id, title, seed_type, seed_json, created_at, conversation_id, summary_id')
+          .eq('user_id', user.id)
+          .eq('conversation_id', conversationId)
+          .order('created_at', ascending: false);
+
+      final list = <Map<String, dynamic>>[];
+      if (res is List) {
+        for (final row in res) {
+          if (row is Map) {
+            list.add(Map<String, dynamic>.from(row as Map));
+          }
+        }
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _storySeeds = list;
+        _loadingSeeds = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loadingSeeds = false;
+        _seedError = 'Failed to load story seeds: $e';
+      });
+    }
+  }
+
+  Future<void> _loadLatestLongitudinalInsights() async {
+    final user = _client.auth.currentUser;
+    if (user == null) return;
+
+    setState(() {
+      _loadingLongInsights = true;
+      _longInsightsError = null;
+    });
+
+    try {
+      final res = await _client
+          .from('memory_insights')
+          .select(
+            'id, short_title, insight_text, insight_type, confidence, tags, created_at, source_session_ids',
+          )
+          .eq('user_id', user.id)
+          .order('created_at', ascending: false)
+          .limit(6);
+
+      final list = <Map<String, dynamic>>[];
+      if (res is List) {
+        for (final row in res) {
+          if (row is Map) list.add(Map<String, dynamic>.from(row as Map));
+        }
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _latestInsights = list;
+        _loadingLongInsights = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loadingLongInsights = false;
+        _longInsightsError = 'Failed to load insights: $e';
+      });
+    }
+  }
+
+  String _seedOneLiner(Map<String, dynamic> seed) {
+    // Try a few common fields inside seed_json
+    final sj = seed['seed_json'];
+    Map<String, dynamic>? m;
+    if (sj is Map<String, dynamic>) {
+      m = sj;
+    } else if (sj is String && sj.trim().isNotEmpty) {
+      try {
+        final decoded = jsonDecode(sj);
+        if (decoded is Map) m = Map<String, dynamic>.from(decoded as Map);
+      } catch (_) {}
+    }
+
+    final candidates = <String>[
+      (m?['key_sentence'] as String?) ?? '',
+      (m?['summary'] as String?) ?? '',
+      (m?['one_liner'] as String?) ?? '',
+      (m?['what_happened'] as String?) ?? '',
+      (m?['story'] as String?) ?? '',
+    ];
+
+    for (final c in candidates) {
+      final t = c.trim();
+      if (t.isNotEmpty) return t;
+    }
+    return '';
+  }
+
+  Widget _buildStorySeedsSection(ThemeData theme) {
+    final sk = (widget.sessionKey ?? '').trim();
+    if (sk.isEmpty) return const SizedBox.shrink();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'Stories identified in this session',
+          style: theme.textTheme.titleMedium,
+        ),
+        const SizedBox(height: 8),
+
+        if (_loadingSeeds)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 8),
+            child: Center(child: CircularProgressIndicator()),
+          )
+        else if (_seedError != null)
+          Text(
+            _seedError!,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: theme.colorScheme.error,
+            ),
+          )
+        else if (_storySeeds.isEmpty)
+          Text(
+            'No story seeds found yet for this session.',
+            style: theme.textTheme.bodyMedium,
+          )
+        else
+          ..._storySeeds.take(10).map((s) {
+            final title = ((s['title'] as String?) ?? '').trim();
+            final seedType = ((s['seed_type'] as String?) ?? '').trim();
+            final oneLiner = _seedOneLiner(s);
+            return Card(
+              margin: const EdgeInsets.only(bottom: 10),
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            title.isNotEmpty ? title : '(Untitled story)',
+                            style: theme.textTheme.titleSmall?.copyWith(
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                        if (seedType.isNotEmpty)
+                          Chip(
+                            visualDensity: VisualDensity.compact,
+                            materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            label: Text(seedType),
+                          ),
+                      ],
+                    ),
+                    if (oneLiner.isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      Text(oneLiner, style: theme.textTheme.bodyMedium),
+                    ],
+                  ],
+                ),
+              ),
+            );
+          }).toList(),
+
+        const SizedBox(height: 12),
+      ],
+    );
+  }
+
+  Widget _buildLongitudinalInsightsSection(ThemeData theme) {
+    if (!_revealPanels) return const SizedBox.shrink();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'Insights over time (latest)',
+          style: theme.textTheme.titleMedium,
+        ),
+        const SizedBox(height: 8),
+
+        if (_loadingLongInsights)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 8),
+            child: Center(child: CircularProgressIndicator()),
+          )
+        else if (_longInsightsError != null)
+          Text(
+            _longInsightsError!,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: theme.colorScheme.error,
+            ),
+          )
+        else if (_latestInsights.isEmpty)
+          Text(
+            'No insights found yet.',
+            style: theme.textTheme.bodyMedium,
+          )
+        else
+          ..._latestInsights.take(6).map((it) {
+            final title = ((it['short_title'] as String?) ?? '').trim();
+            final text = ((it['insight_text'] as String?) ?? '').trim();
+            final kind = ((it['insight_type'] as String?) ?? '').trim();
+
+            return Card(
+              margin: const EdgeInsets.only(bottom: 10),
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            title.isNotEmpty ? title : '(Insight)',
+                            style: theme.textTheme.titleSmall?.copyWith(
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                        if (kind.isNotEmpty)
+                          Chip(
+                            visualDensity: VisualDensity.compact,
+                            materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            label: Text(kind),
+                          ),
+                      ],
+                    ),
+                    if (text.isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      Text(text, style: theme.textTheme.bodyMedium),
+                    ],
+                  ],
+                ),
+              ),
+            );
+          }).toList(),
+
+        const SizedBox(height: 12),
+      ],
+    );
+  }
+
+
+
   Future<void> _saveCurated() async {
     final user = _client.auth.currentUser;
     if (user == null) {
@@ -624,7 +981,7 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
           'memory_summary_id': widget.memorySummaryId,
           'curated_text': trimmed,
         },
-        onConflict: 'user_id, memory_summary_id',
+        onConflict: 'user_id,memory_summary_id',
       );
 
       // 2) Update memory_summary.full_summary so downstream systems see curated text
@@ -767,73 +1124,79 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
                     style: theme.textTheme.bodyMedium,
                   ),
                 )
-              : Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      _buildSessionInsightsSection(theme),
-                      Text(
-                        'Your story for this session',
-                        style: theme.textTheme.titleMedium,
-                      ),
-                      const SizedBox(height: 8),
-                      Expanded(
-                        child: TextField(
-                          controller: _controller,
-                          maxLines: null,
-                          minLines: 8,
-                          decoration: const InputDecoration(
-                            border: OutlineInputBorder(),
-                            alignLabelWithHint: true,
-                          ),
-                          style: theme.textTheme.bodyMedium,
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      if (_error != null) ...[
+              : Builder(
+                  builder: (context) {
+                    final bottomInset = MediaQuery.of(context).viewInsets.bottom;
+                    final h = MediaQuery.of(context).size.height;
+                    final editorH = (h * 0.32).clamp(180.0, 360.0);
+                    return ListView(
+                      padding: EdgeInsets.fromLTRB(16, 16, 16, 16 + bottomInset),
+                      children: [
+                        _buildSessionInsightsSection(theme),
+                        _buildStorySeedsSection(theme),
+                        _buildLongitudinalInsightsSection(theme),
                         Text(
-                          _error!,
-                          style: theme.textTheme.bodyMedium?.copyWith(
-                            color: theme.colorScheme.error,
-                          ),
+                          'Your story for this session',
+                          style: theme.textTheme.titleMedium,
                         ),
                         const SizedBox(height: 8),
-                      ],
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          TextButton.icon(
-                            onPressed: _deleting ? null : _deleteSession,
-                            icon: _deleting
-                                ? const SizedBox(
-                                    width: 16,
-                                    height: 16,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                    ),
-                                  )
-                                : const Icon(Icons.delete_outline),
-                            label: const Text('Delete'),
+                        SizedBox(
+                          height: editorH,
+                          child: TextField(
+                            controller: _controller,
+                            maxLines: null,
+                            expands: true,
+                            keyboardType: TextInputType.multiline,
+                            decoration: const InputDecoration(
+                              border: OutlineInputBorder(),
+                              alignLabelWithHint: true,
+                            ),
+                            style: theme.textTheme.bodyMedium,
                           ),
-                          ElevatedButton.icon(
-                            onPressed: _saving ? null : _saveCurated,
-                            icon: _saving
-                                ? const SizedBox(
-                                    width: 16,
-                                    height: 16,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                    ),
-                                  )
-                                : const Icon(Icons.save),
-                            label: const Text('Save curated story'),
+                        ),
+                        const SizedBox(height: 16),
+                        if (_error != null) ...[
+                          Text(
+                            _error!,
+                            style: theme.textTheme.bodyMedium?.copyWith(
+                              color: theme.colorScheme.error,
+                            ),
                           ),
+                          const SizedBox(height: 12),
                         ],
-                      ),
-                    ],
-                  ),
-                ),
+                        Wrap(
+                          spacing: 12,
+                          runSpacing: 8,
+                          alignment: WrapAlignment.end,
+                          children: [
+                            TextButton.icon(
+                              onPressed: _deleting ? null : _deleteSession,
+                              icon: _deleting
+                                  ? const SizedBox(
+                                      width: 16,
+                                      height: 16,
+                                      child: CircularProgressIndicator(strokeWidth: 2),
+                                    )
+                                  : const Icon(Icons.delete_outline),
+                              label: const Text('Delete'),
+                            ),
+                            ElevatedButton.icon(
+                              onPressed: _saving ? null : _saveCurated,
+                              icon: _saving
+                                  ? const SizedBox(
+                                      width: 16,
+                                      height: 16,
+                                      child: CircularProgressIndicator(strokeWidth: 2),
+                                    )
+                                  : const Icon(Icons.save),
+                              label: const Text('Save curated story'),
+                            ),
+                          ],
+                        ),
+                      ],
+                    );
+                  },
+                )
     );
   }
 }
@@ -859,6 +1222,16 @@ class _MemoryEditorScreenState extends State<MemoryEditorScreen> {
   late TextEditingController _controller;
   bool _saving = false;
 
+  String _uuidV4() {
+    final rnd = Random.secure();
+    final bytes = List<int>.generate(16, (_) => rnd.nextInt(256));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 10
+    String hx(int b) => b.toRadixString(16).padLeft(2, '0');
+    final s = bytes.map(hx).join();
+    return '${s.substring(0, 8)}-${s.substring(8, 12)}-${s.substring(12, 16)}-${s.substring(16, 20)}-${s.substring(20)}';
+  }
+
   @override
   void initState() {
     super.initState();
@@ -871,35 +1244,103 @@ class _MemoryEditorScreenState extends State<MemoryEditorScreen> {
     super.dispose();
   }
 
+
   Future<void> _save() async {
     setState(() {
       _saving = true;
     });
 
     try {
-      // 1) Update the memory text and mark as user-edited
+      final user = _client.auth.currentUser;
+      if (user == null) {
+        throw Exception('You must be logged in to save edits.');
+      }
+
+      final edited = _controller.text.trim();
+      if (edited.isEmpty) {
+        throw Exception('Edit cannot be empty.');
+      }
+
+      // 1) Persist directly to memory_raw (authoritative transcript)
       await _client
           .from('memory_raw')
-          .update({
-            'content': _controller.text,
-            'user_edited': true,
-          })
+          .update({'content': edited})
+          .eq('user_id', user.id)
           .eq('id', widget.memoryId);
 
-      // 2) Fire-and-forget: rebuild insights for this user
+      // 2) Best-effort: also log into memory_raw_edits (do NOT block save if this fails)
       try {
-        final user = _client.auth.currentUser;
-        if (user != null) {
-          await _client.functions
-              .invoke('rebuild-insights', body: {'user_id': user.id});
-        }
+        await _client
+            .from('memory_raw_edits')
+            .update({
+              'is_current': false,
+              'superseded_at': DateTime.now().toIso8601String(),
+            })
+            .eq('user_id', user.id)
+            .eq('raw_id', widget.memoryId)
+            .eq('is_current', true);
+
+        final nowIso = DateTime.now().toIso8601String();
+        await _client.from('memory_raw_edits').insert({
+          'id': _uuidV4(),
+          'user_id': user.id,
+          'raw_id': widget.memoryId,
+          'edited_content': edited,
+          'editor_user_id': user.id,
+          'is_current': true,
+          'created_at': nowIso,
+        });
       } catch (e) {
-        // Don't block the save if insights rebuild fails
-        print('rebuild-insights failed after memory edit: $e');
+        // ignore: avoid_print
+        print('⚠️ memory_raw_edits logging failed (non-fatal): $e');
+      }
+
+      // Look up conversation_id (session key) for optional targeted rebuild
+      String? conversationId;
+      try {
+        final Map<String, dynamic>? row = await _client
+            .from('memory_raw')
+            .select('conversation_id')
+            .eq('user_id', user.id)
+            .eq('id', widget.memoryId)
+            .maybeSingle();
+        final convVal = row?['conversation_id'];
+        if (convVal is String && convVal.trim().isNotEmpty) {
+          conversationId = convVal.trim();
+        }
+      } catch (_) {
+        // ignore
+      }
+
+      // 3) Best-effort: rebuild only this session summary (preferred).
+      if (conversationId != null && conversationId!.isNotEmpty) {
+        try {
+          await _client.functions.invoke(
+            'rebuild-session-summary',
+            body: {'user_id': user.id, 'conversation_id': conversationId},
+          );
+        } catch (e) {
+          final msg = e.toString();
+          if (!(msg.contains('NOT_FOUND') || msg.contains('404'))) {
+            // ignore: avoid_print
+            print('rebuild-session-summary failed after edit: $e');
+          }
+        }
+      } else {
+        // Fallback: previous behavior (heavier) if we couldn't identify session
+        try {
+          await _client.functions.invoke(
+            'rebuild-insights',
+            body: {'user_id': user.id},
+          );
+        } catch (e) {
+          // ignore: avoid_print
+          print('rebuild-insights failed after memory edit: $e');
+        }
       }
 
       if (!mounted) return;
-      Navigator.of(context).pop(true);
+      Navigator.of(context).pop(edited);
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -907,9 +1348,12 @@ class _MemoryEditorScreenState extends State<MemoryEditorScreen> {
           content: Text('Failed to save memory: $e'),
         ),
       );
-      setState(() {
-        _saving = false;
-      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _saving = false;
+        });
+      }
     }
   }
 
@@ -1103,6 +1547,176 @@ class _InsightsScreenState extends State<InsightsScreen> {
                         },
                       ),
       ),
+    );
+  }
+}
+
+
+
+class TranscriptScreen extends StatefulWidget {
+  final String sessionKey;
+  final String dateLabel;
+  final String? rawIdSeed;
+
+  const TranscriptScreen({
+    super.key,
+    required this.sessionKey,
+    required this.dateLabel,
+    this.rawIdSeed,
+  });
+
+  @override
+  State<TranscriptScreen> createState() => _TranscriptScreenState();
+}
+
+class _TranscriptScreenState extends State<TranscriptScreen> {
+  final SupabaseClient _client = Supabase.instance.client;
+  bool _loading = true;
+  String? _error;
+  final List<Map<String, dynamic>> _rows = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  void _showSnack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    final user = _client.auth.currentUser;
+    if (user == null) {
+      setState(() {
+        _loading = false;
+        _error = 'Not logged in.';
+      });
+      return;
+    }
+
+    try {
+      // First try: use the passed key as memory_raw.conversation_id
+      List<dynamic> res = await _client
+          .from('memory_raw')
+          .select('id, content, source, created_at, conversation_id')
+          .eq('user_id', user.id)
+          .eq('conversation_id', widget.sessionKey)
+          .order('created_at', ascending: true);
+
+      // Fallback: if nothing found and we have a raw_id seed, look up the real conversation_id
+      if ((res as List).isEmpty && widget.rawIdSeed != null && widget.rawIdSeed!.isNotEmpty) {
+        final seedRes = await _client
+            .from('memory_raw')
+            .select('conversation_id')
+            .eq('user_id', user.id)
+            .eq('id', widget.rawIdSeed!)
+            .maybeSingle();
+
+        final conv = (seedRes is Map<String, dynamic>)
+            ? (seedRes['conversation_id'] as String? ?? '').trim()
+            : '';
+
+        if (conv.isNotEmpty) {
+          res = await _client
+              .from('memory_raw')
+              .select('id, content, source, created_at, conversation_id')
+              .eq('user_id', user.id)
+              .eq('conversation_id', conv)
+              .order('created_at', ascending: true);
+        }
+      }
+
+
+      final list = (res as List<dynamic>? ?? <dynamic>[])
+          .map((e) => e as Map<String, dynamic>)
+          .toList();
+
+      setState(() {
+        _rows
+          ..clear()
+          ..addAll(list);
+        _loading = false;
+      });
+    } catch (e) {
+      setState(() {
+        _loading = false;
+        _error = 'Failed to load transcript: $e';
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.dateLabel),
+      ),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : (_error != null)
+              ? Center(child: Text(_error!))
+              : ListView.builder(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                  itemCount: _rows.length,
+                  itemBuilder: (context, i) {
+                    final r = _rows[i];
+                    final rawId = (r['id'] as String?) ?? '';
+                    final text = (r['content'] as String? ?? '').trim();
+                    final src = (r['source'] as String? ?? '').trim();
+
+                    if (rawId.isEmpty) return const SizedBox.shrink();
+
+                    return Card(
+                      margin: const EdgeInsets.only(bottom: 10),
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: Text(
+                                    src.isEmpty ? 'Turn' : src,
+                                    style: Theme.of(context).textTheme.bodySmall,
+                                  ),
+                                ),
+                                IconButton(
+                                  tooltip: 'Edit this turn',
+                                  icon: const Icon(Icons.edit),
+                                  onPressed: () async {
+                                    final updated = await Navigator.of(context).push<String>(
+                                      MaterialPageRoute(
+                                        builder: (_) => MemoryEditorScreen(
+                                          memoryId: rawId,
+                                          initialText: text,
+                                          dateLabel: widget.dateLabel,
+                                        ),
+                                      ),
+                                    );
+                                    if (updated != null) {
+                                      _showSnack('Saved.');
+                                      _load();
+                                    }
+                                  },
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 6),
+                            Text(text),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
     );
   }
 }

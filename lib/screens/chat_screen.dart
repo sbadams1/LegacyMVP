@@ -1,3 +1,5 @@
+library chat_screen;
+
 // lib/screens/chat_screen.dart
 //
 // Legacy app chat UI
@@ -32,8 +34,16 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:video_player/video_player.dart';
 
 import '../services/ai_brain_service.dart';
+import '../prompts/media_followup_prompts.dart';
 import 'settings_screen.dart';
 import 'story_library_screen.dart';
+
+part 'chat_screen_models.dart';
+part 'chat_screen_coverage.dart';
+part 'chat_screen_video.dart';
+part 'chat_screen_audio.dart';
+part 'chat_screen_tts.dart';
+
 
 enum _TutorQuickAction {
   showProgress,
@@ -67,56 +77,6 @@ class ChatScreen extends StatefulWidget {
 }
 
 // In-memory message model for the chat UI
-class _ChatMessage {
-  final String id;
-  final String text;
-  final bool isUser;
-  final DateTime createdAt;
-
-  final String? imageUrl;
-  final String? videoUrl;
-
-  _ChatMessage({
-    required this.id,
-    required this.text,
-    required this.isUser,
-    required this.createdAt,
-    this.imageUrl,
-    this.videoUrl,
-  });
-}
-
-// TTS voice personalities – tone only (language is driven by profile locales)
-class _TtsVoiceOption {
-  final String id;
-  final String label;
-
-  /// Pitch for the synthesized voice (1.0 = neutral).
-  final double pitch;
-
-  /// Per-platform speech rate; normalized to avoid “3x speed” bug.
-  final double rateAndroid;
-  final double rateIOS;
-
-  const _TtsVoiceOption({
-    required this.id,
-    required this.label,
-    required this.pitch,
-    required this.rateAndroid,
-    required this.rateIOS,
-  });
-}
-
-// Bottom sheet result for language learning config
-class _LanguageLearningConfig {
-  final String targetLocale; // e.g. "th-TH"
-  final String learningLevel; // "beginner" | "intermediate" | "advanced"
-
-  const _LanguageLearningConfig({
-    required this.targetLocale,
-    required this.learningLevel,
-  });
-}
 
 class _ChatScreenState extends State<ChatScreen> {
   // UI controllers
@@ -170,8 +130,8 @@ class _ChatScreenState extends State<ChatScreen> {
   final FlutterTts _tts = FlutterTts();
 
   // These store the *last used* language codes (for logging / debugging / compatibility).
-  String _ttsLanguageCode = 'en-US';
-  String _sttLanguageCode = 'en-US';
+  String _ttsLanguageCode = WidgetsBinding.instance.platformDispatcher.locale.toLanguageTag();
+  String _sttLanguageCode = WidgetsBinding.instance.platformDispatcher.locale.toLanguageTag();
 
   /// Effective L1 ("native") language based on resolved preferences.
   /// This is language-agnostic: any valid locale (e.g. "es-ES", "ja-JP") works.
@@ -283,38 +243,75 @@ class _ChatScreenState extends State<ChatScreen> {
   /// Newer code paths use explicit [L1]/[L2] segments, but we keep this as a
   /// compatibility layer for any older callers.
   Future<void> _speakTextWithAutoLanguage(String text) async {
-    if (text.trim().isEmpty) return;
+  if (text.trim().isEmpty) return;
 
-    await _tts.awaitSpeakCompletion(true);
+  await _tts.awaitSpeakCompletion(true);
 
-    final matches = _languageSegmentRegex.allMatches(text);
+  final matches = _languageSegmentRegex.allMatches(text);
 
-    for (final match in matches) {
-      var segment = match.group(0)?.trim() ?? '';
-      if (segment.isEmpty) continue;
+  for (final match in matches) {
+    final rawSegment = match.group(0) ?? '';
+    var segment = rawSegment.trim();
+    if (segment.isEmpty) continue;
 
-      final langCode = _detectLangForSegment(segment);
+    // Detect explicit tags (we'll strip them before speaking).
+    final hasL1Tag = RegExp(r'(\[\s*L1\s*\])|\bL1\b', caseSensitive: false)
+        .hasMatch(segment);
+    final hasL2Tag = RegExp(r'(\[\s*L2\s*\])|\bL2\b', caseSensitive: false)
+        .hasMatch(segment);
 
-      // Only apply Thai cleanup when the segment is actually in Thai.
-      if (langCode.toLowerCase().startsWith('th')) {
-        segment = _cleanupThaiForTts(segment);
-        if (segment.isEmpty) continue;
+    // In language_learning mode, prefer speaking only the learner's target (L2).
+    // - If a segment is explicitly tagged L1 (and not L2), skip it.
+    // - If the target language is Thai, also skip any segment that lacks Thai script
+    //   (romanizations tend to get spelled letter-by-letter by many engines).
+    if ((_mode ?? '').toLowerCase() == 'language_learning') {
+    // In language_learning mode we speak both L1 and L2; cleanup below removes tags/romanization.
+
+      final target = (_targetLocale ?? '').toLowerCase();
+      if (target.startsWith('th')) {
+        final hasThai = _thaiCharRegex.hasMatch(segment);
+        if (!hasThai) continue;
       }
-
-      await _tts.setLanguage(langCode);
-      await _tts.speak(segment);
-
-      // Tiny pause (~50ms) between segments so language switches feel natural
-      await Future.delayed(const Duration(milliseconds: 50));
     }
+
+    // Strip L1/L2 tags and other meta markers BEFORE cleaning/detection.
+    segment = segment
+        .replaceAll(
+          RegExp(r'\[\s*L[12]\s*\]\s*', caseSensitive: false),
+          '',
+        )
+        .replaceAll(
+          RegExp(r'\bL[12]\b\s*[:\-–—]?\s*', caseSensitive: false),
+          '',
+        )
+        .trim();
+
+    // General cleanup (URLs, markdown, punctuation that gets read aloud, etc.)
+    segment = _cleanForTts(segment);
+    if (segment.isEmpty) continue;
+
+    final langCode = _detectLangForSegment(segment);
+
+    // Only apply Thai cleanup when the segment is actually in Thai.
+    if (langCode.toLowerCase().startsWith('th')) {
+      segment = _cleanupThaiForTts(segment);
+      if (segment.isEmpty) continue;
+    }
+
+    await _tts.setLanguage(langCode);
+    await _tts.speak(segment);
+
+    // Tiny pause (~50ms) between segments so language switches feel natural
+    await Future.delayed(const Duration(milliseconds: 50));
   }
+}
   // ---------------------------------------------------------------------------
   // Profile-based language preferences (for language-learning mode)
   // ---------------------------------------------------------------------------
 
   // Preferred/native language (L1) – from profiles.preferred_language
   // Stored as full locale (e.g. "en-US", "th-TH", "es-ES")
-    String _preferredLocale = 'en-US';
+    String _preferredLocale = WidgetsBinding.instance.platformDispatcher.locale.toLanguageTag();
 
   // Target language (L2) the user wants to learn – LOCAL ONLY (SharedPreferences)
     String? _targetLocale;
@@ -364,11 +361,15 @@ class _ChatScreenState extends State<ChatScreen> {
         _voiceOptions.firstWhere((v) => v.id == _selectedVoiceId);
 
     // Voice mode (chatbot vs silent)
-    String _voiceMode = 'silent';
+    String _voiceMode = 'chatbot';
     bool get _isChatbotMode => _voiceMode == 'chatbot';
 
     // Conversation mode: 'legacy' | 'language_learning'
     String _mode = 'legacy';
+
+  // Language-learning artifacts for the current turn/session
+  List<_LearningBlock> _learningBlocksCurrent = <_LearningBlock>[];
+
     bool get _isLegacyMode => _mode == 'legacy';
     bool get _isLanguageLearningMode => _mode == 'language_learning';
    
@@ -378,6 +379,7 @@ class _ChatScreenState extends State<ChatScreen> {
       _initRecorder();
       _loadMicPrefs();
       _initTts();
+      _ensureProfileLocaleDefaults(); 
       _loadProfileLanguagePrefs();
       _loadVoiceModePreference();
       _loadConversationModePreference();
@@ -396,6 +398,43 @@ class _ChatScreenState extends State<ChatScreen> {
     // ===========================================================================
     // UTILITY HELPERS
     // ===========================================================================
+
+    // -----------------------------------------------------------------------------
+  // Force an explicit end-session call to ai-brain (bypasses service layer)
+  // -----------------------------------------------------------------------------
+  Future<void> _invokeAiBrainEndSessionDirect() async {
+  final client = Supabase.instance.client;
+  final user = client.auth.currentUser;
+  if (user == null) return;
+
+  final String userId = user.id;
+
+  // IMPORTANT: use your existing conversation id variable here.
+  // If your file uses something else (e.g. _sessionKey), swap it in.
+  final String conversationId = _conversationId ?? 'default';
+
+  // IMPORTANT: use your existing mode variable here.
+  final String mode = _mode; // "legacy" / "language_learning" / "avatar"
+
+  final payload = <String, dynamic>{
+    'user_id': userId,
+    'conversation_id': conversationId,
+    'mode': mode,
+
+    // ✅ This is the critical bit
+    'end_session': true,
+
+    // Optional: keep server happy even if it expects message_text
+    'message_text': '__END_SESSION__',
+  };
+
+  try {
+    await client.functions.invoke('ai-brain', body: payload);
+  } catch (e) {
+    // Don’t crash UI
+    debugPrint('❌ End-session invoke failed: $e');
+  }
+  }
 
     void _showSnack(String msg) {
       if (!mounted) return;
@@ -526,36 +565,64 @@ class _ChatScreenState extends State<ChatScreen> {
       return '$mm:$ss';
     }
 
-    String _normalizeLocale(String? raw) {
-      if (raw == null || raw.trim().isEmpty) return 'en-US';
-      final val = raw.trim();
-      final lower = val.toLowerCase();
+    String _normalizeLocale(String? raw, {String fallback = ''}) {
+      final s = (raw ?? '').trim();
+      if (s.isEmpty) return fallback.isNotEmpty ? fallback : WidgetsBinding.instance.platformDispatcher.locale.toLanguageTag();
 
-      switch (lower) {
-        case 'en':
-        case 'en-us':
-          return 'en-US';
-        case 'en-gb':
-          return 'en-GB';
-        case 'th':
-        case 'th-th':
-          return 'th-TH';
-        case 'es':
-        case 'es-es':
-          return 'es-ES';
-        case 'fr':
-        case 'fr-fr':
-          return 'fr-FR';
-        case 'de':
-        case 'de-de':
-          return 'de-DE';
-        default:
-          final cleaned = lower.replaceAll('_', '-');
-          if (cleaned.contains('-')) return cleaned;
-          // Fallback: "it" -> "it-IT"
-          return '${cleaned}-${cleaned.toUpperCase()}';
-      }
+      // normalize separators
+      final norm = s.replaceAll('_', '-');
+
+      // If it’s a short language tag, map to a stable BCP-47 default.
+      final lower = norm.toLowerCase();
+      // (no hardcoded language mappings)
+      // (no hardcoded language mappings)
+      // (no hardcoded language mappings)
+
+      return norm;
     }
+
+    String _deviceLocaleBcp47() {
+      final loc = WidgetsBinding.instance.platformDispatcher.locale;
+      final lang = loc.languageCode.trim();
+      final country = (loc.countryCode ?? '').trim();
+      final raw = country.isEmpty ? lang : '$lang-$country';
+      return _normalizeLocale(raw);
+    }
+
+    Future<void> _ensureProfileLocaleDefaults() async {
+  final user = _client.auth.currentUser;
+  if (user == null) return;
+
+  final deviceTag =
+      WidgetsBinding.instance.platformDispatcher.locale.toLanguageTag();
+  final normalizedDevice = _normalizeLocale(deviceTag);
+
+  try {
+    final row = await _client
+        .from('profiles')
+        .select('preferred_language, device_locale')
+        .eq('id', user.id)
+        .maybeSingle();
+
+    final existingPref = (row is Map<String, dynamic>)
+        ? (row['preferred_language'] as String?)?.trim()
+        : null;
+
+    final patch = <String, dynamic>{
+      'id': user.id,
+      'device_locale': normalizedDevice,
+    };
+
+    if (existingPref == null || existingPref.isEmpty) {
+      patch['preferred_language'] = normalizedDevice;
+    }
+
+    await _client.from('profiles').upsert(patch);
+  } catch (e) {
+    // ignore: avoid_print
+    print('Failed to ensure profile locale defaults: $e');
+  }
+  }
 
   // ===========================================================================
   // PROFILE LANGUAGE PREFS
@@ -621,11 +688,39 @@ class _ChatScreenState extends State<ChatScreen> {
 
     // ------------------------------------------------------------------
     // 3) Apply defaults + normalize
+    //    If DB preferred_language is missing, fall back to device locale.
     // ------------------------------------------------------------------
-    final resolvedPref = _normalizeLocale(prefRaw ?? 'en-US');
-    final resolvedTarget = (targetRaw == null || targetRaw.isEmpty)
-        ? null
-        : _normalizeLocale(targetRaw);
+    final deviceTag =
+      WidgetsBinding.instance.platformDispatcher.locale.toLanguageTag();
+
+    final normalizedDevice = _normalizeLocale(deviceTag, fallback: '');
+
+    // DB pref if present, else device locale.
+    final resolvedPref = (prefRaw != null && prefRaw.trim().isNotEmpty)
+      ? _normalizeLocale(prefRaw, fallback: normalizedDevice)
+      : normalizedDevice;
+
+    final resolvedTarget = (targetRaw == null || targetRaw.trim().isEmpty)
+      ? null
+      : _normalizeLocale(targetRaw, fallback: '');
+
+    // Best-effort: persist device locale + preferred_locale if missing in DB.
+    // This prevents "en" (non-BCP47) from breaking STT later.
+    try {
+      final user = _client.auth.currentUser;
+      if (user != null) {
+        await _client.from('profiles').upsert({
+        'id': user.id,
+        'device_locale': _deviceLocaleBcp47(),
+        'preferred_locale': resolvedPref,
+        // keep preferred_language as-is if you want; or optionally also store short code:
+        // 'preferred_language': resolvedPref.split('-').first,
+        });
+      }
+    } catch (e) {
+    // ignore: avoid_print
+    print('Failed to persist device_locale/preferred_locale: $e');
+    }
 
     if (!mounted) return;
     setState(() {
@@ -640,6 +735,13 @@ class _ChatScreenState extends State<ChatScreen> {
 
       // Keep TTS aligned with the preferred/native language by default.
       _ttsLanguageCode = _preferredLocale;
+      // In language-learning mode, default the mic to the target language (L2) if available.
+      // This ensures Thai speech produces Thai script instead of English transliteration.
+      if (_isLanguageLearningMode && _hasTargetLanguage && (_targetLocale ?? '').trim().isNotEmpty) {
+        _speakingMode = 'target';
+        _sttLanguageCode = _targetLocale!;
+      }
+
     });
 
     // ignore: avoid_print
@@ -769,26 +871,16 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _handleEndSessionPressed() async {
+    // Let _sendTextMessage own the _isSending lifecycle.
     if (_isSending) return;
 
-    // For now, we only support explicit end-session for legacy interviews.
-    if (_mode != 'legacy') {
-      _showSnack('End session is only available in Legacy mode for now.');
-      return;
-    }
-
-    if (_conversationId == null) {
-      _showSnack('No active legacy session to end yet.');
-      return;
-    }
-
     await _sendTextMessage(
-      '__END_SESSION__', // non-empty so ai-brain never rejects it
-      showUserBubble: false,
+      "__END_SESSION__",
       endSession: true,
+      showUserBubble: false,
     );
 
-    _showSnack('Ending session and rebuilding coverage/insights...');
+    _showSnack("End session triggered.");
   }
 
   // ===========================================================================
@@ -935,6 +1027,12 @@ class _ChatScreenState extends State<ChatScreen> {
       _targetLocale = result.targetLocale;
       _learningLevel = result.learningLevel;
 
+      // If we're currently in Legacy mode, keep speech input in L1 even if a
+      // target language is configured.
+      if (_mode == 'legacy') {
+        _speakingMode = 'native';
+      }
+
       // Keep STT aligned with the current speaking mode
       if (_speakingMode == 'target' && _targetLocale != null) {
         _sttLanguageCode = _targetLocale!;
@@ -951,19 +1049,53 @@ class _ChatScreenState extends State<ChatScreen> {
       '💾 Local language-learning state: target="${_targetLocale}", level="${_learningLevel}", sttLang="$_sttLanguageCode"',
     );
 
-    // 2) Persist ONLY to SharedPreferences – no Supabase writes
+    // 2) Persist to SharedPreferences + Supabase profile (best-effort)
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('target_locale', result.targetLocale);
       await prefs.setString('learning_level', result.learningLevel);
-      // Optionally, if you ever let them change preferred language here:
-      // await prefs.setString('preferred_locale', _preferredLocale);
     } catch (e) {
       // ignore: avoid_print
       print('Failed to save language-learning prefs to SharedPreferences: $e');
     }
 
+    try {
+      final user = _client.auth.currentUser;
+      if (user != null) {
+        final normalizedTarget = _normalizeLocale(result.targetLocale);
+
+        await _client.from('profiles').upsert({
+          'id': user.id,
+          // keep your existing preferred_language as the source of truth for L1
+          'target_language': normalizedTarget,
+          'learning_level': result.learningLevel,
+          // keep supported_languages aligned since your loader uses it as default L2
+          'supported_languages': [normalizedTarget.split('-').first],
+        });
+      }
+    } catch (e) {
+      // ignore: avoid_print
+      print('Failed to save target_language/learning_level to Supabase: $e');
+    }
+
     _showSnack('Language learning settings updated.');
+
+    // 3) ALSO persist to Supabase profiles (so target_language / learning_level are not NULL)
+    try {
+      final user = _client.auth.currentUser;
+      if (user != null) {
+        await _client.from('profiles').upsert({
+        'id': user.id,
+        'target_language': result.targetLocale,     // keep your existing column name
+        'learning_level': result.learningLevel,     // keep your existing column name
+        'preferred_locale': _preferredLocale,       // STT-safe
+        'device_locale': _deviceLocaleBcp47(),
+        });
+      }
+    } catch (e) {
+    // ignore: avoid_print
+    print('Failed to persist language settings to profiles: $e');
+    }
   }
 
   // ===========================================================================
@@ -1026,14 +1158,53 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   String _cleanForTts(String text) {
-    // Remove markup-style characters that add no spoken value.
-    // Examples: *bold*, _italics_, ~~strikethrough~~, `code`
+    // Purpose: remove things that TTS engines tend to *read aloud* (URLs, markdown,
+    // code-ish punctuation), while preserving Thai script when present.
     var cleaned = text;
 
-    // Strip asterisks, underscores, tildes, backticks
+    // 0) Strip explicit language labels like "L1:" / "L2:" or "[L1]" / "[L2]".
+    cleaned = cleaned.replaceAll(RegExp(r'^\s*(?:\[\s*(?:L1|L2)\s*\]|(?:L1|L2))\s*[:\-–—]?\s*', caseSensitive: false, multiLine: true), '');
+    cleaned = cleaned.replaceAll(RegExp(r'\[\s*(?:L1|L2)\s*\]', caseSensitive: false), '');
+
+
+    // 1) Strip URLs (prevents "colon slash slash" and "slash" being spoken).
+    cleaned = cleaned.replaceAll(RegExp(r'https?:\/\/\S+'), '');
+
+    // 2) Convert markdown links: [label](url) -> label
+    cleaned = cleaned.replaceAllMapped(
+      RegExp(r'\[([^\]]+)\]\([^\)]+\)'),
+      (m) => m.group(1) ?? '',
+    );
+
+    // 3) Remove common markdown formatting tokens.
     cleaned = cleaned.replaceAll(RegExp(r'[*_~`]+'), '');
 
-    // Collapse multiple spaces that might be left behind
+    // 4) Replace slashes that join tokens (e.g., "L1/L2") with a space.
+    cleaned = cleaned.replaceAllMapped(
+      RegExp(r'([A-Za-z0-9])\/([A-Za-z0-9])'),
+      (m) => '${m.group(1)} ${m.group(2)}',
+    );
+
+    // 5) Replace remaining slashes / backslashes with a space.
+    cleaned = cleaned.replaceAll(RegExp(r'[\\/]+'), ' ');
+
+    // 6) Replace punctuation that some engines speak as words.
+    cleaned = cleaned
+        .replaceAll(RegExp(r'[!¡]'), '.')   // "exclamation mark"
+        .replaceAll('?', '.')               // "question mark"
+        .replaceAll(RegExp(r'[#@<>\[\]{}|^]+'), ' ')
+        .replaceAll(RegExp(r'[_=*]+'), ' ');
+
+    // 6b) Drop parenthetical/bracketed romanization/IPA chunks (Latin/IPA only).
+    // Example: "สวัสดี (sawatdee)" -> "สวัสดี"
+    //          "[tɕʰaːj]" -> ""
+    final romanParen = RegExp(r"\((?:[A-Za-z\s\-\u02BC\u02B9']+)\)");
+    cleaned = cleaned.replaceAll(romanParen, ' ');
+
+    final romanBrackets = RegExp(r"\[(?:[A-Za-z\s\-\u02BC\u02B9'ːˑˈˌ\u0250-\u02AF]+)\]");
+    cleaned = cleaned.replaceAll(romanBrackets, ' ');
+
+    // 7) Collapse whitespace.
     cleaned = cleaned.replaceAll(RegExp(r'\s{2,}'), ' ');
 
     return cleaned.trim();
@@ -1087,6 +1258,11 @@ String _stripThaiRomanizationFromL1(String text) {
   if (text.isEmpty) return text;
 
   var cleaned = text;
+
+    // 0) Strip explicit language labels like "L1:" / "L2:" or "[L1]" / "[L2]".
+    cleaned = cleaned.replaceAll(RegExp(r'^\s*(?:\[\s*(?:L1|L2)\s*\]|(?:L1|L2))\s*[:\-–—]?\s*', caseSensitive: false, multiLine: true), '');
+    cleaned = cleaned.replaceAll(RegExp(r'\[\s*(?:L1|L2)\s*\]', caseSensitive: false), '');
+
 
   // 1) Replace polite particles in parentheses with a generic phrase.
   //    Example:
@@ -1188,6 +1364,42 @@ String _stripRomanizationParens(String text) {
 
   return cleaned.replaceAll(RegExp(r'\s{2,}'), ' ').trim();
 }
+  // ---------------------------------------------------------------------------
+  // TTS HELPERS: ignore punctuation-only segments, strip leading punctuation, and
+  // split mixed-script text into ordered segments without re-ordering.
+  // ---------------------------------------------------------------------------
+  bool _isTtsIgnorable(String text) {
+    final t = text.trim();
+    if (t.isEmpty) return true;
+    // Punctuation-only tokens (common cause of TTS saying "dot").
+    if (RegExp(r'^[\.,;:!\?\-–—]+$').hasMatch(t)) return true;
+    return false;
+  }
+
+  String _stripLeadingPunctuation(String text) {
+    // Remove stray leading punctuation like '.' that can get spoken as "dot".
+    return text.replaceFirst(RegExp(r'^[\s\.,;:!\?\-–—]+'), '').trim();
+  }
+
+  List<Map<String, String>> _splitIntoOrderedTtsSegments(String text) {
+    final out = <Map<String, String>>[];
+    final matches = _languageSegmentRegex.allMatches(text);
+    for (final m in matches) {
+      var seg = (m.group(0) ?? '').trim();
+      if (seg.isEmpty) continue;
+      seg = _stripLeadingPunctuation(_cleanForTts(seg));
+      if (_isTtsIgnorable(seg)) continue;
+      final lang = _detectLangForSegment(seg);
+      // If this is Thai, apply Thai cleanup for TTS.
+      if (lang.toLowerCase().startsWith('th')) {
+        seg = _cleanupThaiForTts(seg);
+        if (seg.isEmpty) continue;
+      }
+      out.add({'lang': lang, 'text': seg});
+    }
+    return out;
+  }
+
 
   // ===========================================================================
   // TTS CLEANUP: strip trailing non-Thai parenthetical hints (e.g. "(û ì á)")
@@ -1247,17 +1459,16 @@ String _stripRomanizationParens(String text) {
   }
 
   Future<void> _playTtsForMessage(_ChatMessage msg) async {
-  // Respect global voice mode: no TTS in silent mode.
-  if (_voiceMode == 'silent') {
-    return;
-  }
+    // Respect global voice mode: no TTS in silent mode.
+    if (_voiceMode == 'silent') {
+      return;
+    }
 
-  final raw = msg.text.trim();
-  if (raw.isEmpty) return;
+    final raw = msg.text.trim();
+    if (raw.isEmpty) return;
 
-    // Clean markup/asterisks/backticks so they are never spoken.
-    final sanitizedRaw = _cleanForTts(raw);
-    if (sanitizedRaw.isEmpty) return;
+    // IMPORTANT: Do NOT run _cleanForTts() before segmentation, because it strips [L1]/[L2] tags.
+    final rawForSegmentation = raw;
 
     // We want to parse sequences like:
     // [L1] English text...
@@ -1268,227 +1479,194 @@ String _stripRomanizationParens(String text) {
     // tag up to the next tag.
     final List<Map<String, String>> segments = [];
     final segmentRegex = RegExp(r'\[([^\]]+)\]\s*([^[]*)');
-    final matches = segmentRegex.allMatches(sanitizedRaw);
+    final matches = segmentRegex.allMatches(rawForSegmentation).toList();
 
     // If there are NO [L1]/[L2]/[xx-YY] tags at all, fall back to the simpler
     // auto language splitter so the message is never completely silent.
     if (matches.isEmpty) {
-      debugPrint(
-          '🔊 No explicit tags found in reply; falling back to auto L1/L2 segmentation.');
+      final sanitizedRaw = _cleanForTts(raw);
+      if (sanitizedRaw.isEmpty) return;
+      debugPrint('🔊 No explicit tags found in reply; falling back to auto L1/L2 segmentation.');
       await _speakTextWithAutoLanguage(sanitizedRaw);
       return;
+    }
+
+    // Speak any leading untagged text (usually L1 explanation) as L1.
+    final firstStart = matches.first.start;
+    if (firstStart > 0) {
+      final leading = rawForSegmentation.substring(0, firstStart).trim();
+      final leadingFixed = _stripLeadingPunctuation(_cleanForTts(leading));
+      if (!_isTtsIgnorable(leadingFixed)) {
+        segments.add({'lang': _preferredLocale, 'text': leadingFixed});
+      }
     }
 
     // ------------------------------------------------------------------------
     // BUILD SEGMENTS
     // ------------------------------------------------------------------------
     for (final m in matches) {
-      final tag = (m.group(1) ?? '').trim();
-      final textPart = _cleanForTts((m.group(2) ?? ''));
-      if (textPart.isEmpty) continue;
-
-      final upper = tag.toUpperCase();
-
-      // 🔹 SPECIAL CASE: [L1] lines may contain Thai script mixed in.
-      // For TTS, we split that into:
-      //   - a pure L1 segment (spoken with the L1 voice)
-      //   - a pure L2 segment (spoken with the L2 voice)
-      if (upper == 'L1') {
-        final parts = _splitL1AndTargetScript(textPart);
-        var l1Text = (parts['l1'] ?? '').trim();
-        final l2Text = (parts['l2'] ?? '').trim();
-
-        // Extra guard: remove Thai polite particles written in Latin letters
-        // from L1 text so the L1 voice doesn't hit awkward silences.
-        l1Text = _stripThaiRomanizationFromL1(l1Text);
-
-        if (l1Text.isNotEmpty) {
-          segments.add({
-            'lang': _preferredLocale,
-            'text': l1Text,
-          });
-        }
-
-        if (l2Text.isNotEmpty) {
-          String l2Lang = _preferredLocale;
-          if (_hasTargetLanguage &&
-              _targetLocale != null &&
-              _targetLocale!.trim().isNotEmpty) {
-            l2Lang = _targetLocale!;
-          }
-          segments.add({
-            'lang': l2Lang,
-            'text': l2Text,
-          });
-        }
-
-        // We’ve fully handled this [L1] line; move on.
-        continue;
-      }
-
-      // Normal handling for [L2] or explicit locale tags.
-      String effectiveLang = _preferredLocale;
-
-      if (upper == 'L2') {
-        // L2 = target locale if available, else fall back to preferred
-        if (_hasTargetLanguage &&
-            _targetLocale != null &&
-            _targetLocale!.trim().isNotEmpty) {
-          effectiveLang = _targetLocale!;
-        } else {
-          effectiveLang = _preferredLocale;
-        }
-      } else {
-        // Assume locale-style tag, e.g. [en-US], [th-TH]
-        effectiveLang = tag;
-      }
-
-      // 🔹 NEW: If this segment is effectively "native" (L1) but contains Thai,
-      // split it the same way as [L1] so that Thai never shares the same
-      // segment as English.
-      final bool isNativeLang = (effectiveLang == _preferredLocale);
-      final bool hasThai = _thaiCharRegex.hasMatch(textPart);
-      final bool isThaiTarget =
-          _hasTargetLanguage &&
-          _targetLocale != null &&
-          _targetLocale!.toLowerCase().startsWith('th');
-
-      if (isNativeLang && isThaiTarget && hasThai) {
-        final parts = _splitL1AndTargetScript(textPart);
-        final l1Text = (parts['l1'] ?? '').trim();
-        final l2Text = (parts['l2'] ?? '').trim();
-
-        if (l1Text.isNotEmpty) {
-          segments.add({
-            'lang': _preferredLocale,
-            'text': l1Text,
-          });
-        }
-
-        if (l2Text.isNotEmpty) {
-          segments.add({
-            'lang': _targetLocale!,
-            'text': l2Text,
-          });
-        }
-
-        // We’ve re-routed this combined segment into separate L1/L2 segments.
-        continue;
-      }
-
-      // Default: just use the effective language as-is.
-      segments.add({
-        'lang': effectiveLang,
-        'text': textPart,
-      });
+    final tag = (m.group(1) ?? '').trim();
+    final textPart = _cleanForTts((m.group(2) ?? ''));
+    if (textPart.isEmpty) continue;
+    
+    final upper = tag.toUpperCase();
+    
+    // 🔹 SPECIAL CASE: [L1] lines may contain Thai script mixed in.
+    // For TTS, we split that into:
+    //   - a pure L1 segment (spoken with the L1 voice)
+    //   - a pure L2 segment (spoken with the L2 voice)
+    if (upper == 'L1') {
+      // Preserve the original in-line order (don’t bucket all L1 then all L2).
+      segments.addAll(_splitIntoOrderedTtsSegments(textPart));
+      continue;
     }
-
+    
+    // Normal handling for [L2] or explicit locale tags.
+    String effectiveLang = _preferredLocale;
+    
+    if (upper == 'L2') {
+    // L2 = target locale if available, else fall back to preferred
+    if (_hasTargetLanguage &&
+    _targetLocale != null &&
+    _targetLocale!.trim().isNotEmpty) {
+    effectiveLang = _targetLocale!;
+    } else {
+    effectiveLang = _preferredLocale;
+    }
+    } else {
+    // Assume locale-style tag, e.g. [en-US], [th-TH]
+    effectiveLang = tag;
+    }
+    
+    // 🔹 NEW: If this segment is effectively "native" (L1) but contains Thai,
+    // split it the same way as [L1] so that Thai never shares the same
+    // segment as English.
+    final bool isNativeLang = (effectiveLang == _preferredLocale);
+    final bool hasThai = _thaiCharRegex.hasMatch(textPart);
+    final bool isThaiTarget =
+    _hasTargetLanguage &&
+    _targetLocale != null &&
+    _targetLocale!.toLowerCase().startsWith('th');
+    
+    if (isNativeLang && isThaiTarget && hasThai) {
+      // Preserve original order for mixed-script native segments.
+      segments.addAll(_splitIntoOrderedTtsSegments(textPart));
+      continue;
+    }
+    
+    // Default: just use the effective language as-is.
+    segments.add({
+    'lang': effectiveLang,
+    'text': textPart,
+    });
+    }
+    
     if (segments.isEmpty) {
-      debugPrint('🔇 No TTS segments found after parsing tags.');
-      return;
+    debugPrint('🔇 No TTS segments found after parsing tags.');
+    return;
     }
-
+    
     // ------------------------------------------------------------------------
     // PLAY SEGMENTS
     // ------------------------------------------------------------------------
     try {
-      for (final seg in segments) {
-        final lang = seg['lang'] ?? _preferredLocale;
-        var text = seg['text'] ?? '';
-        text = text.trim();
-        if (text.isEmpty) continue;
-
-        // Never speak romanization-style parentheses.
-        text = _stripRomanizationParens(text);
-        if (text.isEmpty) {
-          debugPrint(
-              '🔊 Segment empty after stripping romanization; skipping.');
-          continue;
-        }
-
-        /// For L2 Thai segments:
-        /// - If there is no Thai script at all, treat it as pure romanization and drop it.
-        /// - Otherwise, strip all Latin letters so only Thai script and punctuation remain.
-        String _stripThaiRomanization(String text) {
-          if (text.isEmpty) return text;
-
-          // If there's NO Thai at all → pure romanization → drop entire segment.
-          if (!_thaiCharRegex.hasMatch(text)) {
-            return '';
-          }
-
-          final buffer = StringBuffer();
-
-          for (final rune in text.runes) {
-            final ch = String.fromCharCode(rune);
-
-            final bool isThai = _thaiCharRegex.hasMatch(ch);
-            final bool isAllowedPunctuation =
-                RegExp(r'[.,!?…\s/]').hasMatch(ch);
-
-            if (isThai || isAllowedPunctuation) {
-              buffer.write(ch);
-            }
-          }
-
-          var cleaned = buffer.toString();
-          cleaned = cleaned.replaceAll(RegExp(r'\s{2,}'), ' ');
-          return cleaned.trim();
-        }
-
-        // If this is an L2 Thai segment, strip all Latin letters so we speak
-        // only Thai script and punctuation.
-        final bool isThaiL2 =
-            _targetLocale != null &&
-            lang == _targetLocale &&
-            _targetLocale!.toLowerCase().startsWith('th');
-
-        if (isThaiL2) {
-          final strippedThai = _stripThaiRomanization(text);
-          if (strippedThai.isEmpty) {
-            debugPrint(
-                '🔊 L2 Thai segment empty after stripping romanization; skipping.');
-            continue;
-          }
-          text = strippedThai;
-        }
-
-        debugPrint('🔊 TTS segment → lang=$lang text="$text"');
-
-        // Configure TTS for this segment
-        try {
-          await _tts.setLanguage(lang);
-        } catch (e) {
-          debugPrint('TTS setLanguage error ($lang): $e');
-        }
-
-        // Use your current voice settings
-        try {
-          final v = _currentVoice;
-          if (Platform.isAndroid) {
-            await _tts.setSpeechRate(v.rateAndroid);
-          } else if (Platform.isIOS) {
-            await _tts.setSpeechRate(v.rateIOS);
-          }
-          await _tts.setPitch(v.pitch);
-        } catch (e) {
-          debugPrint('TTS voice config error: $e');
-        }
-
-        // Speak this segment and wait for it to finish
-        await _tts.stop();
-        await _tts.speak(text);
-        await _waitForTtsDone();
-
-        // Short pause between segments
-        await Future.delayed(const Duration(milliseconds: 150));
-      }
-    } catch (e) {
-      debugPrint('TTS error: $e');
-      _showSnack('Audio playback failed.');
+    for (final seg in segments) {
+    final lang = seg['lang'] ?? _preferredLocale;
+    var text = seg['text'] ?? '';
+    text = _stripLeadingPunctuation(text.trim());
+    if (_isTtsIgnorable(text)) continue;
+    
+    // Never speak romanization-style parentheses.
+    text = _stripRomanizationParens(text);
+    if (text.isEmpty) {
+    debugPrint(
+    '🔊 Segment empty after stripping romanization; skipping.');
+    continue;
     }
-  }
-
+    
+    /// For L2 Thai segments:
+    /// - If there is no Thai script at all, treat it as pure romanization and drop it.
+    /// - Otherwise, strip all Latin letters so only Thai script and punctuation remain.
+    String _stripThaiRomanization(String text) {
+    if (text.isEmpty) return text;
+    
+    // If there's NO Thai at all → pure romanization → drop entire segment.
+    if (!_thaiCharRegex.hasMatch(text)) {
+    return '';
+    }
+    
+    final buffer = StringBuffer();
+    
+    for (final rune in text.runes) {
+    final ch = String.fromCharCode(rune);
+    
+    final bool isThai = _thaiCharRegex.hasMatch(ch);
+    final bool isAllowedPunctuation =
+    RegExp(r'[.,!?…\s/]').hasMatch(ch);
+    
+    if (isThai || isAllowedPunctuation) {
+    buffer.write(ch);
+    }
+    }
+    
+    var cleaned = buffer.toString();
+    cleaned = cleaned.replaceAll(RegExp(r'\s{2,}'), ' ');
+    return cleaned.trim();
+    }
+    
+    // If this is an L2 Thai segment, strip all Latin letters so we speak
+    // only Thai script and punctuation.
+    final bool isThaiL2 =
+    _targetLocale != null &&
+    lang == _targetLocale &&
+    _targetLocale!.toLowerCase().startsWith('th');
+    
+    if (isThaiL2) {
+    final strippedThai = _stripThaiRomanization(text);
+    if (strippedThai.isEmpty) {
+    debugPrint(
+    '🔊 L2 Thai segment empty after stripping romanization; skipping.');
+    continue;
+    }
+    text = strippedThai;
+    }
+    
+    debugPrint('🔊 TTS segment → lang=$lang text="$text"');
+    
+    // Configure TTS for this segment
+    try {
+    await _tts.setLanguage(lang);
+    } catch (e) {
+    debugPrint('TTS setLanguage error ($lang): $e');
+    }
+    
+    // Use your current voice settings
+    try {
+    final v = _currentVoice;
+    if (Platform.isAndroid) {
+    await _tts.setSpeechRate(v.rateAndroid);
+    } else if (Platform.isIOS) {
+    await _tts.setSpeechRate(v.rateIOS);
+    }
+    await _tts.setPitch(v.pitch);
+    } catch (e) {
+    debugPrint('TTS voice config error: $e');
+    }
+    
+    // Speak this segment and wait for it to finish
+    // await _tts.stop(); // Avoid stopping between segments; it can cause choppy playback.
+    await _tts.speak(text);
+    await _waitForTtsDone();
+    
+    // Short pause between segments
+    await Future.delayed(const Duration(milliseconds: 150));
+    }
+    } catch (e) {
+    debugPrint('TTS error: $e');
+    _showSnack('Audio playback failed.');
+    }
+    }
+    
   Future<void> _showVoicePicker() async {
     final chosen = await showModalBottomSheet<String>(
       context: context,
@@ -1598,10 +1776,80 @@ String _stripRomanizationParens(String text) {
     }
   }
 
+  // Cleans AI reply text for display (and downstream TTS segmentation) by removing
+  // romanization-only clutter while keeping [L1]/[L2] content intact.
+  //
+  // Important: This is intentionally conservative—only removes:
+  //  - Lines starting with [ROM] (or ROM:) and similar romanization-only blocks
+  //  - A leading bracket-tag that looks like IPA/romanization (not a locale or L1/L2)
+  //  - Lines that contain IPA/combining marks and no Thai characters
+  String _cleanAiTextForChatBubble(String input) {
+    if (input.isEmpty) return input;
+
+    final thaiRegex = RegExp(r'[\u0E00-\u0E7F]');
+    final localeTagRegex = RegExp(r'^[a-z]{2}(-[A-Z]{2})?$'); // e.g. en, en-US
+    final allowedTags = <String>{'L1', 'L2', 'ROM'};
+
+    final lines = input.split('\n');
+    final out = <String>[];
+
+    for (var rawLine in lines) {
+      var line = rawLine;
+
+      // Trim only for checks; keep original spacing where possible.
+      final trimmed = line.trimLeft();
+
+      // Drop standalone romanization segments if the model emits them as their own lines.
+      if (trimmed.startsWith('[ROM]') || trimmed.startsWith('ROM:')) {
+        continue;
+      }
+
+      // If a line begins with a bracket tag, consider stripping that tag if it's "noise".
+      // Example noise: "[dtɔ̂ŋ náːm yùː tîː nǎi] ..."  (IPA / romanization)
+      final tagMatch = RegExp(r'^\s*\[([^\]]+)\]\s*').firstMatch(line);
+      if (tagMatch != null) {
+        final tag = (tagMatch.group(1) ?? '').trim();
+
+        final isAllowed = allowedTags.contains(tag.toUpperCase());
+        final looksLikeLocale = localeTagRegex.hasMatch(tag);
+
+        // Heuristic: treat as noise if it contains spaces or non-ASCII letters,
+        // and it's not one of our known tags or a locale code.
+        final hasSpaces = tag.contains(' ');
+        final hasNonAscii = tag.runes.any((r) => r > 127);
+        if (!isAllowed && !looksLikeLocale && (hasSpaces || hasNonAscii)) {
+          // Remove just the bracket tag, keep the remaining content.
+          line = line.replaceFirst(RegExp(r'^\s*\[[^\]]+\]\s*'), '');
+        }
+      }
+
+      // Drop lines that are romanization-only (IPA / combining marks) and contain no Thai.
+      // We keep normal English (ASCII) lines.
+      final hasThai = thaiRegex.hasMatch(line);
+      final hasCombining = RegExp(r'[\u0300-\u036F]').hasMatch(line); // combining diacritics
+      final hasIpa = RegExp(r'[\u0250-\u02AF]').hasMatch(line); // IPA extensions
+      if (!hasThai && (hasCombining || hasIpa)) {
+        // If it still looks like a romanized chunk (not a normal sentence), drop it.
+        // (Conservative: require at least 6 letters/spaces)
+        final plain = line.replaceAll(RegExp(r'[^A-Za-z\s]'), '');
+        if (plain.trim().length >= 6) continue;
+      }
+
+      out.add(line);
+    }
+
+    // Normalize excessive blank lines introduced by removals.
+    var joined = out.join('\n');
+    joined = joined.replaceAll(RegExp(r'\n{3,}'), '\n\n').trim();
+    return joined;
+  }
+
   void _addAiMessageAndMaybeSpeak(String text) {
+    final cleanedText = _cleanAiTextForChatBubble(text);
+
     final msg = _ChatMessage(
       id: UniqueKey().toString(),
-      text: text,
+      text: cleanedText,
       isUser: false,
       createdAt: DateTime.now(),
     );
@@ -1639,7 +1887,16 @@ String _stripRomanizationParens(String text) {
     await prefs.setString('conversation_mode', mode);
 
     if (!mounted) return;
-    setState(() => _mode = mode);
+    setState(() {
+      _mode = mode;
+
+      // In Legacy mode, the microphone should default to L1.
+      // This prevents L2 bias lingering from Language mode.
+      if (_mode == 'legacy') {
+        _speakingMode = 'native';
+        _sttLanguageCode = _preferredLocale;
+      }
+    });
     await _applyEffectiveTtsConfig();
   }
 
@@ -1671,6 +1928,26 @@ String _stripRomanizationParens(String text) {
       'Avatar mode: the AI will now answer as your future self using your recorded memories.',
     );
   }
+
+  void _openLearningHub() {
+  final user = _client.auth.currentUser;
+  if (user == null) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Not signed in.')),
+    );
+    return;
+  }
+
+  Navigator.of(context).push(
+    MaterialPageRoute(
+      builder: (_) => _LearningHubScreen(
+        client: _client,
+        userId: user.id,
+        currentBlocks: _learningBlocksCurrent,
+      ),
+    ),
+  );
+}
 
   void _openCoverageScreen() {
     Navigator.of(context).push(
@@ -1785,7 +2062,67 @@ String _stripRomanizationParens(String text) {
   // TEXT → AI BRAIN
   // ===========================================================================
 
-  void _handleSendPressed() async {
+  Future<void> _pinStorySeed() async {
+  final supabase = Supabase.instance.client;
+  final user = supabase.auth.currentUser;
+
+  if (user == null) {
+    _showSnack('You must be logged in to pin a story.');
+    return;
+  }
+
+  // Prefer current text input; fallback to last user message
+  String seedText = _textController.text.trim();
+
+  if (seedText.isEmpty) {
+    _ChatMessage? lastUserMsg;
+    for (int i = _messages.length - 1; i >= 0; i--) {
+      final m = _messages[i];
+      if (m.isUser && m.text.isNotEmpty) {
+        lastUserMsg = m;
+        break;
+      }
+    }
+
+if (lastUserMsg == null) {
+  _showSnack('Nothing to pin yet.');
+  return;
+}
+
+seedText = lastUserMsg.text.trim();
+
+  }
+
+  if (seedText.isEmpty) {
+    _showSnack('Nothing to pin.');
+    return;
+  }
+
+  final title = seedText.length > 60
+      ? '${seedText.substring(0, 57)}…'
+      : seedText;
+
+  try {
+    await supabase.from('story_seeds').insert({
+      'user_id': user.id,
+      'conversation_id': _conversationId, // adjust if your var name differs
+      'title': title,
+      'seed_text': seedText,
+      'tags': ['pinned', 'manual'],
+      'confidence': 0.95,
+    });
+
+    _showSnack('📌 Story pinned');
+
+    // Optional: clear input after pinning
+    _textController.clear();
+  } catch (e) {
+    _showSnack('Failed to pin story');
+    debugPrint('❌ pinStorySeed error: $e');
+  }
+}
+
+  Future<void> _handleSendPressed() async {
     final text = _textController.text.trim();
     _textController.clear();
     if (text.isEmpty) return;
@@ -1794,6 +2131,84 @@ String _stripRomanizationParens(String text) {
     await _sendTextMessage(text, showUserBubble: true);
   }
 
+String _derivePinnedTitle(String text) {
+  final t = text.trim().replaceAll(RegExp(r'\s+'), ' ');
+  if (t.isEmpty) return 'Pinned story';
+  // Prefer first sentence-ish chunk
+  final m = RegExp(r'^(.{1,80}?)([\.!?]|$)').firstMatch(t);
+  final candidate = (m?.group(1) ?? t).trim();
+  if (candidate.length <= 80) return candidate;
+  return '${candidate.substring(0, 77)}...';
+}
+
+Future<void> _handlePinPressed() async {
+  final user = _client.auth.currentUser;
+  if (user == null) {
+    _showSnack('Please sign in to pin stories.');
+    return;
+  }
+
+  final conversationId = _conversationId;
+  if (conversationId == null || conversationId.isEmpty) {
+    _showSnack('No active session to pin to yet.');
+    return;
+  }
+
+  // Prefer selected/typed text; fall back to the most recent user message.
+  String textToPin = _textController.text.trim();
+
+  if (textToPin.isEmpty) {
+    for (final m in _messages.reversed) {
+      if (m.isUser && m.text.trim().isNotEmpty) {
+        textToPin = m.text.trim();
+        break;
+      }
+    }
+  }
+
+  if (textToPin.isEmpty) {
+    _showSnack('Nothing to pin yet.');
+    return;
+  }
+
+  final title = _derivePinnedTitle(textToPin);
+
+  try {
+    await _client.from('story_seeds').insert({
+      'user_id': user.id,
+      'conversation_id': conversationId,
+      'title': title,
+      'seed_text': textToPin,
+      'canonical_facts': <String, dynamic>{},
+      'entities': <dynamic>[],
+      'tags': <String>['pinned', 'manual'],
+      'confidence': 0.95,
+      'source_raw_ids': <String>[],
+      'source_edit_ids': <String>[],
+    });
+
+    // Best-effort: refresh insights for this session so pinned stories surface quickly.
+    try {
+      await _client.functions.invoke(
+        'rebuild-insights',
+        body: {
+          'user_id': user.id,
+          'conversation_id': conversationId,
+          'mode': 'session',
+        },
+      );
+    } catch (_) {
+      // ignore: avoid_print
+      print('rebuild-insights failed after pin (non-fatal)');
+    }
+
+    _showSnack('Pinned as a story seed.');
+  } catch (e) {
+    debugPrint('❌ Pin insert failed: $e');
+    _showSnack('Could not pin story (check story_seeds RLS/policies).');
+  }
+}
+
   Future<void> _sendMetaCommand(String command) async {
     // Reuse the normal send pipeline, but we can keep this as a separate
     // helper in case we ever want to treat meta-commands differently.
@@ -1801,100 +2216,162 @@ String _stripRomanizationParens(String text) {
   }
 
   Future<void> _sendTextMessage(
-    String text, {
-    bool showUserBubble = true,
-    bool endSession = false,
-  }) async {
-    if (_isSending) return;
+  String text, {
+  bool showUserBubble = true,
+  bool endSession = false,
+}) async {
+  if (_isSending) return;
 
-    final user = _client.auth.currentUser;
-    if (user == null) {
-      _showSnack('You must be logged in.');
-      return;
-    }
+  final user = _client.auth.currentUser;
+  if (user == null) {
+    _showSnack('You must be logged in.');
+    return;
+  }
 
-    String trimmed = text.trim();
+  String trimmed = text.trim();
 
-    // Allow empty text only when we're explicitly ending the session.
-    if (!endSession && trimmed.isEmpty) return;
+  // Allow empty text only when we're explicitly ending the session.
+  if (!endSession && trimmed.isEmpty) return;
 
-    // Backend requires message_text to be present; for end-session,
-    // send a tiny placeholder but don't show a user bubble.
-    if (endSession && trimmed.isEmpty) {
-      trimmed = '__END_SESSION__';
-    }
+  // Backend requires message_text to be present; for end-session,
+  // send a tiny placeholder but don't show a user bubble.
+  if (endSession && trimmed.isEmpty) {
+    trimmed = '__END_SESSION__';
+    showUserBubble = false;
+  }
 
-    if (showUserBubble && trimmed.isNotEmpty) {
-      // Normal typed message: add user bubble with their actual text.
-      setState(() {
-        _messages.add(
-          _ChatMessage(
-            id: UniqueKey().toString(),
-            text: trimmed,
-            isUser: true,
-            createdAt: DateTime.now(),
-          ),
-        );
-      });
-      _scrollToBottom();
-    }
-
-    setState(() => _isSending = true);
-
-    try {
-      final wrapped = _buildModeWrappedPrompt(trimmed);
-
-      final result = await _aiBrain.askBrain(
-        message: wrapped,
-        mode: _mode,
-        preferredLocale: _preferredLocale,
-        targetLocale: _targetLocale,
-        learningLevel: _learningLevel,
-
-        // ✅ keep the same session across turns
-        conversationId: _conversationId,
-
-        stateJson:
-          _mode == 'language_learning' ? _languageStateJson : _legacyStateJson,
+  if (showUserBubble && trimmed.isNotEmpty) {
+    setState(() {
+      _messages.add(
+        _ChatMessage(
+          id: UniqueKey().toString(),
+          text: trimmed,
+          isUser: true,
+          createdAt: DateTime.now(),
+        ),
       );
+    });
+    _scrollToBottom();
+  }
 
-      final convId = result['conversation_id'] as String?;
-      if (convId != null && convId.isNotEmpty) {
+  setState(() => _isSending = true);
+
+  try {
+    final wrapped = _buildModeWrappedPrompt(trimmed);
+
+    final result = await _aiBrain.askBrain(
+      message: wrapped,
+      mode: _mode,
+      preferredLocale: _preferredLocale,
+      targetLocale: _targetLocale,
+      learningLevel: _learningLevel,
+
+      // ✅ keep the same session across turns
+      conversationId: _conversationId,
+
+      stateJson: _mode == 'language_learning'
+          ? _languageStateJson
+          : _legacyStateJson,
+
+      // ✅ CRITICAL: forward end-session flag through service layer
+      endSession: endSession,
+    );
+
+    final convId = result['conversation_id'] as String?;
+    if (convId != null && convId.isNotEmpty) {
+      if (mounted) {
+        setState(() => _conversationId = convId);
+      } else {
+        _conversationId = convId;
+      }
+    }
+
+    // --- Parse ai-brain response (supports both legacy keys and new contracts) ---
+    final bool serverEndSession = (result['end_session'] == true);
+
+    // Prefer reply_text, fallback to text (older service mapping)
+    final String aiTextRaw = ((result['reply_text'] ?? result['text']) ?? '').toString();
+    var aiText = aiTextRaw.trim();
+
+    // Parse learning artifacts (new contract)
+    _learningBlocksCurrent = <_LearningBlock>[];
+    final dynamic la = result['learning_artifacts'];
+    final dynamic blocks = (la is Map) ? la['blocks'] : null;
+    if (blocks is List) {
+      _learningBlocksCurrent = blocks
+          .where((b) => b is Map)
+          .map((b) => _LearningBlock.fromJson(b as Map))
+          .where((b) => b.content.trim().isNotEmpty)
+          .toList(growable: false);
+    }
+
+
+    // state_json may be a String (JSON) or Map; normalize to String?
+    String? newStateJson;
+    final dynamic sj = result['state_json'];
+    if (sj is String) {
+      newStateJson = sj;
+    } else if (sj is Map) {
+      newStateJson = jsonEncode(sj);
+    } else {
+      newStateJson = null;
+    }
+
+    // NEW DIRECTION: legacy should be free-form; ignore structured chapter routing.
+    if (_mode != 'language_learning') {
+      // Legacy/avatar: keep state_json as returned (or null). Do NOT force-clear here.
+      // (We already avoid using structured chapter routing in UI.)
+    }
+
+    // If end-session, do NOT add an AI chat bubble by default.
+    if (endSession || serverEndSession) {
+      final dynamic moment = result['insight_moment'];
+      final dynamic summary = result['end_session_summary'];
+
+      // Only show the "big reveal" UI if we actually have something to show.
+      final bool hasMoment = moment is Map && moment.isNotEmpty;
+      final bool hasSummary = summary is Map && summary.isNotEmpty;
+
+      if (hasMoment || hasSummary) {
         if (mounted) {
-          setState(() {
-            _conversationId = convId;
-          });
-        } else {
-          _conversationId = convId;
+          await _showEndSessionRevealSheet(
+            insightMoment: hasMoment ? Map<String, dynamic>.from(moment as Map) : null,
+            endSessionSummary: hasSummary ? Map<String, dynamic>.from(summary as Map) : null,
+          );
         }
+      } else {
+        _showSnack("Session saved.");
       }
 
-      var aiText = (result['text'] as String).trim();
-      final newStateJson = result['state_json'] as String?;
-
-      // If we have pronunciation feedback, append it in a readable way.
-      final pronLine = result['pronunciation_score_line'];
-      if (_mode == 'language_learning' &&
-          pronLine is String &&
-          pronLine.trim().isNotEmpty) {
-        aiText = '$aiText\n\n$pronLine';
-      }
-
+      // Persist state_json update (legacy cleared / language kept) and return.
       if (_mode == 'language_learning') {
         _languageStateJson = newStateJson;
       } else {
         _legacyStateJson = newStateJson;
       }
-
-      _addAiMessageAndMaybeSpeak(aiText);
-    } catch (e) {
-      _showSnack('AI communication error: $e');
-    } finally {
-      if (mounted) {
-        setState(() => _isSending = false);
-      }
+      return;
     }
+// If we have pronunciation feedback, append it in a readable way.
+    final pronLine = result['pronunciation_score_line'];
+    if (_mode == 'language_learning' &&
+        pronLine is String &&
+        pronLine.trim().isNotEmpty) {
+      aiText = '$aiText\n\n$pronLine';
+    }
+
+    if (_mode == 'language_learning') {
+      _languageStateJson = newStateJson;
+    } else {
+      _legacyStateJson = newStateJson;
+    }
+
+    _addAiMessageAndMaybeSpeak(aiText);
+  } catch (e) {
+    _showSnack('AI communication error: $e');
+  } finally {
+    if (mounted) setState(() => _isSending = false);
   }
+}
 
   // ===========================================================================
   // STT TEMP BUBBLE MANAGEMENT
@@ -1909,124 +2386,101 @@ String _stripRomanizationParens(String text) {
     });
   }
 
-// ===========================================================================
-// AUDIO → STT → (DRAFT) TEXT
-// ===========================================================================
-Future<void> _sendRecordingToSttAndChat() async {
-  if (_recordingPath == null) {
-    _showSnack('No recording found.');
-    return;
-  }
-
-  final file = File(_recordingPath!);
-  if (!await file.exists()) {
-    _showSnack('Recorded file missing.');
-    return;
-  }
-
-  final user = _client.auth.currentUser;
-  if (user == null) {
-    _showSnack('Not signed in; cannot send audio.');
-    return;
-  }
-
-  try {
-    final bytes = await file.readAsBytes();
-    final base64Audio = base64Encode(bytes);
-
-    if (mounted) {
-      setState(() {
-        _isTranscribing = true;
-      });
+  // ===========================================================================
+  // AUDIO → STT → (DRAFT) TEXT
+  // ===========================================================================
+  Future<void> _sendRecordingToSttAndChat() async {
+    if (_recordingPath == null) {
+      _showSnack('No recording found.');
+      return;
     }
 
-    // Determine current conversation mode once, so STT can behave differently.
-    // We want LEGACY to be as reliable as possible: L1-only, no auto-detect.
-    final String mode = _mode; // 'legacy' | 'language_learning' | 'avatar'
-    final bool isLegacyMode = mode == 'legacy';
+    final file = File(_recordingPath!);
+    if (!await file.exists()) {
+      _showSnack('Recorded file missing.');
+      return;
+    }
 
-    // PRIMARY STT LANGUAGE:
-    // - LEGACY: always listen in preferred/native language (L1) for reliability.
-    // - Other modes: respect the current speaking mode (_sttLanguageCode).
-    final String primaryCode =
-        isLegacyMode ? _preferredLocale : _sttLanguageCode;
+    final user = _client.auth.currentUser;
+    if (user == null) {
+      _showSnack('Not signed in; cannot send audio.');
+      return;
+    }
 
-    // Alternative codes:
-    // - For LEGACY, we pass NO alt codes (no auto-detect).
-    // - For language-learning / avatar, we include the "other side" so STT can
-    //   still auto-detect in those more advanced modes.
-    final altCodes = <String>{};
+    try {
+      final bytes = await file.readAsBytes();
+      final base64Audio = base64Encode(bytes);
 
-    if (!isLegacyMode) {
-      if (_targetLocale != null &&
-          _targetLocale!.isNotEmpty &&
-          _targetLocale != primaryCode) {
-        altCodes.add(_targetLocale!);
+      if (mounted) {
+        setState(() => _isTranscribing = true);
       }
 
-      if (_preferredLocale.isNotEmpty && _preferredLocale != primaryCode) {
-        altCodes.add(_preferredLocale);
+      // Mode + language routing
+      final mode = _mode; // 'legacy' | 'language_learning' | 'avatar'
+      final primaryCode = (mode == 'language_learning') ? _sttLanguageCode : _preferredLocale;
+
+      // Allow alternate languages ONLY in language_learning mode.
+      // In legacy/avatar/etc, listen exclusively in L1 to avoid cross-language mis-detection.
+      final altCodes = <String>{};
+      if (mode == 'language_learning') {
+        final pref = _preferredLocale.trim();
+        final targ = (_targetLocale ?? '').trim();
+
+        if (pref.isNotEmpty && pref != primaryCode) altCodes.add(pref);
+        if (targ.isNotEmpty && targ != primaryCode) altCodes.add(targ);
+      }
+final sttRes = await _client.functions.invoke(
+        'speech-to-text',
+        body: {
+          'user_id': user.id,
+          'audio_base64': base64Audio,
+          'mime_type': 'audio/aac',
+          'language_code': primaryCode,
+          'alt_language_codes': altCodes.toList(),
+        },
+      );
+
+      final data = sttRes.data;
+
+      if (data is Map && data['error'] != null) {
+        _showSnack('STT error: ${data['error']}');
+        return;
+      }
+
+      final transcript = (data is Map) ? (data['transcript'] as String?) : null;
+      if (transcript == null || transcript.trim().isEmpty) {
+        _showSnack('No transcript returned.');
+        return;
+      }
+
+      final trimmedTranscript = transcript.trim();
+      if (!mounted) return;
+
+      debugPrint(
+        'STT routing → mode=$mode (primary=$primaryCode, alt=${altCodes.toList()})',
+      );
+
+      // Push transcript into the text box (user can edit if desired).
+      setState(() {
+        _textController.text = trimmedTranscript;
+        _textController.selection = TextSelection.fromPosition(
+          TextPosition(offset: _textController.text.length),
+        );
+      });
+
+      // Auto-send STT to Gemini in ALL modes (including legacy).
+      // (Transcript is still placed in the text box first for visibility.)
+      await _handleSendPressed();
+      
+    } catch (e, st) {
+      debugPrint('STT error: $e\n$st');
+      _showSnack('Failed to transcribe audio: $e');
+    } finally {
+      if (mounted) {
+        setState(() => _isTranscribing = false);
       }
     }
-
-    final res = await _client.functions.invoke(
-      'speech-to-text',
-      body: {
-        'user_id': user.id,
-        'audio_base64': base64Audio,
-        'mime_type': 'audio/aac',
-        'language_code': primaryCode,
-        'alt_language_codes': altCodes.toList(),
-      },
-    );
-
-    final data = res.data;
-    if (data is! Map<String, dynamic>) {
-      _showSnack('STT returned unexpected data.');
-      return;
-    }
-
-    if (data['error'] != null) {
-      _showSnack('STT error: ${data['error']}');
-      return;
-    }
-
-    final transcript = data['transcript'] as String?;
-    if (transcript == null || transcript.trim().isEmpty) {
-      _showSnack('No transcript returned.');
-      return;
-    }
-
-    final trimmedTranscript = transcript.trim();
-    if (!mounted) return;
-
-    final isLanguageLearningMode = mode == 'language_learning';
-    final isAvatarMode = mode == 'avatar';
-
-    debugPrint(
-      'STT routing → mode=$mode '
-      '(legacy=$isLegacyMode, lang=$isLanguageLearningMode, avatar=$isAvatarMode, '
-      'primary=$primaryCode, alt=${altCodes.toList()})',
-    );
-
-    // FAST LOOP FOR ALL MODES:
-    // - LEGACY: STT (L1-only) → auto-send → Gemini
-    // - LANGUAGE-LEARNING + AVATAR: STT (L1/L2-aware) → auto-send → Gemini
-    await _sendTextMessage(trimmedTranscript);
-
-    // If you ever want a subtle toast here:
-    // _showSnack('Sent via voice input.');
-  } catch (e, st) {
-    debugPrint('STT error: $e\n$st');
-    _showSnack('Failed to transcribe audio: $e');
-  } finally {
-    if (mounted) {
-      setState(() {
-        _isTranscribing = false;
-      });
-    }
   }
-}
 
   // ===========================================================================
   // GOOGLE CLOUD STORAGE UPLOAD
@@ -2220,38 +2674,12 @@ Future<void> _sendRecordingToSttAndChat() async {
           _hasTargetLanguage ? _targetLocale! : _preferredLocale;
 
       // Build the text prompt that will be sent through _sendTextMessage.
-      final prompt = _isLanguageLearningMode
-          ? '''
-You are a patient language tutor.
-Respond primarily in "$targetLocale" (the learner’s target language).
-
-The learner has uploaded a photo.
-Internal description (do NOT repeat verbatim to the learner):
-${desc ?? "(No internal description available)"}.
-
-RULES:
-- The learner may use another language to talk about the photo or explain their goals.
-- Do NOT correct that meta/explanatory language unless they explicitly ask you to.
-- Focus on correcting and improving their attempts in the target language ("$targetLocale").
-
-INSTRUCTIONS:
-1) Briefly acknowledge the photo.
-2) Ask them, in the target language, to describe the photo in a very simple sentence.
-3) When they answer in the target language, you will gently correct and improve their sentences, and give short explanations if needed.
-
-Keep this first reply short, friendly, and not like a legacy interview.
-'''
-          : '''
-Respond ONLY in "$_preferredLocale" (the donor’s preferred language).
-
-The donor uploaded a photo.
-Internal description (do NOT repeat verbatim):
-${desc ?? "(No internal description available)"}.
-
-Warmly acknowledge receiving the photo, briefly mention what you understand,
-and invite them to share the story or meaning behind it.
-Keep your reply short and human.
-''';
+      final prompt = buildPhotoFollowupPrompt(
+        isLanguageLearningMode: _isLanguageLearningMode,
+        preferredLocale: _preferredLocale,
+        targetLocale: targetLocale,
+        internalDescription: desc,
+      );
 
       // Send the prompt to the AI brain via the central pipeline.
       // We already showed a "Photo uploaded." user bubble, so no extra user bubble here.
@@ -2307,38 +2735,12 @@ Keep your reply short and human.
           _hasTargetLanguage ? _targetLocale! : _preferredLocale;
 
       // Build the text prompt that will be sent through _sendTextMessage.
-      final prompt = _isLanguageLearningMode
-          ? '''
-You are a patient language tutor.
-Respond primarily in "$targetLocale" (the learner’s target language).
-
-The learner uploaded a short video.
-Internal description (do NOT repeat verbatim to the learner):
-${desc ?? "(No internal description available)"}.
-
-RULES:
-- The learner may use another language to talk about the video or explain their goals.
-- Do NOT correct that meta/explanatory language unless they explicitly ask you to.
-- Focus on correcting and improving their attempts in the target language ("$targetLocale").
-
-INSTRUCTIONS:
-1) Briefly acknowledge the video.
-2) Ask them, in the target language, to describe what is happening in one or two very simple sentences.
-3) When they answer in the target language, you will gently correct and improve their sentences, with short explanations if needed.
-
-Keep this first reply short, friendly, and clearly focused on language practice, not a life-story interview.
-'''
-          : '''
-Respond ONLY in "$_preferredLocale" (the donor’s preferred language).
-
-The donor uploaded a short video.
-Internal description (do NOT repeat verbatim):
-${desc ?? "(No internal description available)"}.
-
-Warmly acknowledge the video, mention what you infer in broad strokes,
-and invite the donor to talk about the story, context, or meaning.
-Keep it short and conversational.
-''';
+      final prompt = buildVideoFollowupPrompt(
+        isLanguageLearningMode: _isLanguageLearningMode,
+        preferredLocale: _preferredLocale,
+        targetLocale: targetLocale,
+        internalDescription: desc,
+      );
 
       // Send the prompt to the AI brain via the central pipeline.
       await _sendTextMessage(prompt, showUserBubble: false);
@@ -2357,7 +2759,7 @@ Keep it short and conversational.
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Legacy'),
+        title: Text(_mode == 'language_learning' ? 'Learning' : (_mode == 'avatar' ? 'Avatar' : 'Legacy')),
         actions: [
           // Conversation mode picker: legacy / language learning / avatar
           IconButton(
@@ -2365,6 +2767,14 @@ Keep it short and conversational.
             tooltip: 'Change conversation mode',
             onPressed: _showModePicker,
           ),
+
+          // Learning Hub (language-learning)
+          if (_mode == 'language_learning')
+            IconButton(
+              icon: const Icon(Icons.school),
+              tooltip: 'Learning hub',
+              onPressed: _openLearningHub,
+            ),
 
           // Voice mode toggle: chatbot vs silent
           IconButton(
@@ -2397,40 +2807,40 @@ Keep it short and conversational.
             icon: const Icon(Icons.more_horiz),
             tooltip: 'More options',
             onSelected: _handleMainMenuAction,
-          itemBuilder: (context) {
-            final items = <PopupMenuEntry<_MainMenuAction>>[
-              const PopupMenuItem<_MainMenuAction>(
-                value: _MainMenuAction.storyLibrary,
-                child: Text('Story Library'),
-              ),
-              const PopupMenuItem<_MainMenuAction>(
-                value: _MainMenuAction.coverage,
-                child: Text('Coverage Map'),
-              ),
-              const PopupMenuItem<_MainMenuAction>(
-                value: _MainMenuAction.endSession,
-                child: Text('End Session & Rebuild Insights'),
-              ),
-              const PopupMenuItem<_MainMenuAction>(
-                value: _MainMenuAction.settings,
-                child: Text('Settings'),
-              ),
-            ];
+            itemBuilder: (context) {
+              final items = <PopupMenuEntry<_MainMenuAction>>[
+                const PopupMenuItem<_MainMenuAction>(
+                  value: _MainMenuAction.storyLibrary,
+                  child: Text('Story Library'),
+                ),
+                const PopupMenuItem<_MainMenuAction>(
+                  value: _MainMenuAction.coverage,
+                  child: Text('Coverage Map'),
+                ),
+                const PopupMenuItem<_MainMenuAction>(
+                  value: _MainMenuAction.endSession,
+                  child: Text('End Session & Rebuild Insights'),
+                ),
+                const PopupMenuItem<_MainMenuAction>(
+                  value: _MainMenuAction.settings,
+                  child: Text('Settings'),
+                ),
+              ];
 
-            // Only show this option when language-learning mode is active.
-            if (_isLanguageLearningMode) {
-              items.insert(
-                2,
-              const PopupMenuItem<_MainMenuAction>(
-                value: _MainMenuAction.languageLearningSettings,
-                child: Text('Language learning settings'),
-              ),
-            );
-          }
+              // Only show this option when language-learning mode is active.
+              if (_isLanguageLearningMode) {
+                items.insert(
+                  2,
+                  const PopupMenuItem<_MainMenuAction>(
+                    value: _MainMenuAction.languageLearningSettings,
+                    child: Text('Language learning settings'),
+                  ),
+                );
+              }
 
-          return items;
-        },
-      ),
+              return items;
+            },
+          ),
 
           // Language-learning tutor tools (still separate; only visible in LL mode)
           if (_isLanguageLearningMode)
@@ -2561,15 +2971,15 @@ Keep it short and conversational.
     String _stripLeadingTagsForDisplay(String text) {
       final tagRegex = RegExp(r'^\[([^\]]+)\]\s*');
       final lines = text.split('\n');
+
       final cleaned = lines.map((line) {
-      final match = tagRegex.firstMatch(line);
-      if (match != null) {
-        return line.substring(match.end);
-      }
-      return line;
-    }).toList();
-    return cleaned.join('\n');
-  }
+        final match = tagRegex.firstMatch(line);
+        if (match != null) return line.substring(match.end);
+        return line;
+      }).toList();
+
+      return cleaned.join('\n');
+    }
 
   Widget _buildMessageList(ThemeData theme) {
     return ListView.builder(
@@ -2862,444 +3272,518 @@ Keep it short and conversational.
               ),
             ),
             const SizedBox(width: 8),
+
+            IconButton(
+              icon: const Icon(Icons.push_pin),
+              tooltip: 'Pin as story seed',
+              onPressed: _pinStorySeed,
+            ),
+
+            const SizedBox(width: 4),
+
             IconButton(
               onPressed: _isSending ? null : _handleSendPressed,
               icon: _isSending
-                  ? const SizedBox(
-                      height: 18,
-                      width: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.send),
+                ? const SizedBox(
+                width: 18,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : const Icon(Icons.send),
             ),
           ],
         ),
       ),
     );
   }
+
+  // ---------------------------------------------------------------------------
+// End Session: "Before you go" reveal sheet
+// ---------------------------------------------------------------------------
+Future<void> _showEndSessionRevealSheet({
+  Map<String, dynamic>? insightMoment,
+  Map<String, dynamic>? endSessionSummary,
+}) async {
+  if (!mounted) return;
+
+  // If there's literally nothing to show, don't present a reveal UI.
+  final hasMoment = insightMoment != null && insightMoment.isNotEmpty;
+  final hasSummary = endSessionSummary != null && endSessionSummary.isNotEmpty;
+  if (!hasMoment && !hasSummary) {
+    _showSnack('Session saved.');
+    return;
+  }
+
+  await showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+    ),
+    builder: (ctx) {
+      final header = (insightMoment?['header'] as String?)?.trim();
+      final bodyList = insightMoment?['body'];
+      final footnote = (insightMoment?['footnote'] as String?)?.trim();
+
+      final bodyLines = (bodyList is List)
+          ? bodyList.map((e) => e?.toString() ?? '').where((s) => s.trim().isNotEmpty).toList()
+          : <String>[];
+
+      return SafeArea(
+        child: Padding(
+          padding: EdgeInsets.only(
+            left: 16,
+            right: 16,
+            top: 14,
+            bottom: MediaQuery.of(ctx).viewInsets.bottom + 16,
+          ),
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Before you go…',
+                  style: Theme.of(ctx).textTheme.titleLarge,
+                ),
+                const SizedBox(height: 10),
+
+                if (hasMoment) ...[
+                  Text(
+                    (header?.isNotEmpty == true) ? header! : 'Something is becoming clearer',
+                    style: Theme.of(ctx).textTheme.titleMedium,
+                  ),
+                  const SizedBox(height: 10),
+                  for (final line in bodyLines) ...[
+                    Text(line, style: Theme.of(ctx).textTheme.bodyMedium),
+                    const SizedBox(height: 8),
+                  ],
+                  if (footnote?.isNotEmpty == true) ...[
+                    const SizedBox(height: 6),
+                    Text(footnote!, style: Theme.of(ctx).textTheme.bodySmall),
+                  ],
+                  const SizedBox(height: 14),
+                ],
+
+                if (hasSummary) ...[
+                  _buildEndSessionSummaryBlock(ctx, endSessionSummary!),
+                  const SizedBox(height: 14),
+                ],
+
+                Row(
+                  children: [
+                    Expanded(
+                      child: ElevatedButton(
+                        onPressed: () => Navigator.of(ctx).pop(),
+                        child: const Text('Done'),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    },
+  );
+}
+
+Widget _buildEndSessionSummaryBlock(BuildContext ctx, Map<String, dynamic> summary) {
+  String pickString(String key) {
+    final v = summary[key];
+    return v is String ? v.trim() : '';
+  }
+
+  final shortSummary = pickString('short_summary');
+  final fullSummary = pickString('full_summary');
+
+  // Some schemas use these as strings or lists—handle both safely.
+  final observations = summary['observations'];
+  final sessionInsights = summary['session_insights'];
+
+  String normalizeListish(dynamic v) {
+    if (v == null) return '';
+    if (v is String) return v.trim();
+    if (v is List) {
+      final lines = v.map((e) => e?.toString().trim() ?? '').where((s) => s.isNotEmpty).toList();
+      return lines.join('\n• ');
+    }
+    if (v is Map) return jsonEncode(v);
+    return v.toString();
+  }
+
+  final obsText = normalizeListish(observations);
+  final insText = normalizeListish(sessionInsights);
+
+  Widget section(String title, String body) {
+    if (body.trim().isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title, style: Theme.of(ctx).textTheme.titleSmall),
+          const SizedBox(height: 6),
+          Text(body, style: Theme.of(ctx).textTheme.bodyMedium),
+        ],
+      ),
+    );
+  }
+
+  return Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      if (shortSummary.isNotEmpty)
+        section('What we captured today', shortSummary),
+      if (fullSummary.isNotEmpty)
+        section('More detail', fullSummary),
+      if (obsText.isNotEmpty)
+        section('Notes', obsText.startsWith('• ') ? obsText : '• $obsText'),
+      if (insText.isNotEmpty)
+        section('What may be worth noticing', insText.startsWith('• ') ? insText : '• $insText'),
+    ],
+  );
+}
 }
 
 // ============================================================================
 // COVERAGE MAP SCREEN
 // ============================================================================
 
-class CoverageScreen extends StatelessWidget {
-  const CoverageScreen({super.key});
 
-  @override
-  Widget build(BuildContext context) {
-    final client = Supabase.instance.client;
-    final user = client.auth.currentUser;
+// ===========================================================================
+// Learning Hub UI (donor-wide history + search)
+// ===========================================================================
 
-    if (user == null) {
-      return Scaffold(
-        appBar: AppBar(title: const Text('Coverage')),
-        body: const Center(
-          child: Text('Please sign in to view coverage.'),
-        ),
-      );
-    }
+class _LearningBlock {
+  final String tag;
+  final String? title;
+  final String content;
 
-    return Scaffold(
-      appBar: AppBar(title: const Text('Coverage')),
-      body: _CoverageView(
-        supabase: client,
-        userId: user.id,
-      ),
+  const _LearningBlock({
+    required this.tag,
+    required this.content,
+    this.title,
+  });
+
+  factory _LearningBlock.fromJson(Map<dynamic, dynamic> json) {
+    return _LearningBlock(
+      tag: (json['tag'] ?? '').toString(),
+      title: json['title']?.toString(),
+      content: (json['content'] ?? '').toString(),
     );
   }
 }
 
-class _CoverageView extends StatefulWidget {
-  final SupabaseClient supabase;
-  final String userId;
+class _LearningSessionSummary {
+  final String id;
+  final DateTime createdAt;
+  final Map<String, int> counts;
 
-  const _CoverageView({
-    required this.supabase,
+  const _LearningSessionSummary({
+    required this.id,
+    required this.createdAt,
+    required this.counts,
+  });
+
+  factory _LearningSessionSummary.fromJson(Map<dynamic, dynamic> json) {
+    final created = DateTime.tryParse((json['created_at'] ?? '').toString()) ?? DateTime.fromMillisecondsSinceEpoch(0);
+    final countsRaw = json['counts_by_tag'];
+    final counts = <String, int>{};
+    if (countsRaw is Map) {
+      for (final e in countsRaw.entries) {
+        counts[e.key.toString()] = int.tryParse(e.value.toString()) ?? 0;
+      }
+    }
+    return _LearningSessionSummary(
+      id: (json['id'] ?? '').toString(),
+      createdAt: created,
+      counts: counts,
+    );
+  }
+}
+
+class _LearningHubScreen extends StatefulWidget {
+  final SupabaseClient client;
+  final String userId;
+  final List<_LearningBlock> currentBlocks;
+
+  const _LearningHubScreen({
+    super.key,
+    required this.client,
     required this.userId,
+    required this.currentBlocks,
   });
 
   @override
-  State<_CoverageView> createState() => _CoverageViewState();
+  State<_LearningHubScreen> createState() => _LearningHubScreenState();
 }
 
-class _CoverageViewState extends State<_CoverageView> {
-  Map<String, dynamic>? _coverage;
-  bool _loading = true;
-  String? _error;
+class _LearningHubScreenState extends State<_LearningHubScreen> with SingleTickerProviderStateMixin {
+  late final TabController _tabController;
+
+  final TextEditingController _searchCtl = TextEditingController();
+  String _tagFilter = 'ALL';
+  bool _loading = false;
+
+  List<_LearningSessionSummary> _sessions = const [];
+  List<Map<String, dynamic>> _searchHits = const [];
 
   @override
   void initState() {
     super.initState();
-    _loadCoverage();
-  }
-
-  Future<void> _loadCoverage() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
-
-    try {
-      final res = await widget.supabase
-          .from('coverage_map_json')
-          .select('data')
-          .eq('user_id', widget.userId)
-          .maybeSingle();
-
-      if (res == null) {
-        setState(() {
-          _coverage = null;
-          _loading = false;
-        });
-        return;
-      }
-
-      final data = res['data'];
-      if (data is Map<String, dynamic>) {
-        setState(() {
-          _coverage = data;
-          _loading = false;
-        });
-      } else {
-        setState(() {
-          _error = 'Unexpected coverage_map_json.data shape.';
-          _loading = false;
-        });
-      }
-    } catch (e) {
-      setState(() {
-        _error = 'Failed to load coverage: $e';
-        _loading = false;
-      });
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (_loading) {
-      return const Center(child: CircularProgressIndicator());
-    }
-
-    if (_error != null) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                'Error loading coverage',
-                style: Theme.of(context).textTheme.titleMedium,
-              ),
-              const SizedBox(height: 8),
-              Text(
-                _error!,
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 12),
-              ElevatedButton(
-                onPressed: _loadCoverage,
-                child: const Text('Retry'),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-
-    if (_coverage == null) {
-      return const Center(
-        child: Text(
-          'No coverage data yet.\nTry recording some legacy stories first.',
-          textAlign: TextAlign.center,
-        ),
-      );
-    }
-
-    final global = _coverage!['global'] as Map<String, dynamic>? ?? {};
-    final chapters = (_coverage!['chapters'] as Map?) ?? {};
-
-    final totalMemories = (global['total_memories'] ?? 0) as int;
-    final totalWords = (global['total_words_estimate'] ?? 0) as int;
-    final earliestYear = global['earliest_year'];
-    final latestYear = global['latest_year'];
-    final themes = (global['dominant_themes'] as List?) ?? const [];
-
-        // Define a sensible fixed order for chapters
-    const orderedKeys = [
-      'early_childhood',
-      'adolescence',
-      'early_adulthood',
-      'midlife',
-      'later_life',
-      'family_relationships',
-      'work_career',
-      'education',
-      'health_wellbeing',
-      'hobbies_interests',
-      'beliefs_values',
-      'major_events',
-    ];
-
-    final chapterEntries = chapters.entries
-        .where((e) => e.value is Map)
-        .map<Map<String, dynamic>>((e) {
-      final m = e.value as Map;
-      return {
-        'key': m['key'] ?? e.key,
-        'label': m['label'] ?? e.key,
-        'coverage_score': (m['coverage_score'] ?? 0.0) as num,
-        'memory_count': (m['memory_count'] ?? 0) as int,
-        'summary_snippet': m['summary_snippet'],
-      };
-    }).toList()
-      ..sort((a, b) {
-        final keyA = a['key'] as String;
-        final keyB = b['key'] as String;
-
-        final idxA = orderedKeys.indexOf(keyA);
-        final idxB = orderedKeys.indexOf(keyB);
-
-        // If both are in our known list, sort by that order
-        if (idxA != -1 && idxB != -1) {
-          return idxA.compareTo(idxB);
-        }
-        // If only one is known, known one comes first
-        if (idxA != -1) return -1;
-        if (idxB != -1) return 1;
-
-        // Fallback: alphabetical by label
-        return (a['label'] as String)
-            .toLowerCase()
-            .compareTo((b['label'] as String).toLowerCase());
-      });
-
-    final bottomInset = MediaQuery.of(context).padding.bottom;
-
-    return RefreshIndicator(
-      onRefresh: _loadCoverage,
-      child: ListView(
-        padding: EdgeInsets.fromLTRB(
-          16,
-          16,
-          16,
-          16 + bottomInset + 24, // extra cushion above Android nav bar
-        ),
-        children: [
-          _buildGlobalCard(
-            context,
-            totalMemories: totalMemories,
-            totalWords: totalWords,
-            earliestYear: earliestYear,
-            latestYear: latestYear,
-            themes: themes.cast<String>(),
-          ),
-          const SizedBox(height: 16),
-          Text(
-            'Chapters',
-            style: Theme.of(context).textTheme.titleLarge,
-          ),
-          const SizedBox(height: 8),
-          if (chapterEntries.isEmpty)
-            const Text('No chapters have coverage yet.')
-          else
-            ...chapterEntries.map((c) => _buildChapterCard(context, c)),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildGlobalCard(
-    BuildContext context, {
-    required int totalMemories,
-    required int totalWords,
-    dynamic earliestYear,
-    dynamic latestYear,
-    required List<String> themes,
-  }) {
-    final theme = Theme.of(context);
-
-    String timeSpan;
-    if (earliestYear == null && latestYear == null) {
-      timeSpan = 'Not enough data yet';
-    } else if (earliestYear == latestYear) {
-      timeSpan = 'Around $earliestYear';
-    } else {
-      timeSpan = '$earliestYear – $latestYear';
-    }
-
-    return Card(
-      elevation: 1,
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Your Life Story Coverage',
-              style: theme.textTheme.titleMedium,
-            ),
-            const SizedBox(height: 8),
-            Text('Memories captured: $totalMemories'),
-            Text('Estimated words recorded: $totalWords'),
-            Text('Time span covered: $timeSpan'),
-            const SizedBox(height: 8),
-            if (themes.isNotEmpty) ...[
-              Text(
-                'Dominant themes:',
-                style: theme.textTheme.bodyMedium!
-                    .copyWith(fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 4),
-              Wrap(
-                spacing: 6,
-                runSpacing: 4,
-                children: themes
-                    .map(
-                      (t) => Chip(
-                        label: Text(t),
-                        visualDensity: VisualDensity.compact,
-                      ),
-                    )
-                    .toList(),
-              ),
-            ] else
-              const Text('Themes: Not enough data yet'),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildChapterCard(
-    BuildContext context,
-    Map<String, dynamic> chapter,
-  ) {
-    final label = chapter['label'] as String? ?? chapter['key'] as String;
-    final score =
-        (chapter['coverage_score'] as num).toDouble().clamp(0.0, 1.0);
-    final memoryCount = chapter['memory_count'] as int? ?? 0;
-    final snippet = chapter['summary_snippet'] as String?;
-
-    final percent = (score * 100).round();
-
-    return Card(
-      margin: const EdgeInsets.symmetric(vertical: 6),
-      elevation: 0.5,
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              label,
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            const SizedBox(height: 4),
-            Row(
-              children: [
-                Expanded(
-                  child: LinearProgressIndicator(
-                    value: score,
-                    minHeight: 6,
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Text('$percent%'),
-              ],
-            ),
-            const SizedBox(height: 4),
-            Text('Memories in this chapter: $memoryCount'),
-            if (snippet != null && snippet.trim().isNotEmpty) ...[
-              const SizedBox(height: 4),
-              Text(
-                snippet,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                style: Theme.of(context)
-                    .textTheme
-                    .bodySmall
-                    ?.copyWith(color: Colors.grey),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ============================================================================
-// FULL-SCREEN VIDEO PLAYER
-// ============================================================================
-
-class VideoPlayerScreen extends StatefulWidget {
-  final String videoUrl;
-
-  const VideoPlayerScreen({super.key, required this.videoUrl});
-
-  @override
-  State<VideoPlayerScreen> createState() => _VideoPlayerScreenState();
-}
-
-class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
-  late VideoPlayerController _controller;
-  bool _ready = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = VideoPlayerController.network(widget.videoUrl)
-      ..initialize().then((_) {
-        if (!mounted) return;
-        setState(() => _ready = true);
-        _controller.play();
-      });
+    _tabController = TabController(length: 2, vsync: this, initialIndex: 1); // default to History
+    _loadRecentSessions();
   }
 
   @override
   void dispose() {
-    _controller.dispose();
+    _tabController.dispose();
+    _searchCtl.dispose();
     super.dispose();
+  }
+
+  Future<void> _loadRecentSessions() async {
+    setState(() => _loading = true);
+    try {
+      final res = await widget.client.rpc('list_learning_sessions', params: {
+        'p_limit': 50,
+        'p_offset': 0,
+      });
+
+      debugPrint('RPC list_learning_sessions result type=${res.runtimeType} value=$res');
+
+      // If your code expects a List<Map>, assert it:
+      if (res is! List) {
+        throw Exception('Expected List from list_learning_sessions, got: ${res.runtimeType}');
+      }
+
+      setState(() {
+        _sessions = _parseSessionSummaries(res);
+      });
+    } catch (e, st) {
+      debugPrint('❌ Learning Hub history load failed: $e\n$st');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Learning History error: $e')),
+        );
+      }
+    } finally {
+        if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  
+  List<_LearningSessionSummary> _parseSessionSummaries(dynamic data) {
+    final list = (data is List) ? data : const [];
+    final out = <_LearningSessionSummary>[];
+    for (final row in list) {
+      if (row is! Map) continue;
+      final m = Map<String, dynamic>.from(row);
+
+      final String id = (m['id'] ?? m['session_id'] ?? '').toString();
+      if (id.isEmpty) continue;
+
+      DateTime createdAt = DateTime.now();
+      final ca = m['created_at'] ?? m['createdAt'];
+      if (ca is String) {
+        createdAt = DateTime.tryParse(ca) ?? createdAt;
+      }
+
+      Map<String, int> counts = {};
+      final c = m['counts'] ?? m['counts_json'] ?? m['countsJson'];
+      if (c is Map) {
+        counts = c.map((k, v) => MapEntry(k.toString(), (v is num) ? v.toInt() : int.tryParse(v.toString()) ?? 0));
+      } else if (c is String) {
+        try {
+          final decoded = jsonDecode(c);
+          if (decoded is Map) {
+            counts = decoded.map((k, v) => MapEntry(k.toString(), (v is num) ? v.toInt() : int.tryParse(v.toString()) ?? 0));
+          }
+        } catch (_) {}
+      }
+
+      out.add(_LearningSessionSummary(id: id, createdAt: createdAt, counts: counts));
+    }
+    // newest first
+    out.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return out;
+  }
+
+Future<void> _runSearch() async {
+    final q = _searchCtl.text.trim();
+    if (q.isEmpty) {
+      setState(() => _searchHits = const []);
+      return;
+    }
+    setState(() => _loading = true);
+    try {
+      final data = await widget.client.rpc('search_learning_blocks', params: {
+        'p_query': q,
+        'p_tag': (_tagFilter == 'ALL') ? null : _tagFilter,
+        'p_limit': 50,
+        'p_offset': 0,
+      });
+
+      final list = (data is List) ? data : const [];
+      final hits = list
+          .whereType<Map>()
+          .map((m) => Map<String, dynamic>.from(m))
+          .toList(growable: false);
+
+      if (mounted) setState(() => _searchHits = hits);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Search failed: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Widget _buildCurrent() {
+    final blocks = widget.currentBlocks;
+    if (blocks.isEmpty) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(16),
+          child: Text('No learning items for this session yet.\n\nTip: Ask for a vocab list or a short drill.'),
+        ),
+      );
+    }
+    return ListView.separated(
+      padding: const EdgeInsets.all(12),
+      itemCount: blocks.length,
+      separatorBuilder: (_, __) => const SizedBox(height: 10),
+      itemBuilder: (context, i) {
+        final b = blocks[i];
+        return Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('[${b.tag}]', style: const TextStyle(fontWeight: FontWeight.bold)),
+                if (b.title != null && b.title!.trim().isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(b.title!, style: const TextStyle(fontWeight: FontWeight.w600)),
+                  ),
+                const SizedBox(height: 8),
+                Text(b.content),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildHistory() {
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            children: [
+              TextField(
+                controller: _searchCtl,
+                decoration: InputDecoration(
+                  labelText: 'Search learning history',
+                  suffixIcon: IconButton(
+                    icon: const Icon(Icons.search),
+                    onPressed: _runSearch,
+                  ),
+                ),
+                onSubmitted: (_) => _runSearch(),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  const Text('Tag:'),
+                  const SizedBox(width: 12),
+                  DropdownButton<String>(
+                    value: _tagFilter,
+                    items: const [
+                      DropdownMenuItem(value: 'ALL', child: Text('All')),
+                      DropdownMenuItem(value: 'LESSON', child: Text('Lesson')),
+                      DropdownMenuItem(value: 'VOCAB', child: Text('Vocab')),
+                      DropdownMenuItem(value: 'DRILL', child: Text('Drill')),
+                      DropdownMenuItem(value: 'QUIZ', child: Text('Quiz')),
+                      DropdownMenuItem(value: 'NOTES', child: Text('Notes')),
+                      DropdownMenuItem(value: 'ROM', child: Text('Rom')),
+                    ],
+                    onChanged: (v) {
+                      if (v == null) return;
+                      setState(() => _tagFilter = v);
+                    },
+                  ),
+                  const Spacer(),
+                  TextButton(
+                    onPressed: _loadRecentSessions,
+                    child: const Text('Refresh'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+        const Divider(height: 1),
+        if (_loading)
+          const LinearProgressIndicator(),
+        Expanded(
+          child: _searchHits.isNotEmpty
+              ? ListView.builder(
+                  itemCount: _searchHits.length,
+                  itemBuilder: (context, i) {
+                    final h = _searchHits[i];
+                    final tag = (h['tag'] ?? '').toString();
+                    final title = (h['title'] ?? '').toString();
+                    final content = (h['content'] ?? '').toString();
+                    return ListTile(
+                      title: Text('[$tag] ${title.isNotEmpty ? title : ''}'.trim()),
+                      subtitle: Text(content, maxLines: 3, overflow: TextOverflow.ellipsis),
+                    );
+                  },
+                )
+              : ListView.builder(
+                  itemCount: _sessions.length,
+                  itemBuilder: (context, i) {
+                    final s = _sessions[i];
+                    final counts = s.counts.entries.where((e) => e.value > 0).map((e) => '${e.key}:${e.value}').join('  ');
+                    return ListTile(
+                      title: Text('${s.createdAt.toLocal()}'),
+                      subtitle: Text(counts.isEmpty ? 'No blocks' : counts),
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.black,
       appBar: AppBar(
-        backgroundColor: Colors.black,
-        iconTheme: const IconThemeData(color: Colors.white),
-        title: const Text(
-          'Video',
-          style: TextStyle(color: Colors.white),
+        title: const Text('Learning Hub'),
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(text: 'This session'),
+            Tab(text: 'History'),
+          ],
         ),
       ),
-      body: Center(
-        child: _ready
-            ? AspectRatio(
-                aspectRatio: _controller.value.aspectRatio,
-                child: VideoPlayer(_controller),
-              )
-            : const CircularProgressIndicator(),
+      body: TabBarView(
+        controller: _tabController,
+        children: [
+          _buildCurrent(),
+          _buildHistory(),
+        ],
       ),
-      floatingActionButton: _ready
-          ? FloatingActionButton(
-              onPressed: () {
-                setState(() {
-                  _controller.value.isPlaying
-                      ? _controller.pause()
-                      : _controller.play();
-                });
-              },
-              child: Icon(
-                _controller.value.isPlaying
-                    ? Icons.pause
-                    : Icons.play_arrow,
-              ),
-            )
-          : null,
     );
   }
 }

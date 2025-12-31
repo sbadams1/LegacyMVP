@@ -11,7 +11,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.48.0";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+const SB_SECRET_KEY = Deno.env.get("SB_SECRET_KEY");
 const GEMINI_API_KEY =
   Deno.env.get("GEMINI_API_KEY") ?? Deno.env.get("GEMINI_API_KEY_EDGE");
 
@@ -19,16 +19,16 @@ const GEMINI_API_KEY =
 const GEMINI_AUDIO_MODEL =
   Deno.env.get("GEMINI_AUDIO_MODEL") ?? "models/gemini-1.5-pro-latest";
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("❌ SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not set.");
+if (!SUPABASE_URL || !SB_SECRET_KEY) {
+  console.error("❌ SUPABASE_URL or SB_SECRET_KEY is not set.");
 }
 
 if (!GEMINI_API_KEY) {
   console.error("❌ GEMINI_API_KEY / GEMINI_API_KEY_EDGE is not set.");
 }
 
-const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
-  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+const supabase = SUPABASE_URL && SB_SECRET_KEY
+  ? createClient(SUPABASE_URL, SB_SECRET_KEY, {
       auth: { persistSession: false },
     })
   : null;
