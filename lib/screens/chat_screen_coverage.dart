@@ -170,6 +170,7 @@ class _CoverageViewState extends State<_CoverageView> {
         'coverage_score': (m['coverage_score'] ?? 0.0) as num,
         'memory_count': (m['memory_count'] ?? 0) as int,
         'summary_snippet': m['summary_snippet'],
+        'word_count_estimate': (m['word_count_estimate'] ?? 0) as int,
       };
     }).toList()
       ..sort((a, b) {
@@ -193,6 +194,28 @@ class _CoverageViewState extends State<_CoverageView> {
             .compareTo((b['label'] as String).toLowerCase());
       });
 
+    // Chapter word distribution (proxy for 'time spent' per chapter)
+    final chapterWordTotal = chapterEntries.fold<int>(
+      0,
+      (sum, c) => sum + ((c['word_count_estimate'] ?? 0) as int),
+    );
+
+    final top5Chapters = <Map<String, dynamic>>[...chapterEntries]
+      ..sort((a, b) {
+        final wa = (a['word_count_estimate'] ?? 0) as int;
+        final wb = (b['word_count_estimate'] ?? 0) as int;
+        return wb.compareTo(wa);
+      });
+    final top5 = top5Chapters.take(5).map<Map<String, dynamic>>((c) {
+      final words = (c['word_count_estimate'] ?? 0) as int;
+      final pct = chapterWordTotal > 0 ? (words / chapterWordTotal) : 0.0;
+      return {
+        'label': c['label'],
+        'words': words,
+        'pct': pct,
+      };
+    }).toList();
+
     final bottomInset = MediaQuery.of(context).padding.bottom;
 
     return RefreshIndicator(
@@ -212,6 +235,8 @@ class _CoverageViewState extends State<_CoverageView> {
             earliestYear: earliestYear,
             latestYear: latestYear,
             themes: themes.cast<String>(),
+            topChapters: top5,
+            chapterWordTotal: chapterWordTotal,
           ),
           const SizedBox(height: 16),
           Text(
@@ -235,12 +260,14 @@ class _CoverageViewState extends State<_CoverageView> {
     dynamic earliestYear,
     dynamic latestYear,
     required List<String> themes,
+    required List<Map<String, dynamic>> topChapters,
+    required int chapterWordTotal,
   }) {
     final theme = Theme.of(context);
 
     String timeSpan;
     if (earliestYear == null && latestYear == null) {
-      timeSpan = 'Not enough data yet';
+      timeSpan = totalMemories > 0 ? 'Event years not captured yet' : 'Not enough data yet';
     } else if (earliestYear == latestYear) {
       timeSpan = 'Around $earliestYear';
     } else {
@@ -282,8 +309,25 @@ class _CoverageViewState extends State<_CoverageView> {
                     )
                     .toList(),
               ),
-            ] else
-              const Text('Themes: Not enough data yet'),
+            ],
+
+            const SizedBox(height: 12),
+            Text(
+              'Top chapters by words:',
+              style: theme.textTheme.bodyMedium!
+                  .copyWith(fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 6),
+            if (topChapters.isEmpty)
+              const Text('No chapter word counts yet.')
+            else
+              ...topChapters.map((c) {
+                final label = (c['label'] ?? 'Unknown') as String;
+                final words = (c['words'] ?? 0) as int;
+                final pct = (c['pct'] ?? 0.0) as double;
+                final pctStr = (pct * 100).toStringAsFixed(1);
+                return Text('• $label — $words words (~$pctStr%)');
+              }).toList(),
           ],
         ),
       ),

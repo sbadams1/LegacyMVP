@@ -34,6 +34,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:video_player/video_player.dart';
 
 import '../services/ai_brain_service.dart';
+import '../prompts/media_followup_prompts.dart';
 import 'settings_screen.dart';
 import 'story_library_screen.dart';
 
@@ -365,6 +366,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
     // Conversation mode: 'legacy' | 'language_learning'
     String _mode = 'legacy';
+
+  // Language-learning artifacts for the current turn/session
+  List<_LearningBlock> _learningBlocksCurrent = <_LearningBlock>[];
+
     bool get _isLegacyMode => _mode == 'legacy';
     bool get _isLanguageLearningMode => _mode == 'language_learning';
    
@@ -438,6 +443,32 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     }
 
+  Future<void> _speakL2Text(String text, String locale) async {
+    final t = text.trim();
+    if (t.isEmpty) return;
+
+    try {
+      // Manual playback should work even if auto-voice is "silent".
+      // Also stop any in-flight utterance to avoid no-op on some engines.
+      await _tts.stop();
+      await _tts.awaitSpeakCompletion(true);
+
+      var out = t;
+      if (locale.toLowerCase().startsWith('th')) {
+        out = _cleanupThaiForTts(out);
+      }
+      out = out.trim();
+      if (out.isEmpty) return;
+
+      await _tts.setLanguage(locale);
+      await _tts.speak(out);
+      await _waitForTtsDone();
+    } catch (e) {
+      debugPrint('⚠️ _speakL2Text failed: $e');
+    }
+  }
+
+
   void _showModePicker() async {
     final currentMode = _mode; // "legacy", "language_learning", "avatar"
 
@@ -464,7 +495,7 @@ class _ChatScreenState extends State<ChatScreen> {
           return ListTile(
             leading: Icon(icon),
             title: Text(title),
-            subtitle: Text(subtitle),
+            subtitle: Text(subtitle, maxLines: 3, overflow: TextOverflow.ellipsis),
             trailing: isSelected ? const Icon(Icons.check) : null,
             onTap: () {
               Navigator.of(context).pop(choice);
@@ -1359,6 +1390,42 @@ String _stripRomanizationParens(String text) {
 
   return cleaned.replaceAll(RegExp(r'\s{2,}'), ' ').trim();
 }
+  // ---------------------------------------------------------------------------
+  // TTS HELPERS: ignore punctuation-only segments, strip leading punctuation, and
+  // split mixed-script text into ordered segments without re-ordering.
+  // ---------------------------------------------------------------------------
+  bool _isTtsIgnorable(String text) {
+    final t = text.trim();
+    if (t.isEmpty) return true;
+    // Punctuation-only tokens (common cause of TTS saying "dot").
+    if (RegExp(r'^[\.,;:!\?\-–—]+$').hasMatch(t)) return true;
+    return false;
+  }
+
+  String _stripLeadingPunctuation(String text) {
+    // Remove stray leading punctuation like '.' that can get spoken as "dot".
+    return text.replaceFirst(RegExp(r'^[\s\.,;:!\?\-–—]+'), '').trim();
+  }
+
+  List<Map<String, String>> _splitIntoOrderedTtsSegments(String text) {
+    final out = <Map<String, String>>[];
+    final matches = _languageSegmentRegex.allMatches(text);
+    for (final m in matches) {
+      var seg = (m.group(0) ?? '').trim();
+      if (seg.isEmpty) continue;
+      seg = _stripLeadingPunctuation(_cleanForTts(seg));
+      if (_isTtsIgnorable(seg)) continue;
+      final lang = _detectLangForSegment(seg);
+      // If this is Thai, apply Thai cleanup for TTS.
+      if (lang.toLowerCase().startsWith('th')) {
+        seg = _cleanupThaiForTts(seg);
+        if (seg.isEmpty) continue;
+      }
+      out.add({'lang': lang, 'text': seg});
+    }
+    return out;
+  }
+
 
   // ===========================================================================
   // TTS CLEANUP: strip trailing non-Thai parenthetical hints (e.g. "(û ì á)")
@@ -1418,10 +1485,8 @@ String _stripRomanizationParens(String text) {
   }
 
   Future<void> _playTtsForMessage(_ChatMessage msg) async {
-    // Respect global voice mode: no TTS in silent mode.
-    if (_voiceMode == 'silent') {
-      return;
-    }
+    // NOTE: Manual playback (speaker button) should work even if auto-voice mode is 'silent'.
+    // Auto-play behavior elsewhere still respects _voiceMode.
 
     final raw = msg.text.trim();
     if (raw.isEmpty) return;
@@ -1454,9 +1519,9 @@ String _stripRomanizationParens(String text) {
     final firstStart = matches.first.start;
     if (firstStart > 0) {
       final leading = rawForSegmentation.substring(0, firstStart).trim();
-      final leadingClean = _cleanForTts(leading);
-      if (leadingClean.isNotEmpty) {
-        segments.add({'lang': _preferredLocale, 'text': leadingClean});
+      final leadingFixed = _stripLeadingPunctuation(_cleanForTts(leading));
+      if (!_isTtsIgnorable(leadingFixed)) {
+        segments.add({'lang': _preferredLocale, 'text': leadingFixed});
       }
     }
 
@@ -1475,36 +1540,9 @@ String _stripRomanizationParens(String text) {
     //   - a pure L1 segment (spoken with the L1 voice)
     //   - a pure L2 segment (spoken with the L2 voice)
     if (upper == 'L1') {
-    final parts = _splitL1AndTargetScript(textPart);
-    var l1Text = (parts['l1'] ?? '').trim();
-    final l2Text = (parts['l2'] ?? '').trim();
-    
-    // Extra guard: remove Thai polite particles written in Latin letters
-    // from L1 text so the L1 voice doesn't hit awkward silences.
-    l1Text = _stripThaiRomanizationFromL1(l1Text);
-    
-    if (l1Text.isNotEmpty) {
-    segments.add({
-    'lang': _preferredLocale,
-    'text': l1Text,
-    });
-    }
-    
-    if (l2Text.isNotEmpty) {
-    String l2Lang = _preferredLocale;
-    if (_hasTargetLanguage &&
-    _targetLocale != null &&
-    _targetLocale!.trim().isNotEmpty) {
-    l2Lang = _targetLocale!;
-    }
-    segments.add({
-    'lang': l2Lang,
-    'text': l2Text,
-    });
-    }
-    
-    // We’ve fully handled this [L1] line; move on.
-    continue;
+      // Preserve the original in-line order (don’t bucket all L1 then all L2).
+      segments.addAll(_splitIntoOrderedTtsSegments(textPart));
+      continue;
     }
     
     // Normal handling for [L2] or explicit locale tags.
@@ -1535,26 +1573,9 @@ String _stripRomanizationParens(String text) {
     _targetLocale!.toLowerCase().startsWith('th');
     
     if (isNativeLang && isThaiTarget && hasThai) {
-    final parts = _splitL1AndTargetScript(textPart);
-    final l1Text = (parts['l1'] ?? '').trim();
-    final l2Text = (parts['l2'] ?? '').trim();
-    
-    if (l1Text.isNotEmpty) {
-    segments.add({
-    'lang': _preferredLocale,
-    'text': l1Text,
-    });
-    }
-    
-    if (l2Text.isNotEmpty) {
-    segments.add({
-    'lang': _targetLocale!,
-    'text': l2Text,
-    });
-    }
-    
-    // We’ve re-routed this combined segment into separate L1/L2 segments.
-    continue;
+      // Preserve original order for mixed-script native segments.
+      segments.addAll(_splitIntoOrderedTtsSegments(textPart));
+      continue;
     }
     
     // Default: just use the effective language as-is.
@@ -1576,8 +1597,8 @@ String _stripRomanizationParens(String text) {
     for (final seg in segments) {
     final lang = seg['lang'] ?? _preferredLocale;
     var text = seg['text'] ?? '';
-    text = text.trim();
-    if (text.isEmpty) continue;
+    text = _stripLeadingPunctuation(text.trim());
+    if (_isTtsIgnorable(text)) continue;
     
     // Never speak romanization-style parentheses.
     text = _stripRomanizationParens(text);
@@ -1657,7 +1678,7 @@ String _stripRomanizationParens(String text) {
     }
     
     // Speak this segment and wait for it to finish
-    await _tts.stop();
+    // await _tts.stop(); // Avoid stopping between segments; it can cause choppy playback.
     await _tts.speak(text);
     await _waitForTtsDone();
     
@@ -1931,6 +1952,29 @@ String _stripRomanizationParens(String text) {
       'Avatar mode: the AI will now answer as your future self using your recorded memories.',
     );
   }
+
+  void _openLearningHub() {
+  final user = _client.auth.currentUser;
+  if (user == null) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Not signed in.')),
+    );
+    return;
+  }
+
+  Navigator.of(context).push(
+    MaterialPageRoute(
+      builder: (_) => _LearningHubScreen(
+        client: _client,
+        userId: user.id,
+        currentBlocks: _learningBlocksCurrent,
+        preferredLocale: _preferredLocale,
+        targetLocale: _targetLocale,
+        onSpeakL2: (text, locale) => _speakL2Text(text, locale),
+      ),
+    ),
+  );
+}
 
   void _openCoverageScreen() {
     Navigator.of(context).push(
@@ -2276,6 +2320,19 @@ Future<void> _handlePinPressed() async {
     final String aiTextRaw = ((result['reply_text'] ?? result['text']) ?? '').toString();
     var aiText = aiTextRaw.trim();
 
+    // Parse learning artifacts (new contract)
+    _learningBlocksCurrent = <_LearningBlock>[];
+    final dynamic la = result['learning_artifacts'];
+    final dynamic blocks = (la is Map) ? la['blocks'] : null;
+    if (blocks is List) {
+      _learningBlocksCurrent = blocks
+          .where((b) => b is Map)
+          .map((b) => _LearningBlock.fromJson(b as Map))
+          .where((b) => b.content.trim().isNotEmpty)
+          .toList(growable: false);
+    }
+
+
     // state_json may be a String (JSON) or Map; normalize to String?
     String? newStateJson;
     final dynamic sj = result['state_json'];
@@ -2289,8 +2346,8 @@ Future<void> _handlePinPressed() async {
 
     // NEW DIRECTION: legacy should be free-form; ignore structured chapter routing.
     if (_mode != 'language_learning') {
-      // Always clear legacy state to prevent the old chapter machine from persisting.
-      newStateJson = '{}';
+      // Legacy/avatar: keep state_json as returned (or null). Do NOT force-clear here.
+      // (We already avoid using structured chapter routing in UI.)
     }
 
     // If end-session, do NOT add an AI chat bubble by default.
@@ -2644,38 +2701,12 @@ final sttRes = await _client.functions.invoke(
           _hasTargetLanguage ? _targetLocale! : _preferredLocale;
 
       // Build the text prompt that will be sent through _sendTextMessage.
-      final prompt = _isLanguageLearningMode
-          ? '''
-You are a patient language tutor.
-Respond primarily in "$targetLocale" (the learner’s target language).
-
-The learner has uploaded a photo.
-Internal description (do NOT repeat verbatim to the learner):
-${desc ?? "(No internal description available)"}.
-
-RULES:
-- The learner may use another language to talk about the photo or explain their goals.
-- Do NOT correct that meta/explanatory language unless they explicitly ask you to.
-- Focus on correcting and improving their attempts in the target language ("$targetLocale").
-
-INSTRUCTIONS:
-1) Briefly acknowledge the photo.
-2) Ask them, in the target language, to describe the photo in a very simple sentence.
-3) When they answer in the target language, you will gently correct and improve their sentences, and give short explanations if needed.
-
-Keep this first reply short, friendly, and not like a legacy interview.
-'''
-          : '''
-Respond ONLY in "$_preferredLocale" (the donor’s preferred language).
-
-The donor uploaded a photo.
-Internal description (do NOT repeat verbatim):
-${desc ?? "(No internal description available)"}.
-
-Warmly acknowledge receiving the photo, briefly mention what you understand,
-and invite them to share the story or meaning behind it.
-Keep your reply short and human.
-''';
+      final prompt = buildPhotoFollowupPrompt(
+        isLanguageLearningMode: _isLanguageLearningMode,
+        preferredLocale: _preferredLocale,
+        targetLocale: targetLocale,
+        internalDescription: desc,
+      );
 
       // Send the prompt to the AI brain via the central pipeline.
       // We already showed a "Photo uploaded." user bubble, so no extra user bubble here.
@@ -2731,38 +2762,12 @@ Keep your reply short and human.
           _hasTargetLanguage ? _targetLocale! : _preferredLocale;
 
       // Build the text prompt that will be sent through _sendTextMessage.
-      final prompt = _isLanguageLearningMode
-          ? '''
-You are a patient language tutor.
-Respond primarily in "$targetLocale" (the learner’s target language).
-
-The learner uploaded a short video.
-Internal description (do NOT repeat verbatim to the learner):
-${desc ?? "(No internal description available)"}.
-
-RULES:
-- The learner may use another language to talk about the video or explain their goals.
-- Do NOT correct that meta/explanatory language unless they explicitly ask you to.
-- Focus on correcting and improving their attempts in the target language ("$targetLocale").
-
-INSTRUCTIONS:
-1) Briefly acknowledge the video.
-2) Ask them, in the target language, to describe what is happening in one or two very simple sentences.
-3) When they answer in the target language, you will gently correct and improve their sentences, with short explanations if needed.
-
-Keep this first reply short, friendly, and clearly focused on language practice, not a life-story interview.
-'''
-          : '''
-Respond ONLY in "$_preferredLocale" (the donor’s preferred language).
-
-The donor uploaded a short video.
-Internal description (do NOT repeat verbatim):
-${desc ?? "(No internal description available)"}.
-
-Warmly acknowledge the video, mention what you infer in broad strokes,
-and invite the donor to talk about the story, context, or meaning.
-Keep it short and conversational.
-''';
+      final prompt = buildVideoFollowupPrompt(
+        isLanguageLearningMode: _isLanguageLearningMode,
+        preferredLocale: _preferredLocale,
+        targetLocale: targetLocale,
+        internalDescription: desc,
+      );
 
       // Send the prompt to the AI brain via the central pipeline.
       await _sendTextMessage(prompt, showUserBubble: false);
@@ -2781,7 +2786,7 @@ Keep it short and conversational.
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Legacy'),
+        title: Text(_mode == 'language_learning' ? 'Learning' : (_mode == 'avatar' ? 'Avatar' : 'Legacy')),
         actions: [
           // Conversation mode picker: legacy / language learning / avatar
           IconButton(
@@ -2789,6 +2794,14 @@ Keep it short and conversational.
             tooltip: 'Change conversation mode',
             onPressed: _showModePicker,
           ),
+
+          // Learning Hub (language-learning)
+          if (_mode == 'language_learning')
+            IconButton(
+              icon: const Icon(Icons.school),
+              tooltip: 'Learning hub',
+              onPressed: _openLearningHub,
+            ),
 
           // Voice mode toggle: chatbot vs silent
           IconButton(
@@ -3463,3 +3476,1903 @@ Widget _buildEndSessionSummaryBlock(BuildContext ctx, Map<String, dynamic> summa
 // ============================================================================
 // COVERAGE MAP SCREEN
 // ============================================================================
+
+
+// ===========================================================================
+// Learning Hub UI (donor-wide history + search)
+// ===========================================================================
+
+class _LearningBlock {
+  final String? id;
+  final String tag;
+  final String? title;
+  final String content;
+
+  final dynamic rawJson;
+
+  const _LearningBlock({
+    this.id,
+    required this.tag,
+    required this.content,
+    this.title,
+    this.rawJson,
+  });
+
+  factory _LearningBlock.fromJson(Map<dynamic, dynamic> json) {
+    return _LearningBlock(
+      id: json['id']?.toString(),
+      tag: (json['tag'] ?? '').toString(),
+      title: json['title']?.toString(),
+      content: (json['content'] ?? '').toString(),
+      rawJson: json['raw_json'] ?? json['rawJson'],
+    );
+  }
+}
+
+class _ReviewCard {
+  final String l2;
+  final String? romanization;
+  final String? meaning;
+  final String? notes;
+  final DateTime? updatedAt;
+
+  const _ReviewCard({
+    required this.l2,
+    this.romanization,
+    this.meaning,
+    this.notes,
+    this.updatedAt,
+  });
+
+  factory _ReviewCard.fromJson(Map<dynamic, dynamic> json) {
+    DateTime? dt;
+    final raw = json['updated_at'] ?? json['updatedAt'];
+    if (raw is String && raw.isNotEmpty) {
+      dt = DateTime.tryParse(raw);
+    }
+    return _ReviewCard(
+      l2: (json['l2'] ?? '').toString(),
+      romanization: (json['romanization'] ?? '').toString().trim().isEmpty
+          ? null
+          : (json['romanization'] ?? '').toString().trim(),
+      meaning: (json['meaning'] ?? '').toString().trim().isEmpty
+          ? null
+          : (json['meaning'] ?? '').toString().trim(),
+      notes: (json['notes'] ?? '').toString().trim().isEmpty
+          ? null
+          : (json['notes'] ?? '').toString().trim(),
+      updatedAt: dt,
+    );
+  }
+}
+
+class _LearningSessionSummary {
+  final String id;
+  final DateTime createdAt;
+  final Map<String, int> counts;
+
+  /// Optional human-friendly preview shown in the History list (derived from the
+  /// first block in the session, if available).
+  final String preview;
+
+  /// Back-compat alias (older UI code used countsByTag)
+  Map<String, int> get countsByTag => counts;
+
+  const _LearningSessionSummary({
+    required this.id,
+    required this.createdAt,
+    required this.counts,
+    this.preview = '',
+  });
+
+  factory _LearningSessionSummary.fromJson(Map<dynamic, dynamic> json) {
+    final created = DateTime.tryParse((json['created_at'] ?? '').toString()) ?? DateTime.fromMillisecondsSinceEpoch(0);
+    final countsRaw = json['counts_by_tag'];
+    final counts = <String, int>{};
+    if (countsRaw is Map) {
+      for (final e in countsRaw.entries) {
+        final v = int.tryParse(e.value.toString()) ?? 0;
+        counts[e.key.toString()] = v < 0 ? 0 : v;
+      }
+    }
+    return _LearningSessionSummary(
+      id: (json['id'] ?? '').toString(),
+      createdAt: created,
+      counts: counts,
+      preview: (json['preview'] ?? '').toString(),
+    );
+  }
+}
+
+class _LearningHubScreen extends StatefulWidget {
+  final SupabaseClient client;
+  final String userId;
+  final List<_LearningBlock> currentBlocks;
+
+
+  final String preferredLocale;
+  final String? targetLocale;
+  final String? conversationId;
+
+  final Future<void> Function(String text, String locale)? onSpeakL2;
+
+  const _LearningHubScreen({
+    super.key,
+    required this.client,
+    required this.userId,
+    required this.currentBlocks,
+    required this.preferredLocale,
+    this.targetLocale,
+    this.conversationId,
+    this.onSpeakL2,
+  });
+
+  @override
+  State<_LearningHubScreen> createState() => _LearningHubScreenState();
+}
+
+class _LearningHubScreenState extends State<_LearningHubScreen> with SingleTickerProviderStateMixin {
+  late final TabController _tabController;
+
+  final TextEditingController _searchCtl = TextEditingController();
+  String _tagFilter = 'ALL';
+  bool _loading = false;
+
+  List<_LearningSessionSummary> _sessions = const [];
+  List<Map<String, dynamic>> _searchHits = const [];
+
+  List<_LearningBlock> _currentBlocksDb = const [];
+  bool _loadingCurrent = false;
+
+
+  // Review (flashcards) — phrase cache only (no Gemini calls)
+  bool _loadingReview = false;
+  List<_ReviewCard> _reviewCards = const [];
+  final Set<String> _revealedReview = <String>{};
+
+  // Lightweight local phrase cache for UI enrichment (no Gemini calls)
+  final Map<String, Map<String, String>> _phraseCacheByL2 = <String, Map<String, String>>{};
+  final Set<String> _needsEnrichmentL2 = <String>{};
+  String _reviewFilter = 'NEW'; // NEW | LEARNING | MASTERED | DUE | ALL
+
+  String get tl => (widget.targetLocale ?? '').trim();
+  final Map<String, int> _reviewStatus = <String, int>{}; // key -> 0/1/2
+  final Map<String, Map<String, dynamic>> _reviewSchedule = <String, Map<String, dynamic>>{}; // key -> {due_ms, interval_ms, ease}
+
+  // Legacy enrichment helper (currently hidden in UI).
+  final Set<String> _enrichingBlockIds = <String>{};
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 3, vsync: this, initialIndex: 0); // default to History
+    _tabController.addListener(() {
+      if (_tabController.indexIsChanging) return;
+      if (_tabController.index == 2) {
+        if (_reviewCards.isEmpty && !_loadingReview) {
+          _loadReviewCards();
+        }
+      }
+    });
+    _loadReviewStatus();
+    _loadReviewSchedule();
+    _loadRecentSessions();
+    _loadCurrentFromConversationIfPossible();
+  }
+
+  @override
+  void didUpdateWidget(covariant _LearningHubScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+
+    // If parent passed new blocks for "This session", prime cache so this tab can mirror Review.
+    if (widget.currentBlocks != oldWidget.currentBlocks && widget.currentBlocks.isNotEmpty) {
+      _seedPhraseCacheFromBlocks(widget.currentBlocks);
+      _primePhraseCacheForL2(_collectL2FromBlocks(widget.currentBlocks));
+    }
+
+    // Locale changes can affect which cache rows we should show.
+    if ((widget.targetLocale ?? '').trim() != (oldWidget.targetLocale ?? '').trim()) {
+      _loadReviewCards();
+      _loadRecentSessions();
+    }
+  }
+
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    _searchCtl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadRecentSessions() async {
+    setState(() => _loading = true);
+    try {
+      dynamic res;
+
+      // Prefer RPC (fast + server-side aggregation) but pass user id if the function supports it.
+      try {
+        res = await widget.client.rpc('list_learning_sessions', params: {
+          'p_user_id': widget.userId,
+          'p_limit': 50,
+          'p_offset': 0,
+        });
+      } catch (_) {
+        // Backward-compat: older SQL function may not accept p_user_id.
+        res = await widget.client.rpc('list_learning_sessions', params: {
+          'p_limit': 50,
+          'p_offset': 0,
+        });
+      }
+
+      // If RPC returns something unexpected or empty, fall back to a direct table query.
+      List<_LearningSessionSummary> sessions = const [];
+      if (res is List) {
+        sessions = _parseSessionSummaries(res);
+
+        sessions = await _hydrateSessionCountsIfMissing(sessions);
+        sessions = await _hydrateSessionPreviewsIfMissing(sessions);
+      }
+
+      if (sessions.isEmpty) {
+        final data = await widget.client
+            .from('learning_sessions')
+            .select('id, created_at, counts_by_tag')
+            .eq('user_id', widget.userId)
+            .order('created_at', ascending: false)
+            .limit(50);
+
+        sessions = _parseSessionSummaries(data);
+
+        sessions = await _hydrateSessionCountsIfMissing(sessions);
+        sessions = await _hydrateSessionPreviewsIfMissing(sessions);
+      }
+
+      setState(() {
+        _sessions = sessions;
+      });
+    } catch (e, st) {
+      debugPrint('❌ Learning Hub history load failed: $e\n$st');
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Learning History error: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  
+
+  Future<void> _loadCurrentFromConversationIfPossible() async {
+    // "This session" should show multiple learning items, not just the last turn.
+    // We aggregate blocks across recent learning_sessions for the current conversation when possible.
+    final convId = widget.conversationId;
+
+    if (_loadingCurrent) return;
+    setState(() => _loadingCurrent = true);
+    try {
+      List<String> sessionIds = const [];
+
+      if (convId != null && convId.isNotEmpty) {
+        final data = await widget.client
+            .from('learning_sessions')
+            .select('id, created_at')
+            .eq('conversation_id', convId)
+            .order('created_at', ascending: false)
+            .limit(25);
+
+        final list = (data is List) ? data : const [];
+        sessionIds = list
+            .whereType<Map>()
+            .map((m) => (m['id'] ?? '').toString())
+            .where((s) => s.isNotEmpty)
+            .toList(growable: false);
+      }
+
+      // Fallback: if no conversation id (or none found), show recent sessions for this user.
+      if (sessionIds.isEmpty) {
+        final data = await widget.client
+            .from('learning_sessions')
+            .select('id, created_at')
+            .eq('user_id', widget.userId)
+            .order('created_at', ascending: false)
+            .limit(15);
+
+        final list = (data is List) ? data : const [];
+        sessionIds = list
+            .whereType<Map>()
+            .map((m) => (m['id'] ?? '').toString())
+            .where((s) => s.isNotEmpty)
+            .toList(growable: false);
+      }
+
+      if (sessionIds.isEmpty) {
+        if (mounted) setState(() => _currentBlocksDb = const []);
+        return;
+      }
+
+      // Load all blocks across those sessions in one batched call.
+      final blocks = await _loadBlocksForSessions(sessionIds.reversed.toList()); // oldest->newest
+      if (mounted) setState(() => _currentBlocksDb = blocks);
+      // Seed from structured blocks first (covers items that haven't been cached in DB yet).
+      _seedPhraseCacheFromBlocks(blocks);
+      // Normalize legacy VOCAB raw_json to include items[] so all tabs stay consistent.
+      // Don't await (avoid UI latency).
+      // ignore: discarded_futures
+      Future(() => _normalizeVocabBlocksIfNeeded(blocks));
+      // Best-effort: fetch cached romanization/meaning so This session shows richer lines without any Gemini calls.
+      await _primePhraseCacheForL2(_collectL2FromBlocks(blocks));
+      if (mounted) setState(() {});
+    } catch (e) {
+      debugPrint('⚠️ loadCurrentFromConversation failed: $e');
+    } finally {
+      if (mounted) setState(() => _loadingCurrent = false);
+    }
+  }
+
+
+  Future<List<_LearningBlock>> _loadBlocksForSession(String sessionId) async {
+    final data = await widget.client
+        .from('learning_blocks')
+        .select('id, session_id, idx, tag, title, content, raw_json, created_at')
+        .eq('session_id', sessionId)
+        .order('idx', ascending: true);
+
+    final list = (data is List) ? data : const [];
+    final out = <_LearningBlock>[];
+    for (final r in list) {
+      if (r is! Map) continue;
+      out.add(_LearningBlock.fromJson(Map<String, dynamic>.from(r)));
+    }
+    return out;
+  }
+
+  Future<List<_LearningBlock>> _loadBlocksForSessions(List<String> sessionIds) async {
+    final ids = sessionIds.where((s) => s.trim().isNotEmpty).toList();
+    if (ids.isEmpty) return const <_LearningBlock>[];
+
+    final data = await widget.client
+        .from('learning_blocks')
+        .select('id, session_id, idx, tag, title, content, raw_json, created_at')
+        .inFilter('session_id', ids)
+        .order('created_at', ascending: true)
+        .order('idx', ascending: true);
+
+    final list = (data is List) ? data : const [];
+    final out = <_LearningBlock>[];
+    for (final r in list) {
+      if (r is! Map) continue;
+      out.add(_LearningBlock.fromJson(Map<String, dynamic>.from(r)));
+    }
+    return out;
+  }
+
+
+  // ---------------------------------------------------------------------------
+  // On-demand enrichment (zero extra calls during normal turns)
+  // - Only runs when the user taps "Add details" in the Learning Hub.
+  // - Caches by updating learning_blocks.raw_json in Supabase via ai-brain op routing.
+  // ---------------------------------------------------------------------------
+
+  bool _blockNeedsEnrichment(_LearningBlock b) {
+    final tag = (b.tag).toUpperCase().trim();
+    if (tag != 'VOCAB') return false;
+
+    final raw = b.rawJson;
+    if (raw is Map) {
+      final items = raw['items'];
+      if (items is List && items.isNotEmpty) {
+        bool hasMissing = false;
+        for (final it in items) {
+          if (it is Map) {
+            final rom = (it['romanization'] ?? it['ipa'] ?? '').toString().trim();
+            final meaning = (it['meaning'] ?? it['english'] ?? '').toString().trim();
+            if (rom.isEmpty || meaning.isEmpty) {
+              hasMissing = true;
+              break;
+            }
+          } else if (it is String) {
+            // plain strings imply not enriched
+            hasMissing = true;
+            break;
+          }
+        }
+        return hasMissing;
+      }
+    }
+
+    // No structured items present: allow enrichment using content fallback parsing
+    return true;
+  }
+
+  Future<_LearningBlock?> _enrichLearningBlockOnDemand(_LearningBlock b) async {
+    final blockId = b.id;
+    if (blockId == null || blockId.isEmpty) return null;
+
+    final payload = <String, dynamic>{
+      'op': 'enrich_learning_block',
+      'user_id': widget.userId,
+      'block_id': blockId,
+      'preferred_locale': widget.preferredLocale,
+      'target_locale': widget.targetLocale,
+      // required by the existing ai-brain payload schema, but ignored for op routing:
+      'message_text': '',
+      'mode': 'language_learning',
+      // optional hints (ai-brain defaults safely if missing)
+      'preferred_locale': 'en',
+      'target_locale': 'th-TH',
+    };
+
+    final res = await widget.client.functions.invoke('ai-brain', body: payload);
+    final data = res.data;
+    if (data is! Map) return null;
+
+    final rawJson = data['raw_json'];
+    final content = (data['content'] ?? b.content).toString();
+
+    return _LearningBlock(
+      id: b.id,
+      tag: b.tag,
+      title: b.title,
+      content: content,
+      rawJson: rawJson,
+    );
+  }
+
+
+
+  String _formatShortDateTime(DateTime dt) {
+    final local = dt.toLocal();
+    String two(int v) => v.toString().padLeft(2, '0');
+    return '${local.year}-${two(local.month)}-${two(local.day)} ${two(local.hour)}:${two(local.minute)}';
+  }
+
+  String _inferLocaleForSpeak(String l2Text) {
+    final t = l2Text.trim();
+    if (tl.isNotEmpty) return tl;
+    if (t.isEmpty) return widget.preferredLocale;
+    if (RegExp(r'[\u0E00-\u0E7F]').hasMatch(t)) return 'th-TH';
+    return widget.preferredLocale;
+  }
+
+  Future<void> _openSessionDetails(_LearningSessionSummary s) async {
+    try {
+      final blocks = await _loadBlocksForSession(s.id);
+      // Seed cache from this session's structured items so details match Review.
+      _seedPhraseCacheFromBlocks(blocks);
+      // Normalize legacy VOCAB raw_json to include items[] (best effort, no Gemini calls).
+      // ignore: discarded_futures
+      Future(() => _normalizeVocabBlocksIfNeeded(blocks));
+      if (!mounted) return;
+
+      await showModalBottomSheet(
+        context: context,
+        isScrollControlled: true,
+        builder: (ctx) {
+          List<_LearningBlock> localBlocks = List<_LearningBlock>.from(blocks);
+
+          return StatefulBuilder(
+            builder: (ctx, setModalState) {
+              return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    _formatShortDateTime(s.createdAt),
+                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 10),
+                  if (localBlocks.isEmpty)
+                    const Text('No learning items found for this session.')
+                  else
+                    Flexible(
+                      child: ListView.separated(
+                        shrinkWrap: true,
+                        itemCount: localBlocks.length,
+                        separatorBuilder: (_, __) => const SizedBox(height: 10),
+                        itemBuilder: (_, i) {
+                          final b = localBlocks[i];
+                          final tag = (b.tag).trim();
+                          final title = (b.title ?? '').trim();
+                          final header = [
+                            if (tag.isNotEmpty) tag,
+                            if (title.isNotEmpty) title,
+                          ].join(' · ');
+                          return Card(
+                            child: Padding(
+                              padding: const EdgeInsets.all(12),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  if (header.isNotEmpty)
+                                    Text(header, style: const TextStyle(fontWeight: FontWeight.w600)),
+                                  const SizedBox(height: 8),
+                                  Text(_renderBlockContent(b)),
+
+                if (false) // UI removed: no more on-demand enrichment button
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton.icon(
+                      onPressed: _enrichingBlockIds.contains(b.id)
+                          ? null
+                          : () async {
+                              final bid = b.id!;
+                              setState(() => _enrichingBlockIds.add(bid));
+                              try {
+                                final updated = await _enrichLearningBlockOnDemand(b);
+                                if (updated != null) {
+                                  // Refresh current + history so the details and previews appear immediately.
+                                  await _loadCurrentFromConversationIfPossible();
+                                  await _loadRecentSessions();
+                                }
+                              } finally {
+                                if (mounted) {
+                                  setState(() => _enrichingBlockIds.remove(bid));
+                                }
+                              }
+                            },
+                      icon: _enrichingBlockIds.contains(b.id)
+                          ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                          : const Icon(Icons.auto_fix_high),
+                      label: const Text('Add details'),
+                    ),
+                  ),
+                Text(_renderBlockContent(b)),
+                                ],
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          );
+            },
+          );
+        },
+      );
+    } catch (e) {
+      debugPrint('⚠️ openSessionDetails failed: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to load session: $e')),
+        );
+      }
+    }
+  }
+
+  String _humanizeBlockContent(String content) {
+    final c = content.trim();
+    if (c.isEmpty) return c;
+
+    // If content already looks like a numbered list, render as-is.
+    // Otherwise, keep it as plain text.
+    return c;
+  }
+
+
+  String _buildHistoryPreviewText({
+    required String tag,
+    required String title,
+    required String content,
+    required dynamic rawJson,
+  }) {
+    final t = tag.trim().toUpperCase();
+
+    // VOCAB: try to show "Thai — meaning" if available.
+    if (t == 'VOCAB' && rawJson is Map) {
+      final items = rawJson['items'];
+      if (items is List && items.isNotEmpty) {
+        final it0 = items.first;
+        if (it0 is Map) {
+          final l2 = (it0['l2'] ?? it0['thai'] ?? it0['text'] ?? '').toString().trim();
+          final meaning = (it0['meaning'] ?? it0['english'] ?? '').toString().trim();
+          final rom = (it0['romanization'] ?? it0['ipa'] ?? '').toString().trim();
+
+          if (l2.isNotEmpty && meaning.isNotEmpty) {
+            return '$l2 — $meaning';
+          }
+          if (l2.isNotEmpty && rom.isNotEmpty) {
+            return '$l2 ($rom)';
+          }
+          if (l2.isNotEmpty) return l2;
+        } else if (it0 != null) {
+          final s = it0.toString().trim();
+          if (s.isNotEmpty) return s;
+        }
+      }
+    }
+
+    // Otherwise, use title or first line of content.
+    final titleClean = title.trim();
+    if (titleClean.isNotEmpty) return titleClean;
+
+    final c = content.trim();
+    if (c.isEmpty) return '';
+    final firstLine = c.split('\n').first.trim();
+    return firstLine.isNotEmpty ? firstLine : c;
+  }
+
+
+
+  String _renderBlockPreview(_LearningBlock b) {
+    // Single-line preview used in History list rows.
+    // No Gemini calls; purely local formatting.
+    final full = _renderBlockContent(b).trim();
+    if (full.isEmpty) {
+      final t = (b.title ?? '').trim();
+      if (t.isNotEmpty) return t;
+      final c = b.content.trim();
+      if (c.isEmpty) return '';
+      return c.split('\n').first.trim();
+    }
+
+    // Take the first non-empty line and remove leading bullet markers.
+    final firstNonEmpty = full
+        .split('\n')
+        .map((l) => l.trim())
+        .firstWhere((l) => l.isNotEmpty, orElse: () => '');
+
+    var line = firstNonEmpty;
+    if (line.startsWith('• ')) line = line.substring(2).trim();
+    if (line.startsWith('- ')) line = line.substring(2).trim();
+
+    // Clamp to a reasonable length for list subtitles.
+    const maxLen = 120;
+    if (line.length > maxLen) {
+      line = line.substring(0, maxLen).trimRight() + '…';
+    }
+    return line;
+  }
+
+
+
+  
+List<String> _collectL2FromBlocks(List<_LearningBlock> blocks) {
+  // Extract L2 terms/phrases from VOCAB-style blocks WITHOUT any extra Gemini calls.
+  // Supports multiple stored shapes:
+  //  - raw_json: { items: [ {l2, romanization, meaning, notes, ...}, ... ] }
+  //  - raw_json: { tag, title, content, raw_text } where content/raw_text is a numbered list
+  //  - fallback to b.content/title
+  final out = <String>[];
+
+  void addLine(String s) {
+    final t = s.trim();
+    if (t.isEmpty) return;
+
+    // Strip "1) " / "1." / "- " / "• " prefixes.
+    final cleaned = t
+        .replaceFirst(RegExp(r'^\s*[\-\u2022]\s+'), '')
+        .replaceFirst(RegExp(r'^\s*\d+\s*[\)\.\-:]\s*'), '')
+        .trim();
+
+    if (cleaned.isEmpty) return;
+    out.add(cleaned);
+  }
+
+  void addFromText(String text) {
+    final lines = text.split('\n');
+    for (final ln in lines) {
+      final l = ln.trim();
+      if (l.isEmpty) continue;
+      // Avoid capturing headers like "[VOCAB]" or "Auto-captured phrases".
+      final up = l.toUpperCase();
+      if (up == '[VOCAB]' || up == 'VOCAB' || up == 'AUTO-CAPTURED PHRASES') continue;
+      addLine(l);
+      if (out.length >= 200) return;
+    }
+  }
+
+  void extractFromRaw(dynamic raw) {
+    if (raw == null) return;
+
+    // raw_json sometimes stored as a JSON string.
+    if (raw is String) {
+      final s = raw.trim();
+      if ((s.startsWith('{') && s.endsWith('}')) || (s.startsWith('[') && s.endsWith(']'))) {
+        try {
+          raw = jsonDecode(s);
+        } catch (_) {
+          // If decode fails, treat as plain text.
+          addFromText(s);
+          return;
+        }
+      } else {
+        addFromText(s);
+        return;
+      }
+    }
+
+    if (raw is Map) {
+      final map = Map<String, dynamic>.from(raw);
+
+      // Primary: items list.
+      final items = map['items'];
+      if (items is List) {
+        for (final it in items) {
+          if (it is! Map) continue;
+          final m = Map<String, dynamic>.from(it);
+          final l2 = (m['l2'] ??
+                  m['l2_text'] ??
+                  m['l2Text'] ??
+                  m['thai'] ??
+                  m['text'] ??
+                  m['phrase'] ??
+                  m['term'] ??
+                  m['target'] ??
+                  m['target_text'] ??
+                  m['targetText'] ??
+                  '')
+              .toString()
+              .trim();
+          if (l2.isNotEmpty) addLine(l2);
+          if (out.length >= 200) return;
+        }
+        return;
+      }
+
+      // Secondary: VOCAB meta shape with content/raw_text.
+      final content = (map['content'] ?? map['raw_text'] ?? map['rawText'] ?? '').toString();
+      if (content.trim().isNotEmpty) {
+        addFromText(content);
+        return;
+      }
+
+      // Last resort: if there is a "l2" field at top-level.
+      final l2 = (map['l2'] ?? map['text'] ?? '').toString().trim();
+      if (l2.isNotEmpty) addLine(l2);
+      return;
+    }
+
+    if (raw is List) {
+      for (final it in raw) {
+        if (it == null) continue;
+        if (it is Map) {
+          final m = Map<String, dynamic>.from(it);
+          final l2 = (m['l2'] ?? m['thai'] ?? m['text'] ?? '').toString().trim();
+          if (l2.isNotEmpty) addLine(l2);
+        } else {
+          addLine(it.toString());
+        }
+        if (out.length >= 200) return;
+      }
+      return;
+    }
+  }
+
+  for (final b in blocks) {
+    // Prefer structured raw_json.
+    extractFromRaw(b.rawJson);
+
+    // Fallback: parse block content/title if raw_json didn't yield anything.
+    if (out.isEmpty) {
+      final c = b.content.trim();
+      if (c.isNotEmpty) addFromText(c);
+      final t = (b.title ?? '').trim();
+      if (t.isNotEmpty) addLine(t);
+    }
+
+    if (out.length >= 200) break;
+  }
+
+  return out;
+}
+
+  Future<void> _primePhraseCacheForL2(List<String> l2s) async {
+    final uniq = <String>{};
+    for (final s in l2s) {
+      final t = s.trim();
+      if (t.isEmpty) continue;
+      if (_phraseCacheByL2.containsKey(t)) continue;
+      uniq.add(t);
+      if (uniq.length >= 150) break;
+    }
+    if (uniq.isEmpty) return;
+
+    try {
+      final q = widget.client
+          .from('learning_phrase_cache')
+          .select('l2, romanization, meaning, notes, target_locale');
+      dynamic q2 = q;
+      if (tl.isNotEmpty) {
+        q2 = q.eq('target_locale', tl);
+      }
+      final rows = await q2.inFilter('l2', uniq.toList()).limit(200);
+      if (rows is! List) return;
+
+      for (final r in rows) {
+        if (r is! Map) continue;
+        final m = Map<String, dynamic>.from(r);
+        final l2 = (m['l2'] ?? '').toString().trim();
+        if (l2.isEmpty) continue;
+        _phraseCacheByL2[l2] = {
+          'romanization': (m['romanization'] ?? '').toString().trim(),
+          'meaning': (m['meaning'] ?? '').toString().trim(),
+          'notes': (m['notes'] ?? '').toString().trim(),
+        };
+      }
+    } catch (_) {}
+  }
+
+
+  
+  Future<void> _normalizeVocabBlocksIfNeeded(List<_LearningBlock> blocks) async {
+    // Goal: make legacy VOCAB blocks consistent by ensuring raw_json includes items[].
+    // No Gemini calls. We only write back what we can derive locally from content/raw_text.
+    final nowIso = DateTime.now().toUtc().toIso8601String();
+
+    for (final b in blocks) {
+      final id = b.id?.trim();
+      if (id == null || id.isEmpty) continue;
+      if (b.tag.toUpperCase() != 'VOCAB') continue;
+
+      dynamic raw = b.rawJson;
+
+      // raw_json may be a JSON string.
+      if (raw is String) {
+        final s = raw.trim();
+        if ((s.startsWith('{') && s.endsWith('}')) || (s.startsWith('[') && s.endsWith(']'))) {
+          try {
+            raw = jsonDecode(s);
+          } catch (_) {}
+        }
+      }
+
+      // If already has items[], nothing to do.
+      if (raw is Map) {
+        final map = Map<String, dynamic>.from(raw);
+        if (map['items'] is List) continue;
+
+        // Extract L2 lines and build minimal items[]
+        final l2s = _collectL2FromBlocks([b]);
+        if (l2s.isEmpty) continue;
+
+        final items = l2s.map((l2) => <String, dynamic>{'l2': l2}).toList();
+
+        final next = <String, dynamic>{
+          ...map,
+          'items': items,
+          'enriched_at': map['enriched_at'] ?? nowIso,
+          'enriched_via': map['enriched_via'] ?? 'client_seed',
+        };
+
+        try {
+          await widget.client.from('learning_blocks').update({'raw_json': next}).eq('id', id);
+        } catch (e) {
+          debugPrint('⚠️ normalize VOCAB raw_json failed (id=$id): $e');
+        }
+      } else {
+        // If raw_json isn't a map, we still can seed placeholders but we won't overwrite DB blindly.
+        // (Avoids surprising schema changes.)
+        continue;
+      }
+    }
+  }
+
+void _seedPhraseCacheFromBlocks(List<_LearningBlock> blocks) {
+    // Seed phrase cache directly from structured raw_json items when available.
+    // Also "normalize" legacy VOCAB block shapes (tag/title/content/raw_text without items)
+    // by extracting the L2 terms so the UI can behave consistently. No Gemini calls.
+    for (final b in blocks) {
+      dynamic raw = b.rawJson;
+
+      // raw_json may be stored as a JSON string.
+      if (raw is String) {
+        final s = raw.trim();
+        if ((s.startsWith('{') && s.endsWith('}')) || (s.startsWith('[') && s.endsWith(']'))) {
+          try {
+            raw = jsonDecode(s);
+          } catch (_) {
+            // ignore
+          }
+        }
+      }
+
+      // 1) Preferred: raw_json.items[] shape.
+      if (raw is Map) {
+        final map = Map<String, dynamic>.from(raw);
+
+        final items = map['items'];
+        if (items is List) {
+          for (final item in items) {
+            if (item is! Map) continue;
+            final m = Map<String, dynamic>.from(item);
+
+            final l2 = ((m['l2'] ??
+                        m['thai'] ??
+                        m['text'] ??
+                        m['phrase'] ??
+                        m['term'] ??
+                        m['target'] ??
+                        m['target_text'] ??
+                        m['targetText'] ??
+                        '')
+                    .toString())
+                .trim();
+            if (l2.isEmpty) continue;
+
+            final rom = (m['romanization'] ?? m['rom'] ?? m['roman'] ?? '').toString().trim();
+            final meaning = (m['meaning'] ?? m['english'] ?? m['translation'] ?? '').toString().trim();
+            final notes = (m['notes'] ?? m['explanation'] ?? m['hint'] ?? '').toString().trim();
+
+            // Merge with any existing cached data (DB rows should win if already present).
+            final existing = _phraseCacheByL2[l2] ?? const <String, String>{};
+            String pick(String a, String b) => a.trim().isNotEmpty ? a.trim() : b.trim();
+
+            _phraseCacheByL2[l2] = {
+              'romanization': pick(existing['romanization'] ?? '', rom),
+              'meaning': pick(existing['meaning'] ?? '', meaning),
+              'notes': pick(existing['notes'] ?? '', notes),
+            };
+
+            // Mark missing meta so UI can show "needs enrichment" consistently.
+            if ((rom + meaning + notes).trim().isEmpty) {
+              _needsEnrichmentL2.add(l2);
+            } else {
+              _needsEnrichmentL2.remove(l2);
+            }
+          }
+          continue;
+        }
+      }
+
+      // 2) Legacy/fallback VOCAB shapes: extract L2 lines from content/raw_text and seed placeholders.
+      final l2s = _collectL2FromBlocks([b]);
+      for (final l2 in l2s) {
+        if (l2.trim().isEmpty) continue;
+        _phraseCacheByL2.putIfAbsent(l2, () => <String, String>{'romanization': '', 'meaning': '', 'notes': ''});
+        _needsEnrichmentL2.add(l2);
+      }
+    }
+  }
+
+
+
+  String _renderBlockContent(_LearningBlock b) {
+    // Prefer structured raw_json (no extra Gemini calls; purely local formatting).
+    dynamic raw = b.rawJson;
+
+    // Sometimes raw_json is stored as a JSON string.
+    if (raw is String) {
+      final s = raw.trim();
+      if ((s.startsWith('{') && s.endsWith('}')) || (s.startsWith('[') && s.endsWith(']'))) {
+        try {
+          raw = jsonDecode(s);
+        } catch (_) {
+          // ignore
+        }
+      }
+    }
+
+    String lineForItem(dynamic item) {
+      if (item == null) return '';
+      if (item is String) return item.trim();
+
+      if (item is Map) {
+        String pick(dynamic v) => (v ?? '').toString().trim();
+
+        final l2 = pick(item['l2'] ?? item['thai'] ?? item['text'] ?? item['phrase'] ?? item['term'] ?? item['target']);
+        var rom = pick(item['romanization'] ?? item['romaji'] ?? item['ipa'] ?? item['pronunciation']);
+        var meaning = pick(item['meaning'] ?? item['english'] ?? item['translation'] ?? item['gloss'] ?? item['l1']);
+
+        // If raw_json lacks enrichment, fall back to our lightweight phrase cache (no Gemini calls).
+        if (l2.isNotEmpty) {
+          final cached = _phraseCacheByL2[l2];
+          if (cached != null) {
+            if (rom.isEmpty) rom = (cached['romanization'] ?? '').trim();
+            if (meaning.isEmpty) meaning = (cached['meaning'] ?? '').trim();
+          }
+        }
+
+        final note = pick(item['note'] ?? item['notes'] ?? item['explanation'] ?? item['breakdown']);
+
+        final parts = <String>[];
+        if (l2.isNotEmpty) parts.add(l2);
+        if (rom.isNotEmpty) parts.add('($rom)');
+        if (meaning.isNotEmpty) parts.add('— $meaning');
+
+        var out = parts.join(' ');
+        if (note.isNotEmpty) {
+          out = out.isEmpty ? '• $note' : '$out\n   • $note';
+        }
+        return out.trim();
+      }
+
+      return item.toString().trim();
+    }
+
+    String renderFrom(dynamic obj) {
+      if (obj == null) return '';
+      if (obj is List) {
+        final lines = <String>[];
+        var n = 1;
+        for (final it in obj) {
+          final s = lineForItem(it);
+          if (s.isEmpty) continue;
+          lines.add('${n++}) $s');
+        }
+        return lines.join('\n');
+      }
+
+      if (obj is Map) {
+        // Common shapes
+        final items = obj['items'] ?? obj['phrases'] ?? obj['vocab'] ?? obj['entries'] ?? obj['blocks'];
+        if (items is List) return renderFrom(items);
+
+        final text = (obj['text'] ?? obj['content'] ?? obj['value'] ?? '').toString().trim();
+        if (text.isNotEmpty) return text;
+
+        // If the map itself is an item, render it.
+        final one = lineForItem(obj);
+        if (one.isNotEmpty) return one;
+      }
+
+      return obj.toString().trim();
+    }
+
+    final rendered = renderFrom(raw);
+    if (rendered.isNotEmpty) return rendered;
+
+    // Fallback: plain content.
+    return _humanizeBlockContent(b.content);
+  }
+
+
+  Future<List<_LearningSessionSummary>> _hydrateSessionCountsIfMissing(List<_LearningSessionSummary> sessions) async {
+    if (sessions.isEmpty) return sessions;
+
+    final needs = sessions.where((s) => s.counts.isEmpty).toList();
+    if (needs.isEmpty) return sessions;
+
+    final ids = sessions.map((s) => s.id).where((s) => s.isNotEmpty).toList();
+    if (ids.isEmpty) return sessions;
+
+    try {
+      // One batched read. No Gemini calls; low latency.
+      final data = await widget.client
+          .from('learning_blocks')
+          .select('session_id, tag')
+          .inFilter('session_id', ids);
+
+      final list = (data is List) ? data : const [];
+      final bySession = <String, Map<String, int>>{};
+
+      for (final r in list) {
+        if (r is! Map) continue;
+        final m = Map<String, dynamic>.from(r);
+        final sid = (m['session_id'] ?? '').toString();
+        final tag = (m['tag'] ?? '').toString();
+        if (sid.isEmpty || tag.isEmpty) continue;
+
+        final map = bySession.putIfAbsent(sid, () => <String, int>{});
+        map[tag] = (map[tag] ?? 0) + 1;
+      }
+
+      // Rebuild summaries with hydrated counts (leave existing non-empty counts intact).
+      return sessions
+          .map((s) => s.counts.isNotEmpty
+              ? s
+              : _LearningSessionSummary(id: s.id, createdAt: s.createdAt, counts: bySession[s.id] ?? const <String, int>{}))
+          .toList();
+    } catch (e) {
+      debugPrint('⚠️ hydrateSessionCounts failed: $e');
+      return sessions;
+    }
+  }
+
+  bool _isPlaceholderPreview(String p) {
+    final s = p.trim();
+    if (s.isEmpty) return true;
+    // Treat terse meta like "VOCAB-1" or "META-2" as placeholders.
+    final up = s.toUpperCase();
+    final re = RegExp(r'^[A-Z_]+-\d+$');
+    if (re.hasMatch(up)) return true;
+    // Also treat previews that are only counts/meta markers as placeholders.
+    if (up.contains('VOCAB-') || up.contains('META-') || up.contains('BLOCK-')) return true;
+    return false;
+  }
+
+  Future<List<_LearningSessionSummary>> _hydrateSessionPreviewsIfMissing(List<_LearningSessionSummary> sessions) async {
+    if (sessions.isEmpty) return sessions;
+
+    final needs = sessions.toList(); // Always hydrate previews so History is reliably informative (no Gemini calls).
+    if (needs.isEmpty) return sessions;
+
+    final ids = sessions.map((s) => s.id).where((s) => s.isNotEmpty).toList();
+    if (ids.isEmpty) return sessions;
+
+    try {
+      // One batched read. No Gemini calls. We just pick a small preview from existing stored blocks.
+      final data = await widget.client
+          .from('learning_blocks')
+          .select('id, session_id, idx, tag, title, content, raw_json, created_at')
+          .inFilter('session_id', ids)
+          .order('idx', ascending: true)
+          .order('created_at', ascending: true);
+
+      final list = (data is List) ? data : const [];
+      final bySession = <String, List<_LearningBlock>>{};
+      for (final r in list) {
+        if (r is! Map) continue;
+        final b = _LearningBlock.fromJson(Map<String, dynamic>.from(r));
+        final sid = (r['session_id'] ?? '').toString();
+        if (sid.isEmpty) continue;
+        (bySession[sid] ??= <_LearningBlock>[]).add(b);
+      }
+      // Optional: enrich History preview using the phrase cache (no Gemini calls).
+      final tl0 = (widget.targetLocale ?? '').trim();
+      final l2Set = <String>{};
+      
+String? _extractFirstVocabL2(List<_LearningBlock> blocks) {
+  if (blocks.isEmpty) return null;
+  final vocab = blocks.where((b) => (b.tag).toUpperCase().trim() == 'VOCAB').toList();
+  final l2s = _collectL2FromBlocks(vocab.isNotEmpty ? vocab : blocks);
+  if (l2s.isEmpty) return null;
+  return l2s.first.trim().isEmpty ? null : l2s.first.trim();
+}
+      for (final e in bySession.entries) {
+        final l2 = _extractFirstVocabL2(e.value);
+        if (l2 != null && l2.isNotEmpty) l2Set.add(l2);
+      }
+      final cacheByL2 = <String, Map<String, String>>{};
+      if (l2Set.isNotEmpty) {
+        try {
+          dynamic q = widget.client.from('learning_phrase_cache')
+              .select('l2, meaning, romanization, notes, target_locale');
+          if (tl0.isNotEmpty) {
+            q = q.eq('target_locale', tl0);
+          }
+          final rows = await q.inFilter('l2', l2Set.toList());
+          final list2 = (rows is List) ? rows : const [];
+          for (final r in list2) {
+            if (r is! Map) continue;
+            final m = Map<String, dynamic>.from(r);
+            final l2 = (m['l2'] ?? '').toString().trim();
+            if (l2.isEmpty) continue;
+            cacheByL2[l2] = {
+              'meaning': (m['meaning'] ?? '').toString().trim(),
+              'romanization': (m['romanization'] ?? '').toString().trim(),
+              'notes': (m['notes'] ?? '').toString().trim(),
+            };
+          }
+        } catch (_) {
+          // Best-effort only; ignore cache lookup failures.
+        }
+      }
+
+
+      
+String pickPreview(List<_LearningBlock> blocks) {
+  if (blocks.isEmpty) return '';
+
+  // Build a compact preview of actual L2 terms for the session (no Gemini calls).
+  final vocabBlocks = blocks.where((b) => (b.tag).toUpperCase().trim() == 'VOCAB').toList();
+  final rawL2s = _collectL2FromBlocks(vocabBlocks.isNotEmpty ? vocabBlocks : blocks);
+
+  final seen = <String>{};
+  final l2s = <String>[];
+  for (final s in rawL2s) {
+    final t = s.trim();
+    if (t.isEmpty) continue;
+    if (seen.add(t)) l2s.add(t);
+    if (l2s.length >= 8) break;
+  }
+
+  if (l2s.isNotEmpty) {
+    final shown = l2s.take(4).toList();
+    final more = l2s.length > 4 ? ' · +${l2s.length - 4} more' : '';
+    return '${shown.join(' · ')}$more';
+  }
+
+  // Fallback to existing behavior if we can't extract any L2 terms.
+  final vocab = vocabBlocks;
+  final target = vocab.isNotEmpty ? vocab.first : blocks.first;
+  return _renderBlockPreview(target).trim();
+}
+
+      return sessions
+          .map((s) => !_isPlaceholderPreview(s.preview)
+              ? s
+              : _LearningSessionSummary(
+                  id: s.id,
+                  createdAt: s.createdAt,
+                  counts: s.counts,
+                  preview: pickPreview(bySession[s.id] ?? const <_LearningBlock>[]),
+                ))
+          .toList();
+    } catch (e) {
+      debugPrint('⚠️ hydrate previews failed: $e');
+      return sessions;
+    }
+  }
+
+
+  List<_LearningSessionSummary> _parseSessionSummaries(dynamic data) {
+    final list = (data is List) ? data : const [];
+    final out = <_LearningSessionSummary>[];
+    for (final row in list) {
+      if (row is! Map) continue;
+      final m = Map<String, dynamic>.from(row);
+
+      final String id = (m['id'] ?? m['session_id'] ?? '').toString();
+      if (id.isEmpty) continue;
+
+      DateTime createdAt = DateTime.now();
+      final ca = m['created_at'] ?? m['createdAt'];
+      if (ca is String) {
+        createdAt = DateTime.tryParse(ca) ?? createdAt;
+      }
+
+      Map<String, int> counts = {};
+      final c = m['counts'] ?? m['counts_json'] ?? m['countsJson'];
+      if (c is Map) {
+        counts = c.map((k, v) => MapEntry(k.toString(), (v is num) ? v.toInt() : int.tryParse(v.toString()) ?? 0));
+      } else if (c is String) {
+        try {
+          final decoded = jsonDecode(c);
+          if (decoded is Map) {
+            counts = decoded.map((k, v) => MapEntry(k.toString(), (v is num) ? v.toInt() : int.tryParse(v.toString()) ?? 0));
+          }
+        } catch (_) {}
+      }
+
+      out.add(_LearningSessionSummary(id: id, createdAt: createdAt, counts: counts));
+    }
+    // newest first
+    out.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return out;
+  }
+
+Future<void> _runSearch() async {
+    final q = _searchCtl.text.trim();
+    if (q.isEmpty) {
+      setState(() => _searchHits = const []);
+      return;
+    }
+    setState(() => _loading = true);
+    try {
+      final data = await widget.client.rpc('search_learning_blocks', params: {
+        'p_query': q,
+        'p_tag': (_tagFilter == 'ALL') ? null : _tagFilter,
+        'p_limit': 50,
+        'p_offset': 0,
+      });
+
+      final list = (data is List) ? data : const [];
+      final hits = list
+          .whereType<Map>()
+          .map((m) => Map<String, dynamic>.from(m))
+          .toList(growable: false);
+
+      if (mounted) setState(() => _searchHits = hits);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Search failed: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Widget _buildCurrent() {
+    final blocks = widget.currentBlocks.isNotEmpty ? widget.currentBlocks : _currentBlocksDb;
+    if (_loadingCurrent && blocks.isEmpty) {
+      return const Center(child: Padding(padding: EdgeInsets.all(16), child: CircularProgressIndicator()));
+    }
+    if (blocks.isEmpty) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(16),
+          child: Text('No learning items for this session yet.\n\nTip: Ask for a vocab list or a short drill.'),
+        ),
+      );
+    }
+
+    // Mirror Review: show phrase-level cards (L2 + Show answer -> romanization/meaning/notes).
+    final rawL2s = _collectL2FromBlocks(blocks);
+    final seen = <String>{};
+    final l2s = <String>[];
+    for (final s in rawL2s) { final t = s.trim(); if (t.isEmpty) continue; if (seen.add(t)) l2s.add(t); }
+    if (l2s.isNotEmpty) {
+      return ListView.separated(
+        padding: const EdgeInsets.all(12),
+        itemCount: l2s.length,
+        separatorBuilder: (_, __) => const SizedBox(height: 10),
+        itemBuilder: (context, i) {
+          final l2 = l2s[i].trim();
+          final key = 'CUR|$l2';
+          final cached = _phraseCacheByL2[l2] ?? const <String, String>{};
+
+          final rom = (cached['romanization'] ?? '').trim();
+          final meaning = (cached['meaning'] ?? '').trim();
+          final notes = (cached['notes'] ?? '').trim();
+          final needs = _needsEnrichmentL2.contains(l2) || (rom + meaning + notes).trim().isEmpty;
+
+          String line(String label, String value) => '$label: ${value.trim().isNotEmpty ? value.trim() : '—'}';
+
+          return Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(
+                        child: Text(l2, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
+                      ),
+                      if (needs)
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: Colors.orange.withOpacity(0.12),
+                            borderRadius: BorderRadius.circular(999),
+                          ),
+                          child: const Text('Needs enrichment', style: TextStyle(fontSize: 12)),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Text(line('Romanization', rom)),
+                  const SizedBox(height: 4),
+                  Text(line('Meaning', meaning)),
+                  const SizedBox(height: 4),
+                  Text(line('Explanation', notes)),
+                ],
+              ),
+            ),
+          );
+        },
+      );
+    }
+
+    // Fallback: show raw blocks (non-vocab learning blocks, if any).
+    return ListView.separated(
+      padding: const EdgeInsets.all(12),
+      itemCount: blocks.length,
+      separatorBuilder: (_, __) => const SizedBox(height: 10),
+      itemBuilder: (context, i) {
+        final b = blocks[i];
+        return Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('[${b.tag}]', style: const TextStyle(fontWeight: FontWeight.bold)),
+                if (b.title != null && b.title!.trim().isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text(b.title!.trim(), style: const TextStyle(fontSize: 16)),
+                  ),
+                if (b.content.trim().isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Text(b.content.trim()),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+
+
+  // ------------------------------
+  // Review status persistence (local, no schema changes)
+  // ------------------------------
+
+  String _reviewPrefsKey() {
+    final scope = tl.isEmpty ? 'ALL' : tl;
+    return 'review_status_${widget.userId}_$scope';
+  }
+
+  String _reviewKeyFor(_ReviewCard c) {
+    final scope = tl.isEmpty ? 'ALL' : tl;
+    final m = (c.meaning ?? '').trim();
+    return '$scope|${c.l2}|$m';
+  }
+
+  int _cardStatus(_ReviewCard c) {
+    final k = _reviewKeyFor(c);
+    return (_reviewStatus[k] ?? 0).clamp(0, 2);
+  }
+
+  Future<void> _loadReviewStatus() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_reviewPrefsKey());
+      if (raw == null || raw.trim().isEmpty) return;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return;
+      _reviewStatus
+        ..clear()
+        ..addAll(decoded.map((k, v) => MapEntry(k.toString(), (v is num) ? v.toInt() : int.tryParse(v.toString()) ?? 0)));
+      if (mounted) setState(() {});
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  Future<void> _saveReviewStatus() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_reviewPrefsKey(), jsonEncode(_reviewStatus));
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  Future<void> _setCardStatus(_ReviewCard c, int status) async {
+    final k = _reviewKeyFor(c);
+    if (status <= 0) {
+      _reviewStatus.remove(k);
+    } else {
+      _reviewStatus[k] = status.clamp(0, 2);
+    }
+    if (mounted) setState(() {});
+    await _saveReviewStatus();
+  }
+
+
+  String _reviewSchedulePrefsKey() {
+    final scope = tl.isEmpty ? 'ALL' : tl;
+    return 'review_schedule_${widget.userId}_$scope';
+  }
+
+  Future<void> _loadReviewSchedule() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_reviewSchedulePrefsKey());
+      if (raw == null || raw.trim().isEmpty) return;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return;
+      _reviewSchedule
+        ..clear()
+        ..addAll(decoded.map((k, v) {
+          if (v is Map) {
+            return MapEntry(k.toString(), v.map((kk, vv) => MapEntry(kk.toString(), vv)));
+          }
+          return MapEntry(k.toString(), <String, dynamic>{});
+        }));
+      if (mounted) setState(() {});
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  Future<void> _saveReviewSchedule() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_reviewSchedulePrefsKey(), jsonEncode(_reviewSchedule));
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  Map<String, dynamic> _schedFor(_ReviewCard c) {
+    final k = _reviewKeyFor(c);
+    return _reviewSchedule[k] ?? <String, dynamic>{};
+  }
+
+  int _dueMsFor(_ReviewCard c) {
+    final s = _schedFor(c);
+    final v = s['due_ms'];
+    if (v is num) return v.toInt();
+    return int.tryParse(v?.toString() ?? '') ?? 0;
+  }
+
+  bool _isDue(_ReviewCard c, int nowMs) {
+    final st = _cardStatus(c);
+    if (st == 0) return false; // New cards are handled by the NEW filter, not Due.
+    final due = _dueMsFor(c);
+    if (due <= 0) return true;
+    return due <= nowMs;
+  }
+
+  Future<void> _markAgain(_ReviewCard c) async {
+    final k = _reviewKeyFor(c);
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final prev = _reviewSchedule[k] ?? <String, dynamic>{};
+    final ease = (prev['ease'] is num) ? (prev['ease'] as num).toDouble() : 2.3;
+    // short retry window
+    const intervalMs = 10 * 60 * 1000; // 10 minutes
+    _reviewStatus[k] = 1;
+    _reviewSchedule[k] = <String, dynamic>{
+      'due_ms': now + intervalMs,
+      'interval_ms': intervalMs,
+      'ease': ease,
+    };
+    if (mounted) setState(() {});
+    await _saveReviewStatus();
+    await _saveReviewSchedule();
+  }
+
+  Future<void> _markMastered(_ReviewCard c) async {
+    final k = _reviewKeyFor(c);
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final prev = _reviewSchedule[k] ?? <String, dynamic>{};
+    final prevInterval = (prev['interval_ms'] is num) ? (prev['interval_ms'] as num).toInt() : 24 * 60 * 60 * 1000;
+    final prevEase = (prev['ease'] is num) ? (prev['ease'] as num).toDouble() : 2.3;
+
+    final nextEase = (prevEase + 0.05).clamp(1.3, 2.8);
+    final nextInterval = (prevInterval * nextEase).round().clamp(24 * 60 * 60 * 1000, 30 * 24 * 60 * 60 * 1000);
+    _reviewStatus[k] = 2;
+    _reviewSchedule[k] = <String, dynamic>{
+      'due_ms': now + nextInterval,
+      'interval_ms': nextInterval,
+      'ease': nextEase,
+    };
+    if (mounted) setState(() {});
+    await _saveReviewStatus();
+    await _saveReviewSchedule();
+  }
+
+  Future<void> _loadReviewCards() async {
+    setState(() => _loadingReview = true);
+    try {
+      // Phrase-level cache: fast, already enriched; no Gemini calls here.
+      final q = widget.client
+          .from('learning_phrase_cache')
+          .select('l2, romanization, meaning, notes, updated_at, target_locale');
+      final tl0 = (widget.targetLocale ?? '').trim();
+      dynamic q2 = q;
+      if (tl0.isNotEmpty) {
+        q2 = q.eq('target_locale', tl0);
+      }
+      final rows = await q2.order('updated_at', ascending: false).limit(250);
+
+      final list = (rows is List) ? rows : const [];
+      final cards = <_ReviewCard>[];
+      for (final r in list) {
+        if (r is! Map) continue;
+        final m = Map<String, dynamic>.from(r);
+        final l2 = (m['l2'] ?? '').toString().trim();
+        if (l2.isEmpty) continue;
+        cards.add(_ReviewCard.fromJson(m));
+        _phraseCacheByL2[l2] = {
+          'romanization': (m['romanization'] ?? '').toString().trim(),
+          'meaning': (m['meaning'] ?? '').toString().trim(),
+          'notes': (m['notes'] ?? '').toString().trim(),
+        };
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _reviewCards = cards;
+        _revealedReview.clear();
+      });
+    } catch (e) {
+      debugPrint('⚠️ load review cards failed: $e');
+    } finally {
+      if (mounted) setState(() => _loadingReview = false);
+    }
+  }
+
+  Widget _buildReview() {
+    if (_loadingReview && _reviewCards.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final filtered = _reviewCards.where((c) {
+      final st = _cardStatus(c);
+      switch (_reviewFilter) {
+        case 'NEW':
+          return st == 0;
+        case 'LEARNING':
+          return st == 1;
+        case 'MASTERED':
+          return st == 2;
+        case 'DUE':
+          return _isDue(c, nowMs);
+        case 'ALL':
+        default:
+          return true;
+      }
+    }).toList(growable: false);
+
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: Row(
+            children: [
+              Expanded(
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children: [
+                      ChoiceChip(
+                        label: const Text('New'),
+                        selected: _reviewFilter == 'NEW',
+                        onSelected: (_) => setState(() => _reviewFilter = 'NEW'),
+                      ),
+                      const SizedBox(width: 8),
+                      ChoiceChip(
+                        label: const Text('Learning'),
+                        selected: _reviewFilter == 'LEARNING',
+                        onSelected: (_) => setState(() => _reviewFilter = 'LEARNING'),
+                      ),
+                      const SizedBox(width: 8),
+                      ChoiceChip(
+                        label: const Text('Due'),
+                        selected: _reviewFilter == 'DUE',
+                        onSelected: (_) => setState(() => _reviewFilter = 'DUE'),
+                      ),
+                      const SizedBox(width: 8),
+                      ChoiceChip(
+                        label: const Text('Mastered'),
+                        selected: _reviewFilter == 'MASTERED',
+                        onSelected: (_) => setState(() => _reviewFilter = 'MASTERED'),
+                      ),
+                      const SizedBox(width: 8),
+                      ChoiceChip(
+                        label: const Text('All'),
+                        selected: _reviewFilter == 'ALL',
+                        onSelected: (_) => setState(() => _reviewFilter = 'ALL'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Refresh',
+                onPressed: _loadReviewCards,
+                icon: const Icon(Icons.refresh),
+              ),
+            ],
+          ),
+        ),
+        if (filtered.isEmpty)
+          Expanded(
+            child: Center(
+              child: Text(
+                _reviewCards.isEmpty
+                    ? 'No cached phrases yet. Finish a learning session (or ask for vocab) and the app will build your deck automatically.'
+                    : 'No cards in this filter yet.',
+                textAlign: TextAlign.center,
+              ),
+            ),
+          )
+        else
+          Expanded(
+            child: ListView.builder(
+              itemCount: filtered.length,
+              itemBuilder: (context, i) {
+                final c = filtered[i];
+                final key = _reviewKeyFor(c);
+                final revealed = _revealedReview.contains(key);
+                final st = _cardStatus(c);
+
+                final answerParts = <String>[];
+                if ((c.romanization ?? '').trim().isNotEmpty) answerParts.add(c.romanization!.trim());
+                if ((c.meaning ?? '').trim().isNotEmpty) answerParts.add(c.meaning!.trim());
+                if ((c.notes ?? '').trim().isNotEmpty) answerParts.add(c.notes!.trim());
+                final answer = answerParts.join('\n');
+
+                Widget statusChip() {
+                  if (st == 2) return const Chip(label: Text('Mastered'));
+                  if (st == 1) return const Chip(label: Text('Learning'));
+                  return const Chip(label: Text('New'));
+                }
+
+                return Card(
+                  margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(c.l2, style: Theme.of(context).textTheme.titleLarge),
+                            ),
+                            if (widget.onSpeakL2 != null)
+                              IconButton(
+                                tooltip: 'Speak',
+                                icon: const Icon(Icons.volume_up, size: 18),
+                                onPressed: () => widget.onSpeakL2!(c.l2, tl),
+                              ),
+                            statusChip(),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        if (!revealed)
+                          Align(
+                            alignment: Alignment.centerRight,
+                            child: TextButton(
+                              onPressed: () {
+                                setState(() => _revealedReview.add(key));
+                                // Do not change status on reveal; keep in NEW until user explicitly marks it.
+                              },
+                              child: const Text('Show answer'),
+                            ),
+                          )
+                        else ...[
+                          if (answer.isNotEmpty) Text(answer),
+                          const SizedBox(height: 12),
+                          Row(
+                            children: [
+                              TextButton.icon(
+                                onPressed: () => _markAgain(c),
+                                icon: const Icon(Icons.refresh),
+                                label: const Text('Again'),
+                              ),
+                              const SizedBox(width: 8),
+                              TextButton.icon(
+                                onPressed: () => _markMastered(c),
+                                icon: const Icon(Icons.check_circle_outline),
+                                label: const Text('Mastered'),
+                              ),
+                              const Spacer(),
+                              TextButton(
+                                onPressed: () => setState(() => _revealedReview.remove(key)),
+                                child: const Text('Hide'),
+                              ),
+                            ],
+                          ),
+                        ]
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildHistory() {
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            children: [
+              TextField(
+                controller: _searchCtl,
+                decoration: InputDecoration(
+                  labelText: 'Search learning history',
+                  suffixIcon: IconButton(
+                    icon: const Icon(Icons.search),
+                    onPressed: _runSearch,
+                  ),
+                ),
+                onSubmitted: (_) => _runSearch(),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  const Text('Tag:'),
+                  const SizedBox(width: 12),
+                  DropdownButton<String>(
+                    value: _tagFilter,
+                    items: const [
+                      DropdownMenuItem(value: 'ALL', child: Text('All')),
+                      DropdownMenuItem(value: 'LESSON', child: Text('Lesson')),
+                      DropdownMenuItem(value: 'VOCAB', child: Text('Vocab')),
+                      DropdownMenuItem(value: 'DRILL', child: Text('Drill')),
+                      DropdownMenuItem(value: 'QUIZ', child: Text('Quiz')),
+                      DropdownMenuItem(value: 'NOTES', child: Text('Notes')),
+                      DropdownMenuItem(value: 'ROM', child: Text('Rom')),
+                    ],
+                    onChanged: (v) {
+                      if (v == null) return;
+                      setState(() => _tagFilter = v);
+                    },
+                  ),
+                  const Spacer(),
+                  TextButton(
+                    onPressed: _loadRecentSessions,
+                    child: const Text('Refresh'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+        const Divider(height: 1),
+        if (_loading)
+          const LinearProgressIndicator(),
+        Expanded(
+          child: _searchHits.isNotEmpty
+              ? ListView.builder(
+                  itemCount: _searchHits.length,
+                  itemBuilder: (context, i) {
+                    final h = _searchHits[i];
+                    final tag = (h['tag'] ?? '').toString();
+                    final title = (h['title'] ?? '').toString();
+                    final content = (h['content'] ?? '').toString();
+                    return ListTile(
+                      title: Text('[$tag] ${title.isNotEmpty ? title : ''}'.trim()),
+                      subtitle: Text(content, maxLines: 3, overflow: TextOverflow.ellipsis),
+                    );
+                  },
+                )
+              : ListView.builder(
+                  itemCount: _sessions.length,
+                  itemBuilder: (context, i) {
+                    final s = _sessions[i];
+                    final entries = s.counts.entries.where((e) => e.value > 0).toList()
+                      ..sort((a, b) => b.value.compareTo(a.value));
+                    final top = entries.take(3).map((e) => '${e.key} • ${e.value}').join(' · ');
+                    final more = entries.length > 3 ? ' · +${entries.length - 3} more' : '';
+                    final countsLine = top.isEmpty ? 'No blocks' : '$top$more';
+                    final preview = s.preview.trim();
+
+                    String _l2ForSpeak(String p) {
+                      final s = p.trim();
+                      if (s.isEmpty) return '';
+                      final first = s.split('\n').first.trim();
+                      if (first.contains('—')) return first.split('—').first.trim();
+                      if (first.contains(' - ')) return first.split(' - ').first.trim();
+                      return first;
+                    }
+                   
+                    return ListTile(
+                      title: Text(_formatShortDateTime(s.createdAt)),
+                      subtitle: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          if (preview.isNotEmpty)
+                            Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Expanded(
+                                  child: Text(preview, maxLines: 2, overflow: TextOverflow.ellipsis),
+                                ),
+                              ],
+                            ),
+                          Text(countsLine, maxLines: 1, overflow: TextOverflow.ellipsis),
+                        ],
+                      ),
+                      onTap: () => _openSessionDetails(s),
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Learning Hub'),
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(text: 'This session'),
+            Tab(text: 'History'),
+            Tab(text: 'Review'),
+          ],
+        ),
+      ),
+      body: TabBarView(
+        controller: _tabController,
+        children: [
+          _buildCurrent(),
+          _buildHistory(),
+          _buildReview(),
+        ],
+      ),
+    );
+  }
+}

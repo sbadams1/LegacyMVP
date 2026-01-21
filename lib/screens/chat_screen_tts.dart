@@ -194,18 +194,20 @@ extension _ChatScreenTtsExt on _ChatScreenState {
       (m) => '${m.group(1)} ${m.group(2)}',
     );
 
-    // 5) Remove parenthetical romanizations / IPA when no TargetScript script is present inside.
-    //    Example: "(sà-wàt-dee)" or "(sa-wat-dee)" → removed, but "(ค่ะ)" stays.
+    // 5) Remove parenthetical pronunciation/romanization hints in a language-agnostic way.
+    //    - If parentheses contain primarily Latin-like characters (e.g., "(sa-wat-dee)") → drop.
+    //    - If parentheses contain any non-Latin-like letters (e.g., native script) → keep.
     cleaned = cleaned.replaceAllMapped(
       RegExp(r'\(([^)]{1,80})\)'),
       (m) {
         final inner = (m.group(1) ?? '').trim();
         if (inner.isEmpty) return '';
-        final hasTargetScript = _thaiCharRegex.hasMatch(inner);
-        if (hasTargetScript) return '($inner)'; // keep TargetScript-only parentheses
-        final hasLatin = RegExp(r'[A-Za-z]').hasMatch(inner);
+        // Keep parentheses that contain any non-Latin-like letters (likely native script).
+        if (_containsNonLatinLikeLetter(inner)) return '($inner)';
+        // Otherwise, drop short Latin/IPA-ish helper fragments.
+        final hasLatinLetter = RegExp(r'[A-Za-z]').hasMatch(inner);
         final hasIpaish = RegExp(r'[ːˈˌɑɔəɛɪʊʌŋθðʃʒɲ]').hasMatch(inner);
-        if (hasLatin || hasIpaish) return '';
+        if (hasLatinLetter || hasIpaish) return '';
         return '';
       },
     );
@@ -229,60 +231,80 @@ extension _ChatScreenTtsExt on _ChatScreenState {
     return cleaned.trim();
   }
 
-  String _stripTargetScriptFromL1(String text) {
-    if (text.isEmpty) return text;
-    if (_targetLocale == null) return text;
+  // --- Script heuristics (language-agnostic) ---
+  bool _isAsciiLetter(int rune) => (rune >= 0x41 && rune <= 0x5A) || (rune >= 0x61 && rune <= 0x7A);
 
-    final target = _targetLocale!.toLowerCase();
-
-    // Only apply this logic when L2 is TargetScript.
-    if (!target.startsWith('th')) {
-      return text;
-    }
-
-    final buffer = StringBuffer();
-      for (final rune in text.runes) {
-      final ch = String.fromCharCode(rune);
-      // Drop TargetScript characters; keep everything else.
-      if (!_thaiCharRegex.hasMatch(ch)) {
-        buffer.write(ch);
-      }
-    }
-
-    var cleaned = buffer.toString();
-    cleaned = cleaned.replaceAll(RegExp(r'\s{2,}'), ' ');
-    return cleaned.trim();
+  // Treat Latin + Latin-extended letters as "Latin-like" so we don't destroy accents (á, ü, ñ, etc.).
+  bool _isLatinLikeLetter(int rune) {
+    if (_isAsciiLetter(rune)) return true;
+    // Latin-1 Supplement + Latin Extended-A/B (covers most Western/central European letters).
+    if (rune >= 0x00C0 && rune <= 0x024F) return true;
+    // Combining diacritics (keep attached to Latin letters).
+    if (rune >= 0x0300 && rune <= 0x036F) return true;
+    return false;
   }
 
-  Map<String, String> _splitL1AndTargetScript(String text) {
-    if (text.isEmpty) {
-      return {'l1': '', 'l2': ''};
-    }
+  bool _isWhitespaceDigitOrBasicPunct(int rune) {
+    final ch = String.fromCharCode(rune);
+    if (RegExp(r'\s').hasMatch(ch)) return true;
+    if (rune >= 0x30 && rune <= 0x39) return true; // 0-9
+    // Basic ASCII punctuation/symbols (safe to keep with either script).
+    if (RegExp(r'''[!"#\$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~]''').hasMatch(ch)) return true;
+    return false;
+  }
 
-    // If there is no L2 / no TargetScript, just keep everything as L1.
-    if (_targetLocale == null || !_targetLocale!.toLowerCase().startsWith('th')) {
-      return {'l1': text.trim(), 'l2': ''};
+  bool _isNonLatinLikeLetter(int rune) {
+    if (_isLatinLikeLetter(rune)) return false;
+    if (_isWhitespaceDigitOrBasicPunct(rune)) return false;
+    // Heuristic: any other letter-like codepoint is treated as non-Latin-like.
+    return rune > 0x024F;
+  }
+
+  bool _containsNonLatinLikeLetter(String s) => s.runes.any(_isNonLatinLikeLetter);
+
+  /// In L1 output, drop non-Latin-like letters when the text mixes scripts.
+  /// This prevents the L1 voice from trying to pronounce target-script fragments.
+  String _stripTargetScriptFromL1(String text) {
+    if (text.isEmpty) return text;
+    if ((_targetLocale ?? '').trim().isEmpty) return text;
+    if ((_preferredLocale).toLowerCase() == (_targetLocale ?? '').toLowerCase()) return text;
+
+    bool hasLatinLike = false;
+    bool hasNonLatinLike = false;
+    for (final r in text.runes) {
+      if (_isLatinLikeLetter(r)) hasLatinLike = true;
+      if (_isNonLatinLikeLetter(r)) hasNonLatinLike = true;
+      if (hasLatinLike && hasNonLatinLike) break;
     }
+    if (!(hasLatinLike && hasNonLatinLike)) return text;
+
+    final buf = StringBuffer();
+    for (final r in text.runes) {
+      if (_isNonLatinLikeLetter(r)) continue;
+      buf.writeCharCode(r);
+    }
+    return buf.toString().replaceAll(RegExp(r'\s{2,}'), ' ').trim();
+  }
+
+  /// Splits mixed-script text into L1 (Latin-like) and L2 (non-Latin-like) buckets.
+  /// This is a fallback for untagged model output. Prefer explicit [L1]/[L2] or [xx-XX] tags.
+  Map<String, String> _splitL1AndTargetScript(String text) {
+    if (text.isEmpty) return {'l1': '', 'l2': ''};
+    if ((_targetLocale ?? '').trim().isEmpty) return {'l1': text.trim(), 'l2': ''};
 
     final l1Buf = StringBuffer();
     final l2Buf = StringBuffer();
 
     for (final rune in text.runes) {
-      final ch = String.fromCharCode(rune);
-
-      // TargetScript characters → L2 bucket; everything else → L1 bucket.
-      if (_thaiCharRegex.hasMatch(ch)) {
-        l2Buf.write(ch);
+      if (_isNonLatinLikeLetter(rune)) {
+        l2Buf.writeCharCode(rune);
       } else {
-        l1Buf.write(ch);
+        l1Buf.writeCharCode(rune);
       }
     }
 
-    final l1Text =
-        l1Buf.toString().replaceAll(RegExp(r'\s{2,}'), ' ').trim();
-    final l2Text =
-        l2Buf.toString().replaceAll(RegExp(r'\s{2,}'), ' ').trim();
-
+    final l1Text = l1Buf.toString().replaceAll(RegExp(r'\s{2,}'), ' ').trim();
+    final l2Text = l2Buf.toString().replaceAll(RegExp(r'\s{2,}'), ' ').trim();
     return {'l1': l1Text, 'l2': l2Text};
   }
 

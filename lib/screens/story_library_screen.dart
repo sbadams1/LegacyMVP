@@ -1,8 +1,175 @@
 import 'dart:convert';
 import 'dart:math';
 
+
+
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+// Shared helper to detect transcript-like text
+bool looksLikeTranscript(String s) {
+  final t = s.trim();
+  if (t.isEmpty) return false;
+
+  final lower = t.toLowerCase();
+
+  // NEW: wake phrases / meta prompts that commonly come from transcript
+  // but can be mistakenly treated as a summary.
+  if (RegExp(r'^(hey|hi|hello)\s+(gemini|google)\b').hasMatch(lower)) return true;
+  if (RegExp(r'^(play|start)\s+gemini\b').hasMatch(lower)) return true;
+  if (RegExp(r'^(gemini)[,!\s]').hasMatch(lower)) return true;
+  if (RegExp(r'\bare you there\??\b').hasMatch(lower)) return true;
+
+  // Existing transcript markers
+  if (lower.contains('assistant:') ||
+      lower.contains('user:') ||
+      lower.contains('[00:') ||
+      RegExp(r'\b\d{1,2}:\d{2}:\d{2}\b').hasMatch(lower)) {
+    return true;
+  }
+
+  final lines = t
+      .split(RegExp(r'\r?\n'))
+      .where((l) => l.trim().isNotEmpty)
+      .toList();
+
+  // Lots of short lines is typical transcript formatting
+  if (lines.length >= 6) {
+    final shortCount = lines.where((l) => l.trim().length < 50).length;
+    if (shortCount / lines.length >= 0.6) return true;
+  }
+
+  // Speaker-prefixed lines repeated ("User: ...", "Assistant: ...", "Bob: ...")
+  final prefixed = lines
+      .where((l) => RegExp(r'^\s*\w[\w\s]{0,20}:').hasMatch(l))
+      .length;
+  if (prefixed >= 2) return true;
+
+  // NEW: one-line "Gemini..." items are usually not summaries
+  if (lower.contains('gemini') && t.length <= 220) return true;
+
+  return false;
+}
+
+// Parse session_insights which may arrive as Map or JSON string.
+Map<String, dynamic>? parseJsonMap(dynamic raw) {
+  if (raw == null) return null;
+  if (raw is Map<String, dynamic>) return raw;
+  if (raw is Map) return Map<String, dynamic>.from(raw);
+  if (raw is String) {
+    final s = raw.trim();
+    if (s.isEmpty) return null;
+    try {
+      final decoded = jsonDecode(s);
+      if (decoded is Map<String, dynamic>) return decoded;
+      if (decoded is Map) return Map<String, dynamic>.from(decoded);
+    } catch (_) {}
+  }
+  return null;
+}
+
+bool _looksProceduralPlaceholder(String s) {
+  final t = s.trim().toLowerCase();
+  if (t.isEmpty) return false;
+
+  // Common "tiny session" placeholders that should never override a real summary.
+  if (t.contains('checked in briefly') && t.contains('did not record')) return true;
+  if (t.contains('no detailed story') || t.contains('no story in this session')) return true;
+  if (t.contains('no summary was captured')) return true;
+
+  return false;
+}
+
+String pickSummaryFromSessionInsights(
+  Map<String, dynamic>? si, {
+  required bool full,
+}) {
+  if (si == null) return '';
+  String pick(dynamic v) => (v is String) ? v.trim() : '';
+  final reframed = parseJsonMap(si['reframed']);
+  final rShort = pick(reframed?['short_summary']);
+  final rFull = pick(reframed?['full_summary']);
+  final siShort = pick(si['short_summary']);
+  final siFull = pick(si['full_summary']);
+
+  bool ok(String v, {bool allowPlaceholder = false}) {
+    if (v.trim().isEmpty) return false;
+    if (!allowPlaceholder && _looksProceduralPlaceholder(v)) return false;
+    // Prefer to hide transcript-y content when possible.
+    if (looksLikeTranscript(v)) return false;
+    return true;
+  }
+
+  if (full) {
+    // For full summaries, prefer top-level first; reframed is fallback.
+    if (ok(siFull)) return siFull;
+    if (ok(rFull)) return rFull;
+
+    // If everything is transcript-like or placeholder, still return something non-empty as last resort.
+    if (siFull.isNotEmpty && !_looksProceduralPlaceholder(siFull)) return siFull;
+    if (rFull.isNotEmpty && !_looksProceduralPlaceholder(rFull)) return rFull;
+    if (siFull.isNotEmpty) return siFull;
+    if (rFull.isNotEmpty) return rFull;
+    return '';
+  } else {
+    // For short summaries, prefer top-level first; reframed is fallback.
+    if (ok(siShort)) return siShort;
+    if (ok(rShort)) return rShort;
+
+    // Fall back to full summary (top-level first).
+    if (ok(siFull)) return siFull;
+    if (ok(rFull)) return rFull;
+
+    // Last resort: return something non-empty (but still try to avoid placeholders).
+    if (siShort.isNotEmpty && !_looksProceduralPlaceholder(siShort)) return siShort;
+    if (rShort.isNotEmpty && !_looksProceduralPlaceholder(rShort)) return rShort;
+    if (siFull.isNotEmpty && !_looksProceduralPlaceholder(siFull)) return siFull;
+    if (rFull.isNotEmpty && !_looksProceduralPlaceholder(rFull)) return rFull;
+    if (siShort.isNotEmpty) return siShort;
+    if (rShort.isNotEmpty) return rShort;
+    if (siFull.isNotEmpty) return siFull;
+    if (rFull.isNotEmpty) return rFull;
+    return '';
+  }
+}
+
+
+
+
+// Convert common third-person summary phrasing ("The user ...") into second-person ("You ...").
+// UI-only: keeps your stored summaries intact while presenting them in the donor-facing voice you want.
+String _secondPersonifySummary(String input) {
+  var s = input.trim();
+  if (s.isEmpty) return s;
+
+  // Only transform if it clearly uses the third-person "The user" voice.
+  // If it already starts with "You ", leave it alone.
+  if (RegExp(r'^You\b', caseSensitive: false).hasMatch(s)) return s;
+  if (!RegExp(r'\bThe user\b', caseSensitive: false).hasMatch(s) &&
+      !RegExp(r'\bthe user\b', caseSensitive: false).hasMatch(s)) {
+    return s;
+  }
+
+  // Handle leading subject with correct verb agreement.
+  s = s.replaceFirst(RegExp(r'^The user is\b', caseSensitive: false), 'You are');
+  s = s.replaceFirst(RegExp(r'^The user was\b', caseSensitive: false), 'You were');
+  s = s.replaceFirst(RegExp(r'^The user has\b', caseSensitive: false), 'You have');
+  s = s.replaceFirst(RegExp(r'^The user had\b', caseSensitive: false), 'You had');
+  s = s.replaceFirst(RegExp(r'^The user does\b', caseSensitive: false), 'You do');
+  s = s.replaceFirst(RegExp(r'^The user did\b', caseSensitive: false), 'You did');
+  s = s.replaceFirst(RegExp(r'^The user can\b', caseSensitive: false), 'You can');
+  s = s.replaceFirst(RegExp(r'^The user will\b', caseSensitive: false), 'You will');
+  s = s.replaceFirst(RegExp(r'^The user\b', caseSensitive: false), 'You');
+
+  // Replace remaining references conservatively.
+  s = s.replaceAll(RegExp(r'\bthe user\b', caseSensitive: false), 'you');
+
+  // Fix a couple of common agreement artifacts after replacement.
+  s = s.replaceAll(RegExp(r'\bYou is\b'), 'You are');
+  s = s.replaceAll(RegExp(r'\byou is\b'), 'you are');
+
+  return s.trim();
+}
+
 
 class StoryLibraryScreen extends StatefulWidget {
   const StoryLibraryScreen({super.key});
@@ -16,6 +183,9 @@ class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
 
   bool _loading = true;
   String? _error;
+  String? _rawIdSeedFromSummary;
+  String? _conversationIdFromSummary;
+
 
   // ---------------------------------------------------------------------------
   // Story seeds (per-session "named stories") + longitudinal insights
@@ -78,40 +248,39 @@ class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
     return createdAt.replaceFirst('T', ' ').split('.').first;
   }
 
+  
   bool _isLikelySessionSummaryRow(Map<String, dynamic> row) {
-    final obs = _asJsonMap(row['observations']);
-    final marker = (obs?['summary_level'] ??
-            obs?['level'] ??
-            obs?['kind'] ??
-            obs?['type'] ??
-            '')
-        .toString()
-        .toLowerCase()
-        .trim();
+    // Prefer session_insights as the only source of truth for summaries.
+    final si = parseJsonMap(row['session_insights']);
 
-    if (marker.contains('session')) return true;
-    if (marker.contains('turn') || marker.contains('message')) return false;
-
-    final si = _asJsonMap(row['session_insights']);
     final keySentence = (si?['key_sentence'] as String? ?? '').trim();
     final items = (si?['items'] as List<dynamic>? ?? const []);
+
+    // If we have actual insight structure, it's a session summary row.
     if (keySentence.isNotEmpty || items.isNotEmpty) return true;
 
-    final shortSummary = (row['short_summary'] as String? ?? '').trim();
-    final fullSummary = (row['full_summary'] as String? ?? '').trim();
-    final merged = shortSummary.isNotEmpty ? shortSummary : fullSummary;
+    final shortS = pickSummaryFromSessionInsights(si, full: false);
+    final fullS = pickSummaryFromSessionInsights(si, full: true);
+    final merged = shortS.isNotEmpty ? shortS : fullS;
+
+    if (merged.isEmpty) return false;
 
     // Exclude language-learning tagged outputs if they ever land in memory_summary
     final lower = merged.toLowerCase();
-    if (lower.contains('[l1]') || lower.contains('[l2]') || lower.contains('[lesson]') ||
-        lower.contains('[vocab]') || lower.contains('[drill]') || lower.contains('[quiz]') ||
+    if (lower.contains('[l1]') ||
+        lower.contains('[l2]') ||
+        lower.contains('[lesson]') ||
+        lower.contains('[vocab]') ||
+        lower.contains('[drill]') ||
+        lower.contains('[quiz]') ||
         lower.contains('[rom]')) {
       return false;
     }
 
+    // Filter out the "mini transcript" / wake checks.
+    if (lower.startsWith('hey gemini')) return false;
 
-    // filter out the "mini transcript" style rows
-    if (merged.toLowerCase().startsWith('hey gemini')) return false;
+    // Too short = likely not a real session summary.
     if (merged.length < 140) return false;
 
     return true;
@@ -212,14 +381,97 @@ class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
     return ActionChip(
       label: Text(
         label,
-        maxLines: 1,
+        maxLines: 2,
         overflow: TextOverflow.ellipsis,
+        softWrap: true,
         style: theme.textTheme.bodySmall,
       ),
       onPressed: onTap,
     );
   }
 
+
+
+  // --------------------------------------------------------------
+  // Longitudinal snapshot (read-only) helpers
+  // Stored at memory_summary.observations.longitudinal_snapshot
+  // --------------------------------------------------------------
+  Map<String, dynamic>? _extractLongitudinalSnapshot(Map<String, dynamic> row) {
+    final obs = _asJsonMap(row['observations']);
+    final snap = obs?['longitudinal_snapshot'];
+    if (snap is Map) return Map<String, dynamic>.from(snap as Map);
+    return null;
+  }
+
+  List<String> _labelsFromList(dynamic v, {int max = 3}) {
+    if (v is List) {
+      final out = <String>[];
+      for (final it in v) {
+        if (it is Map && it['label'] is String) {
+          final s = (it['label'] as String).trim();
+          if (s.isNotEmpty) out.add(s);
+        } else if (it is String) {
+          final s = it.trim();
+          if (s.isNotEmpty) out.add(s);
+        }
+        if (out.length >= max) break;
+      }
+      return out;
+    }
+    return const <String>[];
+  }
+
+  Widget _buildLongitudinalSnapshotPreview({
+    required ThemeData theme,
+    required Map<String, dynamic> row,
+  }) {
+    final snap = _extractLongitudinalSnapshot(row);
+    if (snap == null) return const SizedBox.shrink();
+
+    final emerging = _labelsFromList(snap['emerging_themes_month'], max: 3);
+
+    // Recurring tensions can be list of strings or objects with label.
+    final tensions = _labelsFromList(snap['recurring_tensions'], max: 2);
+
+    // If neither emerging nor tensions exist, try to show a tiny "change" preview.
+    final changed = snap['changed_since_last_week'];
+    final changedUp = (changed is Map) ? _labelsFromList(changed['up'], max: 2) : const <String>[];
+    final changedDown = (changed is Map) ? _labelsFromList(changed['down'], max: 2) : const <String>[];
+
+    if (emerging.isEmpty && tensions.isEmpty && changedUp.isEmpty && changedDown.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    final lines = <String>[];
+    if (emerging.isNotEmpty) {
+      lines.add('Emerging: ${emerging.join(', ')}');
+    }
+    if (tensions.isNotEmpty) {
+      lines.add('Tensions: ${tensions.join(' • ')}');
+    } else if (changedUp.isNotEmpty || changedDown.isNotEmpty) {
+      final parts = <String>[];
+      if (changedUp.isNotEmpty) parts.add('More: ${changedUp.join(', ')}');
+      if (changedDown.isNotEmpty) parts.add('Less: ${changedDown.join(', ')}');
+      lines.add('Change: ${parts.join(' | ')}');
+    }
+
+    // Max 2 lines, subtle style.
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          for (final line in lines.take(2))
+            Text(
+              line,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.bodySmall,
+            ),
+        ],
+      ),
+    );
+  }
   Future<void> _loadStories() async {
     setState(() {
       _loading = true;
@@ -239,7 +491,7 @@ class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
       final res = await _client
           .from('memory_summary')
           .select(
-              'id, conversation_id, raw_id, short_summary, full_summary, observations, session_insights, created_at')
+              'id, conversation_id, raw_id, short_summary, observations, session_insights, created_at')
           .eq('user_id', user.id)
           .order('created_at', ascending: false);
 
@@ -269,6 +521,8 @@ class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
       });
     }
   }
+
+
 
   @override
   Widget build(BuildContext context) {
@@ -321,16 +575,18 @@ class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
                             (row['id'] as String? ?? '').trim();
                         final dateLabel = _dateLabelForRow(row);
 
-                        final shortSummary =
-                            (row['short_summary'] as String? ?? '').trim();
-                        final fullSummary =
-                            (row['full_summary'] as String? ?? '').trim();
+                        
+                        // UI reads summaries strictly from session_insights (canonical truth).
+                        final siForSummary = parseJsonMap(row['session_insights']) ?? const <String, dynamic>{};
+                        final sessionSummary =
+                            pickSummaryFromSessionInsights(siForSummary, full: false).isNotEmpty
+                                ? pickSummaryFromSessionInsights(siForSummary, full: false)
+                                : (pickSummaryFromSessionInsights(siForSummary, full: true).isNotEmpty
+                                    ? pickSummaryFromSessionInsights(siForSummary, full: true)
+                                    : '(No session summary yet)');
 
-                        final sessionSummary = (shortSummary.isNotEmpty
-                            ? shortSummary
-                            : (fullSummary.isNotEmpty
-                                ? fullSummary
-                                : '(No session summary yet)'));
+                        final shortSummary = pickSummaryFromSessionInsights(siForSummary, full: false);
+                        final fullSummary = pickSummaryFromSessionInsights(siForSummary, full: true);
 
                         final obs = _asJsonMap(row['observations']);
                         final rawSessionKey =
@@ -349,17 +605,15 @@ class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
                         void openDetail() {
                           Navigator.of(context).push(
                             MaterialPageRoute(
-                              builder: (_) => StoryDetailScreen(
+                              builder: (_) => EndSessionReviewScreen(
                                 memorySummaryId: memorySummaryId,
-                                sessionKey: rawSessionKey.isNotEmpty
-                                    ? rawSessionKey
-                                    : null,
+                                sessionKey: rawSessionKey,
                                 dateLabel: dateLabel,
                                 fallbackTitle: dateLabel,
                                 fallbackBody: sessionSummary,
                                 shortSummary: shortSummary,
                                 fullSummary: fullSummary,
-                                sessionInsights: sessionInsights,
+                                sessionInsights: siForSummary,
                               ),
                             ),
                           );
@@ -383,6 +637,9 @@ class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
                                     style: theme.textTheme.bodyMedium,
                                   ),
                                 const SizedBox(height: 10),
+
+                                _buildLongitudinalSnapshotPreview(theme: theme, row: row),
+                                const SizedBox(height: 8),
 
                                 // (2) Insight chip (tap opens detail)
                                 _buildInsightsChip(
@@ -493,6 +750,8 @@ class StoryDetailScreen extends StatefulWidget {
 class _StoryDetailScreenState extends State<StoryDetailScreen> {
   final SupabaseClient _client = Supabase.instance.client;
   final TextEditingController _controller = TextEditingController();
+  final ScrollController _storyScrollController = ScrollController();
+  final ScrollController _insightsScrollController = ScrollController();
   bool _loading = true;
   bool _saving = false;
   bool _deleting = false;
@@ -501,6 +760,9 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
   bool _revealPanels = false;
 
   String? _error;
+  String? _rawIdSeedFromSummary;
+  String? _conversationIdFromSummary;
+
 
   // ---------------------------------------------------------------------------
   // Story seeds (per-session "named stories") + longitudinal insights
@@ -520,16 +782,62 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
     _kickoffSideLoads();
   }
 
-  void _kickoffSideLoads() {
-    // Story seeds are per-session (conversation_id == observations.session_key).
-    final sk = (widget.sessionKey ?? '').trim();
-    if (sk.isNotEmpty) {
-      _loadStorySeedsForSession(sk);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    _storyScrollController.dispose();
+    _insightsScrollController.dispose();
+    super.dispose();
+  }
+
+
+  Map<String, dynamic>? _asJsonMap(dynamic raw) {
+    if (raw == null) return null;
+    if (raw is Map<String, dynamic>) return raw;
+    if (raw is String && raw.trim().isNotEmpty) {
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map<String, dynamic>) return decoded;
+      } catch (_) {}
     }
+    return null;
+  }
+
+  void _kickoffSideLoads() {    // Story seeds are intentionally hidden in donor UX (and can be re-enabled later).
     // Longitudinal insights are cross-session (latest N for this user).
     _loadLatestLongitudinalInsights();
   }
 
+  bool looksLikeTranscript(String s) {
+    final t = s.trim();
+    if (t.isEmpty) return false;
+
+    final lower = t.toLowerCase();
+
+    if (lower.contains('assistant:') ||
+        lower.contains('user:') ||
+        lower.contains('[00:') ||
+        RegExp(r'\b\d{1,2}:\d{2}:\d{2}\b').hasMatch(lower)) {
+      return true;
+    }
+
+    final lines =
+      t.split(RegExp(r'\r?\n')).where((l) => l.trim().isNotEmpty).toList();
+
+    if (lines.length >= 6) {
+      final shortCount = lines.where((l) => l.trim().length < 50).length;
+    if (shortCount / lines.length >= 0.6) return true;
+  }
+
+  final prefixed =
+      lines.where((l) => RegExp(r'^\s*\w[\w\s]{0,20}:').hasMatch(l)).length;
+
+  if (prefixed >= 2) return true;
+
+  return false;
+}
+ 
   Widget _buildSessionInsightsSection(ThemeData theme) {
   Map<String, dynamic>? si;
 
@@ -595,20 +903,72 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
           ),
         ],
 
-        if (items.isNotEmpty) ...[
+        
+if (items.isNotEmpty) ...[
           const SizedBox(height: 10),
-          ...items.take(10).map((it) {
-            if (it is! Map) return const SizedBox.shrink();
-            final text = (it['text'] as String? ?? '').trim();
-            final kind = (it['kind'] as String? ?? '').trim();
-            if (text.isEmpty) return const SizedBox.shrink();
 
-            final prefix = kind.isNotEmpty ? '${kind.toUpperCase()}: ' : '';
-            return Padding(
-              padding: const EdgeInsets.symmetric(vertical: 4),
-              child: Text("• $prefix$text"),
+          // Group by kind so the user sees clear differentiation.
+          Builder(builder: (context) {
+            String prettyKind(String k) {
+              final key = k.trim().toLowerCase();
+              if (key.isEmpty) return 'Other';
+              if (key == 'insight' || key == 'insights') return 'Insights';
+              if (key == 'reflection' || key == 'reflections') return 'Reflections';
+              if (key == 'pattern' || key == 'pattern_noticing' || key == 'pattern-noticing' || key == 'pattern noticing') {
+                return 'Patterns';
+              }
+              if (key == 'theme' || key == 'themes') return 'Themes';
+              if (key == 'value' || key == 'values') return 'Values';
+              if (key == 'behavior' || key == 'behaviour') return 'Behaviors';
+              if (key == 'trait' || key == 'traits') return 'Traits';
+              return key.split(RegExp(r'[_\-\s]+')).map((w) {
+                if (w.isEmpty) return w;
+                return w[0].toUpperCase() + w.substring(1);
+              }).join(' ');
+            }
+
+            final Map<String, List<String>> grouped = <String, List<String>>{};
+            for (final it in items.take(80)) {
+              if (it is! Map) continue;
+              final text = (it['text'] as String? ?? '').trim();
+              if (text.isEmpty) continue;
+              final kindRaw = (it['kind'] as String? ?? '').trim();
+              final kind = prettyKind(kindRaw);
+              grouped.putIfAbsent(kind, () => <String>[]);
+              grouped[kind]!.add(text);
+            }
+            if (grouped.isEmpty) return const SizedBox.shrink();
+
+            return ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 520),
+              child: Scrollbar(
+                controller: _insightsScrollController,
+                thumbVisibility: true,
+                child: SingleChildScrollView(
+                  controller: _insightsScrollController,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      for (final entry in grouped.entries) ...[
+                        const SizedBox(height: 6),
+                        Text(
+                          entry.key,
+                          style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+                        ),
+                        const SizedBox(height: 4),
+                        for (final t in entry.value)
+                          Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 4),
+                            child: SelectableText('• $t'),
+                          ),
+                        const SizedBox(height: 10),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
             );
-            }),
+          }),
         ],
       ],
     ),
@@ -636,7 +996,7 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
       try {
         final res = await _client
             .from('memory_summary')
-            .select('short_summary, full_summary')
+            .select('short_summary, session_insights, raw_id, conversation_id')
             .eq('id', widget.memorySummaryId)
             .eq('user_id', user.id)
             .maybeSingle();
@@ -651,8 +1011,24 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
 
       final shortSummaryFromDb =
           (summaryRes?['short_summary'] as String? ?? '').trim();
-      final fullSummaryFromDb =
-          (summaryRes?['full_summary'] as String? ?? '').trim();
+      final siFromDb = _asJsonMap(summaryRes?['session_insights']) ?? const <String, dynamic>{};
+      String _fullFromSi(Map<String, dynamic> si) {
+        final direct = (si['full_summary'] as String? ?? '').trim();
+        if (direct.isNotEmpty) return direct;
+        final reframed = si['reframed'];
+        if (reframed is Map<String, dynamic>) {
+          final rf = (reframed['full_summary'] as String? ?? '').trim();
+          if (rf.isNotEmpty) return rf;
+        }
+        return '';
+      }
+      final fullSummaryFromDb = _fullFromSi(siFromDb);
+      final rawIdSeedFromDb = (summaryRes?['raw_id'] ?? '').toString().trim();
+      final conversationIdFromDb = (summaryRes?['conversation_id'] ?? '').toString().trim();
+
+      _rawIdSeedFromSummary = rawIdSeedFromDb.isNotEmpty ? rawIdSeedFromDb : _rawIdSeedFromSummary;
+      _conversationIdFromSummary = conversationIdFromDb.isNotEmpty ? conversationIdFromDb : _conversationIdFromSummary;
+
 
       final effectiveShortSummary = shortSummaryFromDb.isNotEmpty
           ? shortSummaryFromDb
@@ -662,17 +1038,21 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
           ? fullSummaryFromDb
           : widget.fullSummary.trim();
 
-      String initialText;
-      if (effectiveFullSummary.isNotEmpty) {
-        initialText = effectiveFullSummary;
-      } else if (effectiveShortSummary.isNotEmpty) {
-        initialText = effectiveShortSummary;
+      String initialText = '';
+
+      // Prefer actual summaries; avoid transcript-like text.
+      final f = effectiveFullSummary.trim();
+      final s = effectiveShortSummary.trim();
+      if (f.isNotEmpty && !looksLikeTranscript(f)) {
+        initialText = f;
+      } else if (s.isNotEmpty && !looksLikeTranscript(s)) {
+        initialText = s;
       } else {
-        // Last resort: whatever fallback we computed earlier.
-        initialText = widget.fallbackBody;
+        // Leave blank rather than showing transcript/meta.
+        initialText = '';
       }
 
-      _controller.text = initialText;
+      _controller.text = initialText.isEmpty ? '' : _secondPersonifySummary(initialText);
 
       setState(() {
         _loading = false;
@@ -707,7 +1087,7 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
     try {
       final res = await _client
           .from('story_seeds')
-          .select('id, title, seed_type, seed_json, created_at, conversation_id, summary_id')
+          .select('id, title, seed_type, seed_text, created_at, conversation_id, summary_id')
           .eq('user_id', user.id)
           .eq('conversation_id', conversationId)
           .order('created_at', ascending: false);
@@ -751,6 +1131,7 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
             'id, short_title, insight_text, insight_type, confidence, tags, created_at, source_session_ids',
           )
           .eq('user_id', user.id)
+          .eq('insight_type', 'longitudinal_v2')
           .order('created_at', ascending: false)
           .limit(6);
 
@@ -776,8 +1157,8 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
   }
 
   String _seedOneLiner(Map<String, dynamic> seed) {
-    // Try a few common fields inside seed_json
-    final sj = seed['seed_json'];
+    // Try a few common fields inside seed_text
+    final sj = seed['seed_text'];
     Map<String, dynamic>? m;
     if (sj is Map<String, dynamic>) {
       m = sj;
@@ -803,79 +1184,8 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
     return '';
   }
 
-  Widget _buildStorySeedsSection(ThemeData theme) {
-    final sk = (widget.sessionKey ?? '').trim();
-    if (sk.isEmpty) return const SizedBox.shrink();
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          'Stories identified in this session',
-          style: theme.textTheme.titleMedium,
-        ),
-        const SizedBox(height: 8),
-
-        if (_loadingSeeds)
-          const Padding(
-            padding: EdgeInsets.symmetric(vertical: 8),
-            child: Center(child: CircularProgressIndicator()),
-          )
-        else if (_seedError != null)
-          Text(
-            _seedError!,
-            style: theme.textTheme.bodyMedium?.copyWith(
-              color: theme.colorScheme.error,
-            ),
-          )
-        else if (_storySeeds.isEmpty)
-          Text(
-            'No story seeds found yet for this session.',
-            style: theme.textTheme.bodyMedium,
-          )
-        else
-          ..._storySeeds.take(10).map((s) {
-            final title = ((s['title'] as String?) ?? '').trim();
-            final seedType = ((s['seed_type'] as String?) ?? '').trim();
-            final oneLiner = _seedOneLiner(s);
-            return Card(
-              margin: const EdgeInsets.only(bottom: 10),
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            title.isNotEmpty ? title : '(Untitled story)',
-                            style: theme.textTheme.titleSmall?.copyWith(
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                        ),
-                        if (seedType.isNotEmpty)
-                          Chip(
-                            visualDensity: VisualDensity.compact,
-                            materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                            label: Text(seedType),
-                          ),
-                      ],
-                    ),
-                    if (oneLiner.isNotEmpty) ...[
-                      const SizedBox(height: 6),
-                      Text(oneLiner, style: theme.textTheme.bodyMedium),
-                    ],
-                  ],
-                ),
-              ),
-            );
-          }).toList(),
-
-        const SizedBox(height: 12),
-      ],
-    );
+    Widget _buildStorySeedsSection(ThemeData theme) {
+    return const SizedBox.shrink();
   }
 
   Widget _buildLongitudinalInsightsSection(ThemeData theme) {
@@ -903,7 +1213,7 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
           )
         else if (_latestInsights.isEmpty)
           Text(
-            'No insights found yet.',
+            'No longitudinal insights yet — record a few meaningful sessions to build durable themes.',
             style: theme.textTheme.bodyMedium,
           )
         else
@@ -984,14 +1294,8 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
         onConflict: 'user_id,memory_summary_id',
       );
 
-      // 2) Update memory_summary.full_summary so downstream systems see curated text
-      await _client
-          .from('memory_summary')
-          .update({'full_summary': trimmed})
-          .eq('id', widget.memorySummaryId)
-          .eq('user_id', user.id);
-
-      // 3) Kick off an insights rebuild
+      // 2) Note: memory_summary.full_summary column was removed; curated text is stored in memory_curated only.
+// 3) Kick off an insights rebuild
       try {
         await _client.functions
             .invoke('rebuild-insights', body: {'user_id': user.id});
@@ -1111,6 +1415,33 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text('Session: ${widget.dateLabel}'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.fact_check),
+            tooltip: 'Session Review',
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => EndSessionReviewScreen(
+                    memorySummaryId: widget.memorySummaryId,
+                    sessionKey: (widget.sessionKey ?? ''),
+                    dateLabel: widget.dateLabel,
+                    fallbackTitle: 'Session Review',
+                    fallbackBody: (widget.fullSummary.isNotEmpty
+                            ? widget.fullSummary
+                            : widget.shortSummary)
+                        .trim(),
+                    shortSummary: widget.shortSummary,
+                    fullSummary: widget.fullSummary,
+                    sessionInsights: (widget.sessionInsights is Map)
+                        ? (widget.sessionInsights as Map).cast<String, dynamic>()
+                        : (widget.sessionInsights ?? const {}),
+                  ),
+                ),
+              );
+            },
+          ),
+        ],
       ),
       body: _loading
           ? const Center(
@@ -1132,9 +1463,7 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
                     return ListView(
                       padding: EdgeInsets.fromLTRB(16, 16, 16, 16 + bottomInset),
                       children: [
-                        _buildSessionInsightsSection(theme),
-                        _buildStorySeedsSection(theme),
-                        _buildLongitudinalInsightsSection(theme),
+                        _buildSessionInsightsSection(theme),                        _buildLongitudinalInsightsSection(theme),
                         Text(
                           'Your story for this session',
                           style: theme.textTheme.titleMedium,
@@ -1144,8 +1473,10 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
                           height: editorH,
                           child: TextField(
                             controller: _controller,
+                            scrollController: _storyScrollController,
+                            scrollPhysics: const BouncingScrollPhysics(),
                             maxLines: null,
-                            expands: true,
+                            expands: false,
                             keyboardType: TextInputType.multiline,
                             decoration: const InputDecoration(
                               border: OutlineInputBorder(),
@@ -1169,6 +1500,23 @@ class _StoryDetailScreenState extends State<StoryDetailScreen> {
                           runSpacing: 8,
                           alignment: WrapAlignment.end,
                           children: [
+                            OutlinedButton.icon(
+                              onPressed: () {
+                                final rawIdSeed = (_rawIdSeedFromSummary ?? '').toString().trim();
+                                final sk = (widget.sessionKey ?? _conversationIdFromSummary ?? '').toString().trim();
+                                Navigator.of(context).push(
+                                  MaterialPageRoute(
+                                    builder: (_) => TranscriptScreen(
+                                      sessionKey: sk,
+                                      dateLabel: widget.dateLabel,
+                                      rawIdSeed: rawIdSeed.isEmpty ? null : rawIdSeed,
+                                    ),
+                                  ),
+                                );
+                              },
+                              icon: const Icon(Icons.article_outlined),
+                              label: const Text('Transcript'),
+                            ),
                             TextButton.icon(
                               onPressed: _deleting ? null : _deleteSession,
                               icon: _deleting
@@ -1488,8 +1836,9 @@ class _InsightsScreenState extends State<InsightsScreen> {
                           Padding(
                             padding: EdgeInsets.all(16),
                             child: Text(
-                              'No insights yet. As you record more memories, '
-                              'this screen will show patterns and themes.',
+                              'No longitudinal insights yet. Even if you have lots of memories overall, '
+                              'this only appears after a few recent sessions are “meaningful” (not short/procedural). '
+                              'Record a longer reflective session, then refresh this screen.',
                             ),
                           ),
                         ],
@@ -1553,6 +1902,126 @@ class _InsightsScreenState extends State<InsightsScreen> {
 
 
 
+
+
+class SessionHistoryScreen extends StatefulWidget {
+  const SessionHistoryScreen({super.key});
+
+  @override
+  State<SessionHistoryScreen> createState() => _SessionHistoryScreenState();
+}
+
+class _SessionHistoryScreenState extends State<SessionHistoryScreen> {
+  final SupabaseClient _client = Supabase.instance.client;
+  bool _loading = true;
+  String _error = '';
+  List<Map<String, dynamic>> _rows = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final uid = _client.auth.currentUser?.id;
+    if (uid == null || uid.isEmpty) {
+      setState(() { _loading = false; _error = 'Not signed in.'; });
+      return;
+    }
+    setState(() { _loading = true; _error = ''; });
+    try {
+      final res = await _client
+          .from('memory_summary')
+          .select('id, created_at, short_summary, session_insights, conversation_id, raw_id')
+          .eq('user_id', uid)
+          .order('created_at', ascending: false)
+          .limit(50);
+      if (res is List) {
+        _rows = res.cast<Map<String, dynamic>>();
+      } else {
+        _rows = const [];
+      }
+    } catch (e) {
+      _error = e.toString();
+      _rows = const [];
+    }
+    if (!mounted) return;
+    setState(() { _loading = false; });
+  }
+
+  String _formatTs(dynamic ts) {
+    try {
+      final d = DateTime.parse(ts.toString()).toLocal();
+      return '${d.year.toString().padLeft(4,'0')}-${d.month.toString().padLeft(2,'0')}-${d.day.toString().padLeft(2,'0')} '
+             '${d.hour.toString().padLeft(2,'0')}:${d.minute.toString().padLeft(2,'0')}';
+    } catch (_) {
+      return ts?.toString() ?? '';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Session history'),
+        actions: [
+          IconButton(
+            tooltip: 'Refresh',
+            onPressed: _loading ? null : _load,
+            icon: const Icon(Icons.refresh),
+          ),
+        ],
+      ),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : _error.isNotEmpty
+              ? Center(child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(_error),
+                ))
+              : ListView.separated(
+                  padding: const EdgeInsets.all(12),
+                  itemCount: _rows.length,
+                  separatorBuilder: (_, __) => const SizedBox(height: 10),
+                  itemBuilder: (context, i) {
+                    final r = _rows[i];
+                    final id = (r['id'] ?? '').toString();
+                    final date = _formatTs(r['created_at']);
+                    
+                    final si = parseJsonMap(r['session_insights']) ?? const <String, dynamic>{};
+                    final displayShort = pickSummaryFromSessionInsights(si, full: false);
+                    final fullS = pickSummaryFromSessionInsights(si, full: true);
+
+                    return Card(
+                      child: ListTile(
+                        title: Text(date.isEmpty ? 'Session' : date),
+                          subtitle: Text(displayShort.isEmpty ? '(no summary)' : displayShort, maxLines: 4, overflow: TextOverflow.ellipsis),
+                        onTap: () {
+                          final sessionKey = (r['conversation_id'] ?? '').toString().trim();
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (_) => EndSessionReviewScreen(
+                                memorySummaryId: id,
+                                sessionKey: sessionKey.isEmpty ? id : sessionKey,
+                                dateLabel: date,
+                                fallbackTitle: 'Session',
+                                fallbackBody: displayShort,
+                                shortSummary: displayShort,
+                                fullSummary: fullS,
+                                sessionInsights: si,
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    );
+                  },
+                ),
+    );
+  }
+}
+
 class TranscriptScreen extends StatefulWidget {
   final String sessionKey;
   final String dateLabel;
@@ -1602,21 +2071,27 @@ class _TranscriptScreenState extends State<TranscriptScreen> {
     }
 
     try {
-      // First try: use the passed key as memory_raw.conversation_id
-      List<dynamic> res = await _client
-          .from('memory_raw')
-          .select('id, content, source, created_at, conversation_id')
-          .eq('user_id', user.id)
-          .eq('conversation_id', widget.sessionKey)
-          .order('created_at', ascending: true);
+      // First try: use the passed key as memory_raw.conversation_id.
+      // IMPORTANT: PostgREST will throw if we compare a UUID column to "".
+      List<dynamic> res = <dynamic>[];
+      final sessionKey = widget.sessionKey.trim();
+      if (sessionKey.isNotEmpty && sessionKey != 'n/a') {
+        res = await _client
+            .from('memory_raw')
+            .select('id, content, source, created_at, conversation_id')
+            .eq('user_id', user.id)
+            .eq('conversation_id', sessionKey)
+            .order('created_at', ascending: true)
+            .order('id', ascending: true);
+      }
 
-      // Fallback: if nothing found and we have a raw_id seed, look up the real conversation_id
-      if ((res as List).isEmpty && widget.rawIdSeed != null && widget.rawIdSeed!.isNotEmpty) {
+      // Fallback: if nothing found and we have a raw_id seed, look up the real conversation_id.
+      if ((res as List).isEmpty && widget.rawIdSeed != null && widget.rawIdSeed!.trim().isNotEmpty) {
         final seedRes = await _client
             .from('memory_raw')
             .select('conversation_id')
             .eq('user_id', user.id)
-            .eq('id', widget.rawIdSeed!)
+            .eq('id', widget.rawIdSeed!.trim())
             .maybeSingle();
 
         final conv = (seedRes is Map<String, dynamic>)
@@ -1629,7 +2104,8 @@ class _TranscriptScreenState extends State<TranscriptScreen> {
               .select('id, content, source, created_at, conversation_id')
               .eq('user_id', user.id)
               .eq('conversation_id', conv)
-              .order('created_at', ascending: true);
+              .order('created_at', ascending: true)
+              .order('id', ascending: true);
         }
       }
 
@@ -1717,6 +2193,794 @@ class _TranscriptScreenState extends State<TranscriptScreen> {
                     );
                   },
                 ),
+    );
+  }
+}
+
+// ============================================================================
+// END OF SESSION REVIEW (Dedicated screen)
+// ============================================================================
+
+class EndSessionReviewScreen extends StatefulWidget {
+  final String memorySummaryId;
+  final String sessionKey;
+  final String dateLabel;
+
+  // Fallbacks (used when DB row is not yet available)
+  final String fallbackTitle;
+  final String fallbackBody;
+
+  // Optional payloads (from server or DB)
+  final String shortSummary;
+  final String fullSummary;
+  final Map<String, dynamic> sessionInsights;
+
+  const EndSessionReviewScreen({
+    super.key,
+    required this.memorySummaryId,
+    required this.sessionKey,
+    required this.dateLabel,
+    required this.fallbackTitle,
+    required this.fallbackBody,
+    required this.shortSummary,
+    required this.fullSummary,
+    required this.sessionInsights,
+  });
+
+  @override
+  State<EndSessionReviewScreen> createState() => _EndSessionReviewScreenState();
+}
+
+class _EndSessionReviewScreenState extends State<EndSessionReviewScreen> {
+  final SupabaseClient _client = Supabase.instance.client;
+  Future<List<Map<String, dynamic>>>? _longitudinalFuture;
+  
+  String get whatCapturedText {
+    final ins = _effectiveInsights();
+    final short = pickSummaryFromSessionInsights(ins, full: false).trim();
+    final full = pickSummaryFromSessionInsights(ins, full: true).trim();
+
+    final candidate = short.isNotEmpty ? short : full;
+    if (candidate.isEmpty) return '—';
+
+    // UI normalization only (do NOT compute alternative truth).
+    return normalizeSummaryVoice(candidate);
+  }
+
+  /// Light UI-only normalization for summary text (presentation only).
+  /// This must NEVER compute a different “truth”; it only cleans formatting.
+  String normalizeSummaryVoice(String input) {
+    var t = input.trim();
+    // Collapse whitespace.
+    t = t.replaceAll(RegExp(r'\s+'), ' ');
+    // Remove leading bullet characters if present.
+    t = t.replaceAll(RegExp(r'^[\-•\u2022]+\s*'), '');
+    return t;
+  }
+
+
+
+  Future<void> _editStoryText() async {
+    // Ensure we have something to edit (prefer current displayed story text)
+    final initial = whatCapturedText.trim();
+    final controller = TextEditingController(text: initial);
+
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          title: const Text('Edit story'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: TextField(
+              controller: controller,
+              maxLines: 10,
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(),
+                hintText: 'Edit the story summary for this session…',
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(null),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.of(ctx).pop(controller.text),
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (result == null) return;
+    final trimmed = result.trim();
+    if (trimmed.isEmpty) return;
+
+    final user = _client.auth.currentUser;
+    if (user == null) return;
+
+    setState(() {
+      _loading = true;
+      _error = '';
+    });
+
+    try {
+      await _client
+          .from('memory_summary')
+          .update({'short_summary': trimmed, 'session_insights': {..._effectiveInsights(), 'short_summary': trimmed}})
+          .eq('id', widget.memorySummaryId)
+          .eq('user_id', user.id);
+
+      // Update local cached row so the UI updates immediately
+      setState(() {
+        _row = {
+          ...?_row,
+          'short_summary': trimmed,
+        };
+      });
+    } catch (e) {
+      setState(() {
+        _error = 'Failed to save edit: $e';
+      });
+    } finally {
+      setState(() {
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _saveCuratedStory() async {
+    final user = _client.auth.currentUser;
+    if (user == null) return;
+
+    final trimmed = whatCapturedText.trim();
+    if (trimmed.isEmpty) return;
+
+    setState(() {
+      _loading = true;
+      _error = '';
+    });
+
+    try {
+
+      // Persist the edited story text back to memory_summary (canonical),
+      // and keep short_summary in sync when the edited text is reasonably short.
+      final existingShort = pickSummaryFromSessionInsights(_effectiveInsights(), full: false).trim().isNotEmpty
+          ? pickSummaryFromSessionInsights(_effectiveInsights(), full: false).trim()
+          : widget.shortSummary;
+      final shortCandidate = trimmed.length <= 500 ? trimmed : existingShort;
+
+      // Canonical truth lives in session_insights (and curated lives in memory_curated).
+      // Do NOT touch memory_summary.full_summary here.
+      final mergedSI = <String, dynamic>{
+        ..._effectiveInsights(),
+        // Keep short_summary mirrored for list UIs.
+        'short_summary': shortCandidate,
+        // Store curated text in session_insights for easy downstream access.
+        'curated_story': trimmed,
+        'curated_at': DateTime.now().toUtc().toIso8601String(),
+      };
+
+      await _client
+          .from('memory_summary')
+          .update({
+            'short_summary': shortCandidate,
+            'session_insights': mergedSI,
+            'updated_at': DateTime.now().toUtc().toIso8601String(),
+          })
+          .eq('id', widget.memorySummaryId)
+          .eq('user_id', user.id);
+
+      // Update local cached row so the UI updates immediately
+      setState(() {
+        _row = {
+          ...?_row,
+          'short_summary': shortCandidate,
+          'session_insights': mergedSI,
+        };
+      });
+
+
+      // Upsert curated text for this memory_summary row
+      await _client.from('memory_curated').upsert(
+        {
+          'user_id': user.id,
+          'memory_summary_id': widget.memorySummaryId,
+          'curated_text': trimmed,
+        },
+        onConflict: 'user_id,memory_summary_id',
+      );
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Curated story saved.')),
+        );
+      }
+    } catch (e) {
+      setState(() {
+        _error = 'Failed to save curated story: $e';
+      });
+    } finally {
+      setState(() {
+        _loading = false;
+      });
+    }
+  }
+
+
+  bool _loading = false;
+  String _error = '';
+
+  Map<String, dynamic>? _row; // memory_summary row
+
+  @override
+  void initState() {
+    super.initState();
+    _longitudinalFuture = _fetchLongitudinalInsights();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final id = widget.memorySummaryId.trim();
+    if (id.isEmpty || id == 'n/a') {
+      // We can still render from fallbacks.
+      return;
+    }
+
+    setState(() {
+      _loading = true;
+      _error = '';
+    });
+
+    try {
+      final client = Supabase.instance.client;
+      final res = await client
+          .from('memory_summary')
+          .select('id, created_at, short_summary, observations, session_insights, conversation_id, raw_id')
+          .eq('id', id)
+          .limit(1);
+
+      if (res is List && res.isNotEmpty) {
+        _row = Map<String, dynamic>.from(res.first as Map);
+      } else {
+        _error = 'Session summary not found yet.';
+      }
+    } catch (e) {
+      _error = 'Failed to load session review: $e';
+    } finally {
+      if (!mounted) return;
+      setState(() {
+      _loading = false;
+      _longitudinalFuture = _fetchLongitudinalInsights();
+    });
+}
+  }
+
+  Future<List<Map<String, dynamic>>> _fetchLongitudinalInsights() async {
+    final uid = _client.auth.currentUser?.id;
+    if (uid == null || uid.isEmpty) return <Map<String, dynamic>>[];
+    try {
+      final res = await _client
+          .from('memory_insights')
+          .select('short_title, insight_text, created_at')
+          .eq('user_id', uid)
+          .eq('insight_type', 'longitudinal_v2')
+          .order('created_at', ascending: false)
+          .limit(5);
+      if (res is List) return res.cast<Map<String, dynamic>>();
+    } catch (_) {}
+    return <Map<String, dynamic>>[];
+  }
+
+
+
+  Map<String, dynamic> _effectiveInsights() {
+    final fromDb = _row?['session_insights'];
+    if (fromDb is Map) return Map<String, dynamic>.from(fromDb as Map);
+    return widget.sessionInsights;
+  }
+
+  
+  String _effectiveShortSummary() {
+    final ins = _effectiveInsights();
+    final s = pickSummaryFromSessionInsights(ins, full: false).trim();
+    if (s.isNotEmpty) return s;
+    if (widget.shortSummary.trim().isNotEmpty) return widget.shortSummary.trim();
+    return widget.fallbackBody.trim();
+  }
+
+  String _effectiveFullSummary() {
+    final ins = _effectiveInsights();
+    final s = pickSummaryFromSessionInsights(ins, full: true).trim();
+    if (s.isNotEmpty) return s;
+    if (widget.fullSummary.trim().isNotEmpty) return widget.fullSummary.trim();
+    return widget.fallbackBody.trim();
+  }
+
+Map<String, dynamic>? _reframed() {
+    final ins = _effectiveInsights();
+    final r = ins['reframed'];
+    if (r is Map) return Map<String, dynamic>.from(r as Map);
+    return null;
+  }
+
+  List<String> _stringList(dynamic v) {
+    if (v is List) {
+      return v
+          .whereType<String>()
+          .map((s) => s.trim())
+          .where((s) => s.isNotEmpty)
+          .toList(growable: false);
+    }
+    return const <String>[];
+  }
+
+  Widget _bulletList(List<String> items) {
+    if (items.isEmpty) return const SizedBox.shrink();
+    return Column(
+      children: items
+          .map((t) => Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('•  '),
+                    Expanded(child: Text(t)),
+                  ],
+                ),
+              ))
+          .toList(growable: false),
+    );
+  }
+
+  
+  Widget _buildLongitudinalSnapshotSection(BuildContext context) {
+    final theme = Theme.of(context);
+    final obs = parseJsonMap(_row?["observations"]) ?? const <String, dynamic>{};
+    final snapRaw = obs["longitudinal_snapshot"];
+    if (snapRaw is! Map) return const SizedBox.shrink();
+    final snap = Map<String, dynamic>.from(snapRaw as Map);
+    // Prefer an already-written observational paragraph if present.
+    String? snapshotText;
+    final st0 = snap["snapshot_text"];
+    if (st0 is String && st0.trim().isNotEmpty) {
+      snapshotText = st0.trim();
+    } else {
+      final v2 = snap["v2"];
+      if (v2 is Map) {
+        final blocks = (v2["blocks"] is Map) ? Map<String, dynamic>.from(v2["blocks"] as Map) : null;
+        final st1 = blocks?["snapshot_text"];
+        if (st1 is String && st1.trim().isNotEmpty) snapshotText = st1.trim();
+      }
+    }
+
+
+    // If this session was not eligible, we still show the snapshot, but it is "from prior sessions".
+    final eligibility = (obs["eligibility"] is Map) ? Map<String, dynamic>.from(obs["eligibility"] as Map) : const <String, dynamic>{};
+    final bool fromPriorSessions = (eligibility["eligible"] == false);
+
+    List<String> labelsFrom(dynamic v, {int max = 3}) {
+      if (v is List) {
+        final out = <String>[];
+        for (final it in v) {
+          if (it is Map && it["label"] != null) {
+            final s = it["label"].toString().trim();
+            if (s.isNotEmpty) out.add(s);
+          } else if (it is String) {
+            final s = it.trim();
+            if (s.isNotEmpty) out.add(s);
+          }
+          if (out.length >= max) break;
+        }
+        return out;
+      }
+      return const <String>[];
+    }
+
+    List<String> receiptsFrom(dynamic v, {int max = 6}) {
+      if (v is List) {
+        final out = <String>[];
+        for (final it in v) {
+          final s = it?.toString().trim() ?? "";
+          if (s.isNotEmpty && !out.contains(s)) out.add(s);
+          if (out.length >= max) break;
+        }
+        return out;
+      }
+      return const <String>[];
+    }
+
+    String? _bestReceiptForLabel({
+      required String label,
+      required Map<String, dynamic> receiptsByLabel,
+      required List<dynamic> recurringTensionsRaw,
+    }) {
+      // Prefer receipts embedded in recurring_tensions (if present for this label).
+      for (final it in recurringTensionsRaw) {
+        if (it is Map) {
+          final l = (it["label"] ?? '').toString().trim();
+          if (l == label) {
+            final rs = receiptsFrom(it["receipts"], max: 6);
+            if (rs.isNotEmpty) {
+              rs.sort((a, b) => a.length.compareTo(b.length));
+              return rs.first;
+            }
+          }
+        }
+      }
+
+      final rs = receiptsFrom(receiptsByLabel[label], max: 6);
+      if (rs.isEmpty) return null;
+
+      // Heuristic: pick the shortest, but avoid boilerplate-y openers when possible.
+      String scoreKey(String s) {
+        final t = s.toLowerCase().trim();
+        if (t.startsWith('tension') || t.startsWith('balance') || t.startsWith('seeking') || t.startsWith('trying') || t.startsWith('suspecting') || t.startsWith('potential')) {
+          return '1';
+        }
+        return '0';
+      }
+
+      rs.sort((a, b) {
+        final sa = scoreKey(a);
+        final sb = scoreKey(b);
+        if (sa != sb) return sa.compareTo(sb);
+        return a.length.compareTo(b.length);
+      });
+      return rs.first;
+    }
+
+    Widget _section({required String title, required List<String> labels, required Map<String, dynamic> receiptsByLabel, required List<dynamic> recurringTensionsRaw}) {
+      if (labels.isEmpty) return const SizedBox.shrink();
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(title, style: theme.textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600)),
+            const SizedBox(height: 6),
+            ...labels.map((label) {
+              final best = _bestReceiptForLabel(
+                label: label,
+                receiptsByLabel: receiptsByLabel,
+                recurringTensionsRaw: recurringTensionsRaw,
+              );
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(label, style: theme.textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600)),
+                    if (best != null) ...[
+                      const SizedBox(height: 2),
+                      Text(best, style: theme.textTheme.bodySmall, softWrap: true),
+                    ],
+                  ],
+                ),
+              );
+            }),
+          ],
+        ),
+      );
+    }
+
+    final emerging = labelsFrom(snap["emerging_themes_month"], max: 3);
+
+    // recurring_tensions is a list of objects with label + receipts.
+    final recurringTensionsRaw = (snap["recurring_tensions"] is List) ? List<dynamic>.from(snap["recurring_tensions"] as List) : const <dynamic>[];
+    final tensions = labelsFrom(recurringTensionsRaw, max: 3);
+
+    final changed = snap["changed_since_last_week"];
+    final changedUp = (changed is Map) ? labelsFrom(changed["up"], max: 3) : const <String>[];
+    final changedDown = (changed is Map) ? labelsFrom(changed["down"], max: 3) : const <String>[];
+
+    final receiptsByLabel = (snap["receipts_by_label"] is Map)
+        ? Map<String, dynamic>.from(snap["receipts_by_label"] as Map)
+        : <String, dynamic>{};
+
+    final hasAnything = emerging.isNotEmpty || tensions.isNotEmpty || changedUp.isNotEmpty || changedDown.isNotEmpty || receiptsByLabel.isNotEmpty;
+    if (!hasAnything) return const SizedBox.shrink();
+
+    // Per-label expandable receipts.
+    // To reduce clutter, only surface the most supported labels (top-N).
+    final receiptLabelTiles = <Widget>[];
+    if (receiptsByLabel.isNotEmpty) {
+      bool isInList(List<String> xs, String v) => xs.any((x) => x.toLowerCase() == v.toLowerCase());
+
+      int labelScore(String label) {
+        final rs = receiptsFrom(receiptsByLabel[label], max: 50);
+        // Dart doesn't have a String(...) constructor; always use toString().
+        final inTensions = recurringTensionsRaw.any((it) => ((it as dynamic)?['label'] ?? '').toString().trim() == label);
+        final inEmerging = isInList(emerging, label);
+        final base = rs.length;
+        return base + (inTensions ? 6 : 0) + (inEmerging ? 3 : 0);
+      }
+
+      final labels = receiptsByLabel.keys.toList()
+        ..sort((a, b) => labelScore(b).compareTo(labelScore(a)));
+
+      // Show only the top labels; everything else stays hidden behind the DB.
+      final maxLabels = 6;
+      for (final label in labels.take(maxLabels)) {
+        final rs = receiptsFrom(receiptsByLabel[label], max: 8);
+        if (rs.isEmpty) continue;
+        final best = _bestReceiptForLabel(label: label, receiptsByLabel: receiptsByLabel, recurringTensionsRaw: recurringTensionsRaw);
+        receiptLabelTiles.add(
+          ExpansionTile(
+            tilePadding: EdgeInsets.zero,
+            childrenPadding: const EdgeInsets.only(left: 12, bottom: 6),
+            title: Text(label, style: theme.textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600)),
+            subtitle: (best == null)
+                ? null
+                : Text(
+                    best,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodySmall,
+                  ),
+            children: [
+              for (final r in rs)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('•  '),
+                      Expanded(child: Text(r, style: theme.textTheme.bodySmall, softWrap: true)),
+                    ],
+                  ),
+                ),
+            ],
+          ),
+        );
+      }
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 16),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.black12),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Expanded(child: Text("What keeps showing up", style: theme.textTheme.titleSmall)),
+              if (fromPriorSessions)
+                Padding(
+                  padding: const EdgeInsets.only(left: 8),
+                  child: Text(
+                    "From prior sessions",
+                    style: theme.textTheme.bodySmall?.copyWith(color: Colors.black54, fontStyle: FontStyle.italic),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 10),
+
+          if (snapshotText != null) ...[
+            Text(snapshotText!, style: theme.textTheme.bodyMedium, softWrap: true),
+            const SizedBox(height: 12),
+          ],
+
+          // Prefer v2 narrative blocks when available (less taxonomy, more recognition).
+          (() {
+            final v2 = (snap["v2"] is Map) ? Map<String, dynamic>.from(snap["v2"] as Map) : null;
+            final resonance = (v2 != null && v2["resonance"] is Map) ? Map<String, dynamic>.from(v2["resonance"] as Map) : <String, dynamic>{};
+            final blocks = (v2 != null && v2["blocks"] is Map) ? Map<String, dynamic>.from(v2["blocks"] as Map) : <String, dynamic>{};
+            final emergingText = (blocks["emerging_pattern"] ?? "").toString().trim();
+            final tensionText = (blocks["tension_you_are_carrying"] ?? "").toString().trim();
+            final valueText = (blocks["underlying_value"] ?? "").toString().trim();
+            final hasV2 = emergingText.isNotEmpty || tensionText.isNotEmpty || valueText.isNotEmpty;
+            final passed = (resonance["passed"] == true);
+
+            Widget buildBlock(String title, String text) {
+              if (text.trim().isEmpty) return const SizedBox.shrink();
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title, style: theme.textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 4),
+                  Text(text, style: theme.textTheme.bodySmall, softWrap: true),
+                ],
+              );
+            }
+
+            if (hasV2) {
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (!passed)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 6),
+                      child: Text(
+                        "Draft (still learning your voice)",
+                        style: theme.textTheme.bodySmall?.copyWith(color: Colors.black54, fontStyle: FontStyle.italic),
+                      ),
+                    ),
+                  buildBlock("Emerging Pattern", emergingText),
+                  const SizedBox(height: 10),
+                  buildBlock("Tension You're Carrying", tensionText),
+                  const SizedBox(height: 10),
+                  buildBlock("Underlying Value", valueText),
+                  const SizedBox(height: 6),
+                ],
+              );
+            }
+
+            // Fallback: no extra taxonomy.
+            return const SizedBox.shrink();
+})(),
+
+          if (receiptLabelTiles.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            ExpansionTile(
+              tilePadding: EdgeInsets.zero,
+              title: Text("Evidence", style: theme.textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600)),
+              children: [
+                Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: receiptLabelTiles),
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+
+  @override
+  Widget build(BuildContext context) {
+    final reframed = _reframed();
+    final shortSummary = _effectiveShortSummary();
+    final fullSummary = _effectiveFullSummary();
+
+    final reflections = _stringList(reframed?['reflections']);
+    final rare = _stringList(reframed?['rare_insights']);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('End of session'),
+        actions: [
+          IconButton(
+            tooltip: 'Refresh',
+            icon: const Icon(Icons.refresh),
+            onPressed: _loading ? null : _load,
+          ),
+        ],
+      ),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : SingleChildScrollView(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  if (_error.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: Text(_error, style: const TextStyle(color: Colors.red)),
+                    ),
+
+                  // Session Review header
+                  Text('Session Review', style: Theme.of(context).textTheme.titleMedium),
+                  const SizedBox(height: 8),
+
+                  // What you captured
+                  Text('Your story for this session', style: Theme.of(context).textTheme.titleSmall),
+                  const SizedBox(height: 8),
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Colors.black12),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(whatCapturedText),
+                  ),
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 10,
+                    runSpacing: 8,
+                    children: [
+                      OutlinedButton.icon(
+                        onPressed: _loading ? null : _editStoryText,
+                        icon: const Icon(Icons.edit),
+                        label: const Text('Edit'),
+                      ),
+                      ElevatedButton.icon(
+                        onPressed: _loading ? null : _saveCuratedStory,
+                        icon: const Icon(Icons.save),
+                        label: const Text('Save curated story'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: OutlinedButton.icon(
+                      onPressed: () {
+                        final convId = (_row?['conversation_id'] ?? '').toString().trim();
+                        final effectiveSessionKey = convId.isNotEmpty ? convId : widget.sessionKey;
+                        final rawIdSeed = (_row?['raw_id'] ?? '').toString().trim();
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => TranscriptScreen(
+                              sessionKey: effectiveSessionKey,
+                              dateLabel: widget.dateLabel,
+                              rawIdSeed: rawIdSeed,
+                            ),
+                          ),
+                        );
+                      },
+                      icon: const Icon(Icons.subject),
+                      label: const Text('Transcript'),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+
+                  _buildLongitudinalSnapshotSection(context),
+                  const SizedBox(height: 16),
+
+                  // Reframed insights (only show sections that exist; avoid forcing)
+                  if (reflections.isNotEmpty) ...[
+                  Text('Reflections', style: Theme.of(context).textTheme.titleSmall),
+                  const SizedBox(height: 8),
+                  _bulletList(reflections),
+                  const SizedBox(height: 16),
+                ],
+                if (rare.isNotEmpty) ...[
+                  Text('Rare insights', style: Theme.of(context).textTheme.titleSmall),
+                  const SizedBox(height: 8),
+                  _bulletList(rare),
+                  const SizedBox(height: 16),
+                ],
+
+                FutureBuilder<List<Map<String, dynamic>>>(
+                  future: _longitudinalFuture,
+                  builder: (context, snap) {
+                    final items = (snap.data ?? const <Map<String, dynamic>>[]);
+                    if (items.isEmpty) return const SizedBox.shrink();
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('Longitudinal insights', style: Theme.of(context).textTheme.titleSmall),
+                        const SizedBox(height: 8),
+                        ...items.map((m) {
+                          final title = (m['short_title'] ?? '').toString().trim();
+                          final text = (m['insight_text'] ?? '').toString().trim();
+                          return Padding(
+                            padding: const EdgeInsets.only(bottom: 10),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                if (title.isNotEmpty)
+                                  Text(title, style: Theme.of(context).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600)),
+                                if (text.isNotEmpty) Text(text),
+                              ],
+                            ),
+                          );
+                        }),
+                        const SizedBox(height: 8),
+                      ],
+                    );
+                  },
+                ),
+
+
+
+                ],
+              ),
+            ),
     );
   }
 }

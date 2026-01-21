@@ -42,6 +42,23 @@ Future<void> main() async {
       anonKey: SB_PUBLISHABLE_KEY,
     );
 
+    // Optional: print a JWT for debugging/admin tooling (e.g., backfill scripts).
+    // This will print after a user signs in (or immediately if a session is restored).
+    final supa = Supabase.instance.client;
+    final session = supa.auth.currentSession;
+    if (session?.accessToken != null && session!.accessToken.isNotEmpty) {
+      // ignore: avoid_print
+      print('ACCESS_TOKEN_JWT=${session.accessToken}');
+    }
+    supa.auth.onAuthStateChange.listen((data) {
+      final s = data.session;
+      if (s?.accessToken != null && s!.accessToken.isNotEmpty) {
+        // ignore: avoid_print
+        print('ACCESS_TOKEN_JWT=${s.accessToken}');
+      }
+    });
+
+
     runApp(const LegacyMobileApp());
   }, (Object error, StackTrace stack) {
     // ignore: avoid_print
@@ -50,6 +67,7 @@ Future<void> main() async {
     print(stack);
   });
 }
+
 
 class LegacyMobileApp extends StatelessWidget {
   const LegacyMobileApp({super.key});

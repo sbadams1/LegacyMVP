@@ -1,8 +1,48 @@
 import { buildLegacySystemPrompt, getLegacyPersonaInstructions } from "../../prompts/legacy.ts";
 import { buildAvatarSystemPrompt, buildPronunciationScoringPrompt, buildLanguageLearningSystemPrompt } from "../../prompts/language.ts";
 import { buildBeginnerModeAddon, buildBeginnerRewritePrompt } from "../../prompts/turn_core_language_prompts.ts";
-import { buildLegacySessionSummaryPrompt, buildStorySeedsPrompt, buildExtractStoriesPrompt, buildSessionInsightsPrompt, buildCoverageClassificationPrompt } from "../../prompts/turn_core_prompts.ts";
+import { buildLegacySessionSummaryPrompt, buildStorySeedsPrompt, buildExtractStoriesPrompt, buildCoverageClassificationPrompt } from "../../prompts/turn_core_prompts.ts";
 import { TAGGING_CONTRACT, formatRecentLanguageLearningConversation } from "../../prompts/language_learning_contracts.ts";
+
+// ---------------------------------------------------------------------------
+// Legacy + Avatar companion role contract (narrative momentum)
+// ---------------------------------------------------------------------------
+const LEGACY_COMPANION_ROLE_CONTRACT = [
+  "System Role: Legacy Companion",
+  "",
+  "You are a helpful, accurate, conversational AI companion.",
+  "",
+  "Your purpose is to help the user:",
+  "- understand their experiences more clearly",
+  "- explore ideas, memories, and decisions with depth and context",
+  "- articulate their story in a way that preserves meaning over time",
+  "",
+  "You are:",
+  "- careful with safety, privacy, and medical/legal boundaries",
+  "- clear, structured, and engaging in communication",
+  "- respectful of user autonomy and personal interpretation",
+  "",
+  "You are NOT:",
+  "- a doctor, therapist, lawyer, or financial advisor",
+  "- a replacement for human relationships",
+  "- a source of authority over the user's life decisions",
+  "",
+  "Do not diagnose, prescribe, or give professional advice.",
+  "Do not encourage dependency, harm, illegal behavior, or conspiratorial thinking.",
+  "When appropriate, help the user think — not tell them what to think.",
+  "",
+  "DO NOT:",
+  "- Ask repetitive 'how did that make you feel' questions",
+  "- Force lessons, growth narratives, or closure",
+  "- Reframe experiences as problems that must be solved",
+  "- Over-validate or emotionally escalate the conversation",
+  "- Use clinical, therapeutic, or diagnostic language",
+  "",
+  "Narrative Momentum Rule:",
+  "Each response should either (1) move the story forward, or (2) deepen understanding of what already happened.",
+  "If neither is appropriate, ask a single, optional question — or remain silent.",
+].join("\n");
+
 
 // supabase/functions/ai-brain/pipelines/turn.ts
 //
@@ -46,6 +86,110 @@ const INTERNAL_FUNCTION_KEY = Deno.env.get("INTERNAL_FUNCTION_KEY");
 
 function looksLikeLegacyJwt(token: string | null | undefined): boolean {
   return !!token && token.startsWith("eyJ") && token.split(".").length >= 3;
+}
+
+// ---------------------------------------------------------------------------
+// Theme extraction (used by longitudinal theme pipeline)
+// ---------------------------------------------------------------------------
+export async function extractSummaryThemesWithGemini(args: {
+  short_summary: string;
+  full_summary?: string | null;
+  max_themes?: number;
+}): Promise<{ themes: Array<{ label: string; weight?: number; domains?: string[]; receipts?: string[] }> }> {
+  const short = String(args?.short_summary ?? "").trim();
+  const full = args?.full_summary == null ? "" : String(args.full_summary).trim();
+  const maxThemes = Math.max(1, Math.min(8, Number(args?.max_themes ?? 5) || 5));
+
+  if (!short) return { themes: [] };
+
+  const prompt = `You are extracting emergent, durable themes from a person's session summary.
+
+Return STRICT JSON ONLY (no markdown, no commentary) with this exact shape:
+{
+  "themes": [
+    {
+      "label": "<short noun phrase>",
+      "weight": 0.0,
+      "domains": ["values|identity|relationships|work|health|meaning|money|politics|learning|place"],
+      "receipts": ["<very short quote from the summary>"]
+    }
+  ]
+}
+
+Rules:
+- Output 1 to ${maxThemes} themes.
+- Labels must reflect meaning/values/tension/goals/identity/emotions (NOT generic topics).
+- Use consistent wording across similar sessions (prefer canonical phrasing over synonyms).
+- weight is 0.4-0.95.
+- receipts: 1-2 short snippets copied from the summary text.
+
+SHORT_SUMMARY:
+${short}
+
+FULL_SUMMARY:
+${full}
+`;
+
+  const raw = await callGemini(prompt);
+
+  try {
+    const jsonText = extractJsonCandidate(raw) ?? raw;
+    const parsed = JSON.parse(jsonText);
+    const themes = Array.isArray(parsed?.themes) ? parsed.themes : [];
+
+    const haystack = (short + "\n" + full).trim();
+    const hayLower = haystack.toLowerCase();
+
+    const normalizeReceipt = (raw: string): string => {
+      let r = String(raw ?? "").trim();
+      // Strip surrounding quotes.
+      r = r.replace(/^[\s"'“”‘’]+/, "").replace(/[\s"'“”‘’]+$/, "");
+      return r.trim();
+    };
+
+    const isLikelyHexGarbage = (r: string): boolean => /^[0-9a-f]{4,}$/i.test(r);
+    const hasSomeAlnum = (r: string): boolean => /[A-Za-z0-9]/.test(r);
+
+    const cleanReceipts = (receipts: any): string[] => {
+      if (!Array.isArray(receipts)) return [];
+      const out: string[] = [];
+      for (const rawR of receipts) {
+        const r0 = normalizeReceipt(String(rawR ?? ""));
+        if (!r0) continue;
+        // Drop known garbage like 201c201d (unicode quote codepoints) and other hex-only strings.
+        if (isLikelyHexGarbage(r0)) continue;
+        // Drop pure punctuation / quote remnants.
+        if (!hasSomeAlnum(r0)) continue;
+        // Too short to be meaningful or reliably grounded.
+        if (r0.length < 8) continue;
+        // Must be grounded in the provided summary text (case-insensitive substring check).
+        if (hayLower && !hayLower.includes(r0.toLowerCase())) continue;
+        out.push(r0);
+        if (out.length >= 2) break;
+      }
+      return out;
+    };
+
+    const cleaned = themes
+      .map((t: any) => {
+        const receipts = cleanReceipts(t?.receipts);
+        return {
+          label: String(t?.label ?? "").trim(),
+          weight: typeof t?.weight === "number" ? t.weight : undefined,
+          domains: Array.isArray(t?.domains)
+            ? t.domains.map((d: any) => String(d).trim()).filter(Boolean).slice(0, 6)
+            : undefined,
+          receipts: receipts.length ? receipts : undefined,
+        };
+      })
+      .filter((t: any) => t.label.length > 0)
+      .slice(0, maxThemes);
+
+    return { themes: cleaned };
+  } catch (e) {
+    console.warn("extractSummaryThemesWithGemini JSON parse failed (non-fatal):", e);
+    return { themes: [] };
+  }
 }
 
 function looksLikeNewSbSecret(token: string | null | undefined): boolean {
@@ -93,6 +237,137 @@ if (!GEMINI_API_KEY) {
   console.error("❌ GEMINI_API_KEY is NOT set in Supabase environment.");
 }
 
+async function runDiagnostics({ supabase, userId: userIdParam, authHeader }: { supabase: any; userId?: string | null; authHeader?: string | null }) {
+  const results: any[] = [];
+
+  // Resolve userId for DB FK-safe diagnostics.
+  let userId: string | null | undefined = userIdParam ?? null;
+  if (!userId && authHeader && /^Bearer\s+/i.test(authHeader)) {
+    const token = authHeader.replace(/^Bearer\s+/i, "").trim();
+    if (token) {
+      try {
+        const { data, error } = await supabase.auth.getUser(token);
+        if (!error && data?.user?.id) userId = data.user.id;
+      } catch (_e) {
+        // ignore; userId will remain null and FK tests will be skipped/fail with a clear message
+      }
+    }
+  }
+
+
+  const check = async (name: string, fn: () => Promise<void>) => {
+    const start = Date.now();
+    try {
+      await fn();
+      results.push({ name, ok: true, ms: Date.now() - start });
+    } catch (e) {
+      results.push({
+        name,
+        ok: false,
+        ms: Date.now() - start,
+        error:
+          (e as any)?.message ??
+          (e as any)?.details ??
+          (e as any)?.hint ??
+          (e as any)?.code ??
+          (typeof e === "string" ? e : JSON.stringify(e, Object.getOwnPropertyNames(e))),
+      });
+    }
+  };
+
+  await check("env.SUPABASE_URL", async () => {
+    const v = Deno.env.get("SUPABASE_URL");
+    if (!v || typeof v !== "string") throw new Error("Missing or invalid");
+  });
+
+  await check("db.select.memory_summary", async () => {
+    const { error } = await supabase
+      .from("memory_summary")
+      .select("id")
+      .limit(1);
+    if (error) throw error;
+  });
+
+  await check("db.select.summary_themes", async () => {
+    const { error } = await supabase.from("summary_themes").select("id").limit(1);
+    if (error) throw error;
+  });
+
+  await check("db.select.theme_clusters", async () => {
+    const { error } = await supabase.from("theme_clusters").select("id").limit(1);
+    if (error) throw error;
+  });
+
+  await check("db.select.cluster_members", async () => {
+    const { error } = await supabase.from("cluster_members").select("id").limit(1);
+    if (error) throw error;
+  });
+
+  await check("db.insert.temp_row", async () => {
+    if (!userId) throw new Error("No authenticated user_id (missing/invalid Authorization header)");
+
+    // 1) insert a temp memory_raw row (FK target)
+    const { data: raw, error: rawErr } = await supabase
+      .from("memory_raw")
+      .insert({
+        user_id: userId,
+        source: "diagnostic",
+        content: "[diagnostic] temp raw",
+        context: { diagnostic: true },
+      })
+      .select("id")
+      .single();
+    if (rawErr) throw rawErr;
+
+    // 2) insert temp memory_summary referencing raw.id
+      const { data: sum, error: sumErr } = await supabase
+      .from("memory_summary")
+      .insert({
+        user_id: userId,
+        raw_id: raw.id,
+        short_summary: "[diagnostic] temp summary",
+        session_insights: { diagnostic: true },
+      })
+      .select("id")
+      .single();
+
+    // cleanup (best effort)
+    if (!sumErr && sum?.id) {
+      await supabase.from("memory_summary").delete().eq("id", sum.id);
+    }
+    await supabase.from("memory_raw").delete().eq("id", raw.id);
+
+    if (sumErr) throw sumErr;
+  });
+
+  await check("invoke.rebuild_insights", async () => {
+    if (!userId) throw new Error("No authenticated user_id for rebuild-insights invocation");
+
+    const { data, error } = await supabase.functions.invoke("rebuild-insights", {
+      body: { diagnostic: true, user_id: userId },
+      headers: authHeader ? { Authorization: authHeader } : undefined,
+    });
+
+    if (error) throw error;
+
+    if (data && typeof data === "object" && (data as any).ok === false) {
+      throw new Error(JSON.stringify(data));
+    }
+  });
+
+  const payload = {
+    ok: results.every(r => r.ok),
+    results,
+  };
+
+  console.log("DIAGNOSTICS_RESULT", JSON.stringify(payload));
+
+  return new Response(
+    JSON.stringify(payload, null, 2),
+    { headers: { "Content-Type": "application/json" } }
+  );
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -107,6 +382,8 @@ interface AiBrainPayload {
 
   end_session?: boolean;
 
+  diagnostic?: boolean;
+
   mode?: ConversationMode;
   preferred_locale?: string;
   target_locale?: string | null;
@@ -115,6 +392,11 @@ interface AiBrainPayload {
   // Optional per-request persona override for legacy mode.
   // Allowed values match ConversationPersona: "adaptive" | "playful" | "grounded".
   conversation_persona?: ConversationPersona;
+
+  // Optional op routing (used for on-demand enrichment, etc.)
+  op?: string;
+  block_id?: string;
+
 
   // optional structured state
   state_json?: string | null;
@@ -141,6 +423,9 @@ type SummarizerContext = {
   preferred_locale?: string | null;
   target_locale?: string | null;
   learning_level?: string | null;
+  // Optional: provided by end_session pipeline for gating/rate-limiting.
+  user_id?: string | null;
+  conversation_id?: string | null;
 };
 
 function tryExtractJsonObject(rawText: string): any | null {
@@ -183,6 +468,51 @@ function tryExtractJsonObject(rawText: string): any | null {
   }
 }
 
+function stripSummaryMarkup(input: string): string {
+  let s = String(input ?? "").trim();
+  if (!s) return "";
+
+  // Remove BOM
+  s = s.replace(/^﻿/, "");
+
+  // Remove common code fences (```json ... ```)
+  s = s.replace(/```(?:json)?/gi, "```");
+  if (s.includes("```")) {
+    const firstFence = s.indexOf("```");
+    const secondFence = s.indexOf("```", firstFence + 3);
+    if (secondFence !== -1) {
+      const inside = s.slice(firstFence + 3, secondFence).trim();
+      if (inside) s = inside;
+    }
+  }
+
+  // Remove leading labels that sometimes sneak in
+  // e.g. "short_summary: ..." or "full_summary - ..."
+  s = s.replace(/^\s*(short_summary|full_summary)\s*[:\-–]\s*/i, "");
+
+  // Remove markdown headings and list bullets if the model returns them
+  s = s.replace(/^\s*#{1,6}\s+/g, "");          // "# Title"
+  s = s.replace(/^\s*[-*•]\s+/g, "");           // "- bullet"
+  s = s.replace(/^\s*\d+\.\s+/g, "");           // "1. item"
+
+  // Strip wrapping quotes if present
+  if (
+    (s.startsWith('"') && s.endsWith('"')) ||
+    (s.startsWith("'") && s.endsWith("'"))
+  ) {
+    s = s.slice(1, -1).trim();
+  }
+
+  // Collapse whitespace
+  s = s.replace(/\s+/g, " ").trim();
+
+  return s;
+}
+
+// ==========================
+// (Session insights v1 items/key_sentence removed)
+// ==========================
+
 async function summarizeLegacySessionWithGemini(
   transcript: LegacyTranscriptTurn[],
   ctx?: SummarizerContext,
@@ -194,26 +524,74 @@ async function summarizeLegacySessionWithGemini(
 } | null> {
   if (!transcript?.length) return null;
 
-  // If Gemini not configured, fallback to something deterministic.
-  if (!GEMINI_API_KEY) {
-    const joined = transcript
-      .map((t) => `${t.role === "user" ? "USER" : "AI"}: ${t.text}`)
-      .join("\n");
-    const trimmed = joined.trim();
-    const shortSummary =
-      trimmed.length > 160 ? `${trimmed.slice(0, 157)}...` : trimmed || "Legacy session";
-    const fullSummary =
-      trimmed.length > 400 ? `${trimmed.slice(0, 397)}...` : trimmed || shortSummary;
+  // --- Option A "magical insight" gating (eligibility + scarcity) ---
+  const userTurnsText = (transcript || [])
+    .filter((t) => (t as any)?.role === "user")
+    .map((t) => String((t as any)?.text ?? "").trim())
+    .filter(Boolean)
+    .join(" ");
 
+  const userWordCount = countWordsApprox(userTurnsText);
+  const userLower = userTurnsText.toLowerCase();
+
+  const looksProcedural = (() => {
+    if (!userLower) return true;
+    // Presence-check / app-test style sessions
+    if (userLower === "__end_session__") return true;
+    if (userLower.startsWith("play gemini")) return true;
+    if (userLower.startsWith("are you there")) return true;
+    if (userLower.startsWith("hello")) return true;
+    if (userLower.startsWith("test")) return true;
+    // Very short + non-narrative
+    if (userWordCount < 60) return true;
+    return false;
+  })();
+
+  const hasReflectiveSignal = (() => {
+    if (!userLower) return false;
+    // Heuristic A: first-person + feeling/meaning words
+    const firstPerson = /\b(i|i\'m|i\'ve|i\'d|me|my|mine)\b/.test(userLower);
+    const reflective = /\b(feel|felt|feeling|think|thought|realize|realized|meaning|purpose|learned|regret|proud|grateful|worried|anxious|happy|sad|angry|lonely)\b/.test(userLower);
+    if (firstPerson && reflective) return true;
+    // Heuristic B: multi-sentence narrative with some length
+    const sentences = userTurnsText.split(/(?<=[.!?])\s+/).filter((s) => s.trim().length > 0);
+    if (sentences.length >= 2) {
+      const longish = sentences.filter((s) => countWordsApprox(s) >= 10);
+      if (longish.length >= 1 && userWordCount >= 120) return true;
+    }
+    return false;
+  })();
+
+  // NOTE: Summary generation should NOT be gated by a high bar intended for "insights".
+  // End-of-session eligibility is handled in end_session.ts. Here we only protect against
+  // truly procedural / presence-check sessions.
+
+  const proceduralOnly = looksProcedural && !hasReflectiveSignal && userWordCount < 40;
+
+  // If procedural-only, return a safe placeholder summary (never transcript).
+  if (proceduralOnly) {
+    const short_summary = "You checked in briefly this session.";
+    const full_summary = "You opened the app and did a brief check-in, without recording a detailed story.";
     return {
-      short_summary: shortSummary,
-      full_summary: fullSummary,
-      observations: {
-        chapter_keys: [],
-        themes: [],
-        word_count_estimate: Math.max(0, Math.floor(trimmed.split(/\s+/).length)),
-      },
-      session_insights: null,
+      short_summary,
+      full_summary,
+      observations: null,
+      session_insights: {},
+    };
+  }
+
+
+
+  // If Gemini not configured, fallback to something deterministic.
+  // If Gemini not configured, fallback to a safe deterministic summary (never transcript).
+  if (!GEMINI_API_KEY) {
+    const short_summary = "You recorded a session, but automated summarization is temporarily unavailable.";
+    const full_summary = "You captured some thoughts in the app, but this session could not be summarized automatically at the moment. Try again later to generate a summary.";
+    return {
+      short_summary,
+      full_summary,
+      observations: null,
+      session_insights: {},
     };
   }
 
@@ -253,16 +631,45 @@ async function summarizeLegacySessionWithGemini(
   const chapterId = ctx?.chapter_id ?? null;
   const chapterTitle = ctx?.chapter_title ?? null;
 
-    const prompt = buildLegacySessionSummaryPrompt({
+  const prompt =
+  buildLegacySessionSummaryPrompt({
     transcriptText,
     sessionKey,
     chapterId,
     chapterTitle,
     allowedChapterKeys,
-  });
+  }) +
+  "\n\n" +
+  `CRITICAL RULES (MUST FOLLOW):
+ - This is a SUMMARY task. DO NOT produce a transcript. DO NOT copy transcript lines.
+ - DO NOT include any direct quotes from the transcript. Paraphrase everything.
+ - DO NOT reuse any full sentence verbatim from the transcript (including the first user line).
+ - Ignore "wake phrases" / "presence checks" / app-control phrases as NON-CONTENT. These include (examples):
+   "Hey Gemini", "Play Gemini", "Gemini", "Are you there?", "Hello", "Test", "Can you hear me", "Start recording".
+   These lines MUST NOT appear in short_summary or full_summary and MUST NOT count as "concrete details".
+ - If the transcript contains wake phrases mixed with real content, summarize ONLY the real content.
+ - "Concrete details" means substantive facts/topics/events/feelings mentioned — NOT greetings, commands, or assistant-invocation text.
+
+OUTPUT VOICE (STRICT):
+ - Write BOTH short_summary and full_summary in second person ("you") with correct verb agreement (you are/you have/you do).
+ - Do NOT use third person (no "the user", no names).
+ - Do NOT use meta framing like "you said", "you described", "you mentioned", "it sounds like", or "you reiterate".
+ - Keep short_summary to 1 sentence. Keep full_summary to 2–4 sentences.
+ - Be specific and concrete; avoid filler/manager-speak.
+ - Include at least TWO substantive concrete details that were actually said this session (NOT wake phrases or greetings).
+
+FORMAT (STRICT):
+ - Return valid JSON only, matching the required schema exactly.
+ - Schema keys MUST be exactly: short_summary, full_summary, observations, session_insights.
+ - Do not wrap JSON in markdown fences.`;
 
   const body = {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: {
+      maxOutputTokens: 2048,
+      temperature: 0.1,
+      responseMimeType: "application/json",
+    },
   };
 
   try {
@@ -296,25 +703,40 @@ async function summarizeLegacySessionWithGemini(
       return null;
     }
 
-    const short_summary = typeof parsed.short_summary === "string" ? parsed.short_summary.trim() : "";
-    const full_summary = typeof parsed.full_summary === "string" ? parsed.full_summary.trim() : "";
+    const short_summary_raw = typeof parsed.short_summary === "string" ? parsed.short_summary.trim() : "";
+    const full_summary_raw = typeof parsed.full_summary === "string" ? parsed.full_summary.trim() : "";
+
+    // Summaries should already be correct second-person; only strip unsafe markup.
+    const short_summary = stripSummaryMarkup(short_summary_raw);
+    const full_summary = stripSummaryMarkup(full_summary_raw);
 
     // observations is optional but strongly preferred
     const observations: MemorySummaryObservations | null =
       parsed.observations && typeof parsed.observations === "object" ? parsed.observations : null;
 
-    // session_insights is optional but strongly preferred
-    const session_insights: SessionInsightsJson | null =
-      parsed.session_insights && typeof parsed.session_insights === "object"
-        ? parsed.session_insights
-        : null;
+    // We intentionally do NOT parse/persist any per-session "insights" fields here.
+    // The end-of-session artifact pass is the only place that should populate
+    // memory_summary.session_insights (reframed content).
+    const session_insights: SessionInsightsJson | null = {};
 
     if (!short_summary || !full_summary) {
       console.error("summarizeLegacySessionWithGemini: missing summaries");
       return null;
     }
 
-    return { short_summary, full_summary, observations, session_insights };
+
+    // Hard guardrail: never allow raw transcript markers into summaries.
+    const deTranscript = (s: string) =>
+      String(s || "")
+        .replace(/(?:^|\n)\s*(?:USER|AI)\s*:\s*/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    const short_summary_clean = deTranscript(short_summary);
+    const full_summary_clean = deTranscript(full_summary);
+
+    return { short_summary: short_summary_clean, full_summary: full_summary_clean, observations, session_insights };
+
   } catch (err) {
     console.error("summarizeLegacySessionWithGemini: unexpected error", err);
     return null;
@@ -343,6 +765,7 @@ async function summarizeLegacySessionWithGemini(
         .eq("user_id", userId)
         .eq("conversation_id", conversationId)
         .order("created_at", { ascending: true })
+        .order("id", { ascending: true })
         .limit(200);
 
       if (error) {
@@ -496,6 +919,32 @@ async function upsertCuratedStoriesForConversation(
   }
 
   for (const seed of seeds) {
+
+    // Optional tag enrichment (no extra Gemini calls): if tags are missing/short,
+    // add a few normalized entity phrases as tags to improve recall/search.
+    const baseTags: string[] = Array.isArray((seed as any).tags) ? ((seed as any).tags as any[]).map((x) => String(x)).filter(Boolean) : [];
+    const ents: string[] = Array.isArray((seed as any).entities) ? ((seed as any).entities as any[]).map((x) => String(x)).filter(Boolean) : [];
+    const norm = (s: string) => s.trim().toLowerCase();
+    const tagSet = new Set(baseTags.map(norm));
+    const entTags = ents
+      .map((e) => e.replace(/\s+/g, ' ').trim())
+      .filter((e) => e.length >= 3 && e.length <= 60)
+      .slice(0, 6);
+    const enrichedTags = [...baseTags];
+    if (enrichedTags.length < 8) {
+      for (const e of entTags) {
+        const k = norm(e);
+        if (!k) continue;
+        if (tagSet.has(k)) continue;
+        // Only add entity tags when the seed has no tags, or very few tags.
+        if (baseTags.length <= 3) {
+          enrichedTags.push(e);
+          tagSet.add(k);
+        }
+        if (enrichedTags.length >= 8) break;
+      }
+    }
+
     // existing loop body unchanged...
 
     try {
@@ -531,7 +980,7 @@ async function upsertCuratedStoriesForConversation(
           .update({
             title: seed.title,
             curated_text: seed.body,
-            tags: seed.tags ?? null,
+            tags: enrichedTags.length ? enrichedTags : null,
             traits: seed.traits ?? null,
             metadata: {
               ...metadata,
@@ -554,7 +1003,7 @@ async function upsertCuratedStoriesForConversation(
             story_key: seed.story_key,
             title: seed.title,
             curated_text: seed.body,
-            tags: seed.tags ?? null,
+            tags: enrichedTags.length ? enrichedTags : null,
             traits: seed.traits ?? null,
             metadata: {
               conversation_ids: [conversationId],
@@ -585,6 +1034,7 @@ type StorySeedRowInsert = {
   user_id: string;
   summary_id?: string | null;
   conversation_id?: string | null;
+  seed_type: StorySeedType;
   title: string;
   seed_text: string;
   canonical_facts: Record<string, any>;
@@ -594,7 +1044,225 @@ type StorySeedRowInsert = {
   confidence: number;
   source_raw_ids: string[];
   source_edit_ids: string[];
+  evidence_raw_ids: string[];
 };
+
+type StorySeedType = "episode" | "dynamic" | "insight";
+
+function normalizeForSeedCompare(s: string): string {
+  return String(s ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeForSeedCompare(s: string): Set<string> {
+  const text = normalizeForSeedCompare(s);
+  const parts = text.split(" ").filter(Boolean);
+  const stop = new Set([
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "to",
+    "of",
+    "in",
+    "on",
+    "for",
+    "with",
+    "about",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "it",
+    "that",
+    "this",
+    "as",
+    "at",
+    "from",
+    "by",
+    "into",
+    "over",
+    "under",
+    "your",
+    "you",
+    "i",
+    "me",
+    "my",
+    "we",
+    "our",
+    "his",
+    "her",
+    "their",
+    "they",
+    "them",
+  ]);
+  const out = new Set<string>();
+  for (const p of parts) {
+    if (p.length < 3) continue;
+    if (stop.has(p)) continue;
+    out.add(p);
+  }
+  return out;
+}
+
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (!a.size && !b.size) return 1;
+  if (!a.size || !b.size) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  const union = a.size + b.size - inter;
+  return union ? inter / union : 0;
+}
+
+function classifySeedType(title: string, seedText: string, tags: string[], timeSpan: any | null): StorySeedType {
+  const t = normalizeForSeedCompare(title);
+  const s = normalizeForSeedCompare(seedText);
+  const tagStr = (Array.isArray(tags) ? tags : []).map((x) => normalizeForSeedCompare(String(x))).join(" ");
+
+  // Lightweight scoring (heuristic, no extra Gemini calls)
+  let episode = 0;
+  let dynamic = 0;
+  let insight = 0;
+
+  // Episode/event cues
+  if (timeSpan) episode += 1;
+  if (/(went|visited|trip|buffet|restaurant|market|hotel|airport|flight|drive|moved|arrived|left|met|saw|watched|party|wedding|funeral|birthday|job|work|graduat|school|college)/.test(s)) episode += 2;
+  if (/(today|yesterday|last week|last month|in \d{4}|when i)/.test(s)) episode += 1;
+
+  // Relationship/interpersonal dynamics cues
+  if (/(relationship|girlfriend|boyfriend|wife|husband|partner|dating|marriage|divorce)/.test(s + " " + tagStr)) dynamic += 2;
+  if (/(friend|pulled me into|drama|argument|fight|ignored my opinion|cycle|spiral|boundary|boundaries)/.test(s)) dynamic += 2;
+  if (/(thai women|foreign men|age gap|sugar daddy|transactional)/.test(s + " " + t)) dynamic += 1;
+
+  // Insight/trait/belief cues
+  if (/(natural posture|on guard|guarded|vigilant|cautious|cynical|belief|view|mindset|lesson|realiz|learned|value|trait|always)/.test(t + " " + s)) insight += 2;
+  if (/(stemming from|because i grew up|upbringing|childhood)/.test(s + " " + t)) insight += 2;
+
+  // Title-based nudges
+  if (t.includes(":") && /(posture|view|belief|guard)/.test(t)) insight += 1;
+
+  // Pick the max; tie-break toward episode (more concrete), then dynamic, then insight.
+  const best = Math.max(episode, dynamic, insight);
+  if (best === episode) return "episode";
+  if (best === dynamic) return "dynamic";
+  return "insight";
+}
+
+function dedupeSeeds<T extends { title: string; seed_text: string }>(
+  seeds: T[],
+  threshold = 0.72,
+): T[] {
+  const kept: T[] = [];
+  const keptTokens: Array<Set<string>> = [];
+  for (const s of seeds) {
+    const tok = tokenizeForSeedCompare(`${s.title} ${s.seed_text}`);
+    let isDup = false;
+    for (let i = 0; i < keptTokens.length; i++) {
+      if (jaccard(tok, keptTokens[i]) >= threshold) {
+        isDup = true;
+        break;
+      }
+    }
+    if (!isDup) {
+      kept.push(s);
+      keptTokens.push(tok);
+    }
+  }
+  return kept;
+}
+
+function selectTopSeedsCapped(
+  seeds: Array<{
+    title: string;
+    seed_text: string;
+    canonical_facts: Record<string, any>;
+    entities: any[];
+    tags: string[];
+    time_span?: any | null;
+    confidence?: number;
+  }>,
+): Array<{
+  seed_type: StorySeedType;
+  title: string;
+  seed_text: string;
+  canonical_facts: Record<string, any>;
+  entities: any[];
+  tags: string[];
+  time_span?: any | null;
+  confidence: number;
+}> {
+  // Sort by confidence desc first (stable, deterministic)
+  const sorted = [...seeds]
+    .map((s) => ({
+      ...s,
+      confidence: typeof s.confidence === "number" && Number.isFinite(s.confidence) ? Math.max(0, Math.min(1, s.confidence)) : 0.7,
+    }))
+    .sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0));
+
+  // Assign seed_type cheaply
+  const typed = sorted.map((s) => ({
+    seed_type: classifySeedType(s.title, s.seed_text, s.tags ?? [], s.time_span ?? null),
+    title: s.title,
+    seed_text: s.seed_text,
+    canonical_facts: s.canonical_facts ?? {},
+    entities: Array.isArray(s.entities) ? s.entities : [],
+    tags: Array.isArray(s.tags) ? s.tags : [],
+    time_span: s.time_span ?? null,
+    confidence: s.confidence ?? 0.7,
+  }));
+
+  // Dedupe within type first (relationship seeds tend to overlap)
+  const byType = {
+    episode: typed.filter((s) => s.seed_type === "episode"),
+    dynamic: typed.filter((s) => s.seed_type === "dynamic"),
+    insight: typed.filter((s) => s.seed_type === "insight"),
+  } as const;
+
+  const dedupedEpisode = dedupeSeeds(byType.episode, 0.72);
+  const dedupedDynamic = dedupeSeeds(byType.dynamic, 0.68); // slightly stricter on overlap
+  const dedupedInsight = dedupeSeeds(byType.insight, 0.72);
+
+  const pick: typeof typed = [];
+  const used = new Set<string>();
+  const key = (s: any) => `${normalizeForSeedCompare(s.title)}|${normalizeForSeedCompare(s.seed_text).slice(0, 80)}`;
+
+  const takeOne = (arr: any[]) => {
+    for (const s of arr) {
+      const k = key(s);
+      if (used.has(k)) continue;
+      used.add(k);
+      pick.push(s);
+      return;
+    }
+  };
+
+  // Goal: one episode + one dynamic + one insight
+  takeOne(dedupedEpisode);
+  takeOne(dedupedDynamic);
+  takeOne(dedupedInsight);
+
+  // If any category missing, fill with best remaining, but keep cap at 3.
+  if (pick.length < 3) {
+    const remaining = dedupeSeeds([...typed].filter((s) => !used.has(key(s))), 0.72);
+    for (const s of remaining) {
+      if (pick.length >= 3) break;
+      const k = key(s);
+      if (used.has(k)) continue;
+      used.add(k);
+      pick.push(s);
+    }
+  }
+
+  // Hard cap
+  return pick.slice(0, 3);
+}
 
 async function extractStorySeedsWithGemini(
   transcriptText: string,
@@ -634,6 +1302,32 @@ async function extractStorySeedsWithGemini(
       s?.canonical_facts && typeof s.canonical_facts === "object" ? s.canonical_facts : {};
     const entities = Array.isArray(s?.entities) ? s.entities : [];
     const tags = Array.isArray(s?.tags) ? s.tags.map((t: any) => String(t)).filter(Boolean) : [];
+
+// Optional tag enrichment: lightly derive tags from entities when tags are missing/weak.
+// This improves recall (tags.cs.{...}) without hardcoding any specific phrases.
+if (entities.length) {
+  const norm = (x: string) =>
+    x
+      .toLowerCase()
+      .replace(/[^a-z0-9\s_-]/g, "")
+      .trim()
+      .replace(/\s+/g, "_")
+      .slice(0, 32);
+
+  const tagSet = new Set(tags.map((t: any) => String(t).toLowerCase()));
+  // Only enrich if tags are sparse.
+  if (tagSet.size < 6) {
+    for (const e of entities) {
+      const t = norm(String(e || ""));
+      if (!t) continue;
+      if (!tagSet.has(t)) {
+        tags.push(t);
+        tagSet.add(t);
+      }
+      if (tagSet.size >= 8) break; // keep small to avoid noise
+    }
+  }
+}
     const time_span = s?.time_span ?? null;
 
     let confidence = typeof s?.confidence === "number" ? s.confidence : 0.7;
@@ -679,6 +1373,10 @@ async function upsertStorySeedsForConversation(
     const seeds = await extractStorySeedsWithGemini(transcriptText);
     if (!seeds.length) return;
 
+	    // End-session only: cap + dedupe + separate into episode/dynamic/insight.
+	    const topSeeds = selectTopSeedsCapped(seeds);
+	    if (!topSeeds.length) return;
+
     // Avoid duplicates: replace the seeds for this session.
     const del = await client
       .from("story_seeds")
@@ -689,10 +1387,11 @@ async function upsertStorySeedsForConversation(
       console.error("upsertStorySeedsForConversation delete error:", del.error);
     }
 
-    const rows: StorySeedRowInsert[] = seeds.map((s) => ({
+	    const rows: StorySeedRowInsert[] = topSeeds.map((s) => ({
       user_id: userId,
       summary_id: summaryId ?? null,
       conversation_id: conversationId,
+	      seed_type: s.seed_type,
       title: s.title,
       seed_text: s.seed_text,
       canonical_facts: s.canonical_facts ?? {},
@@ -702,6 +1401,7 @@ async function upsertStorySeedsForConversation(
       confidence: typeof s.confidence === "number" ? s.confidence : 0.7,
       source_raw_ids: rawIds,
       source_edit_ids: [],
+      evidence_raw_ids: rawIds,
     }));
 
     const ins = await client.from("story_seeds").insert(rows);
@@ -720,7 +1420,7 @@ async function upsertStorySeedsForConversation(
 interface LegacyInterviewState {
   chapter_id: string;
   chapter_title: string;
-  progress_percent: number; // 0–100
+  progress_percent: number; // 0-100
   focus_topic: string | null;
 }
 
@@ -931,7 +1631,7 @@ interface LanguageLessonState {
 }
 
 // Qualitative observations about a single distilled memory summary.
-// All scores are 0–1, where higher means "more of this quality".
+// All scores are 0-1, where higher means "more of this quality".
 interface MemorySummaryObservations {
   // Which coverage chapters this summary contributes to.
   chapter_keys?: CoverageChapterKey[];
@@ -954,16 +1654,16 @@ interface MemorySummaryObservations {
   themes?: string[];
   insight_tags?: string[];
 
-  // Qualitative richness (0–1). These will be filled by the summariser.
+  // Qualitative richness (0-1). These will be filled by the summariser.
   narrative_depth_score?: number;     // How much story & concrete detail?
   emotional_depth_score?: number;     // How much emotion is present?
   reflection_score?: number;          // How much “what it meant / what I learned”?
   distinctiveness_score?: number;     // How non-generic / personally specific?
 
-  // Optional pre-computed “this memory is rich” weight (0–1).
+  // Optional pre-computed “this memory is rich” weight (0-1).
   memory_weight?: number;
 
-  // Optional: flags for “don’t over-stereotype this”.
+  // Optional: flags for “don't over-stereotype this”.
   stereotype_risk_flags?: string[];
 }
 
@@ -977,18 +1677,28 @@ interface MemorySummaryRow {
   observations: MemorySummaryObservations | null;
 }
 
-interface SessionInsightItem {
-  id: string;
-  kind: "trait" | "theme" | "value" | "behavior";
-  text: string;
-  strength?: number;
+/**
+ * Session insights payload stored in memory_summary.session_insights.
+ *
+ * We no longer generate or persist `items` or `key_sentence`.
+ * The UI should rely on `reframed` (reflections / rare_insights / etc.)
+ * populated in the end-of-session artifact pass.
+ */
+interface SessionInsightsReframed {
+  short_summary: string;
+  reflections: string[];
+  patterns: string[];
+  rare_insights: string[];
+  questions: string[];
+  more_detail: string;
 }
 
 interface SessionInsightsJson {
-  session_id: string;
-  conversation_id: string;
-  key_sentence: string;
-  items: SessionInsightItem[];
+  // End-session review content
+  reframed?: SessionInsightsReframed;
+
+  // Back-compat: allow other keys (e.g., insight_moment) without strict typing.
+  [key: string]: any;
 }
 
 async function extractStoriesFromTranscript(
@@ -1112,7 +1822,7 @@ interface PronunciationDiagnostic {
   summary_issues: string[];
 
   /**
-   * 1–3 short focus phrases describing what to practice next, e.g.
+   * 1-3 short focus phrases describing what to practice next, e.g.
    * ["keep the last tone low and steady", "hold the long vowel a bit longer"].
    */
   recommended_focus: string[];
@@ -1164,7 +1874,7 @@ export interface CoverageChapter {
   key: CoverageChapterKey;
   label: string;
 
-  // 0.0–1.0; we still store a normalized score here.
+  // 0.0-1.0; we still store a normalized score here.
   coverage_score: number;
 
   // Simple counts for debugging + UI.
@@ -1267,26 +1977,26 @@ function normalizeCoverageChapterKey(
     case "early_childhood":
     case "childhood":
     case "0-10":
-    case "0–10":
+    case "0-10":
       return "early_childhood";
 
     case "adolescence":
     case "teen":
     case "teens":
     case "11-18":
-    case "11–18":
+    case "11-18":
       return "adolescence";
 
     case "early_adulthood":
     case "young_adult":
     case "20s":
     case "19-30":
-    case "19–30":
+    case "19-30":
       return "early_adulthood";
 
     case "midlife":
     case "31-55":
-    case "31–55":
+    case "31-55":
       return "midlife";
 
     case "later_life":
@@ -1347,78 +2057,12 @@ async function extractSessionInsightsFromSummary(
   conversationId: string,
   sessionId: string,
 ): Promise<SessionInsightsJson | null> {
-  const trimmed = fullSummary.trim();
-  if (!trimmed || !GEMINI_API_KEY) return null;
-
-  const prompt = buildSessionInsightsPrompt({ fullSummary: trimmed });
-
-  const body = {
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: prompt }],
-      },
-    ],
-  };
-
-  try {
-    const resp = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      },
-    );
-
-    if (!resp.ok) {
-      console.error("extractSessionInsightsFromSummary: Gemini error", resp.status, await resp.text());
-      return null;
-    }
-
-    const json = await resp.json();
-    const text =
-      json?.candidates?.[0]?.content?.parts?.[0]?.text ??
-      json?.candidates?.[0]?.content?.parts?.[0]?.rawText ??
-      "";
-
-    let parsed: any;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      const match = String(text).match(/\{[\s\S]*\}/);
-      if (!match) return null;
-      parsed = JSON.parse(match[0]);
-    }
-
-    const keySentence = (parsed?.key_sentence as string | undefined)?.trim();
-    const items = Array.isArray(parsed?.items) ? parsed.items : [];
-
-    if (!keySentence || !items.length) return null;
-
-    const insights: SessionInsightsJson = {
-      session_id: sessionId,
-      conversation_id: conversationId,
-      key_sentence: keySentence,
-      items: items.map((it: any): SessionInsightItem => ({
-        id: String(it.id ?? "unknown"),
-        kind:
-          it.kind === "theme" ||
-          it.kind === "value" ||
-          it.kind === "behavior"
-            ? it.kind
-            : "trait",
-        text: String(it.text ?? "").trim(),
-        strength:
-          typeof it.strength === "number" ? it.strength : undefined,
-      })),
-    };
-
-    return insights;
-  } catch (err) {
-    console.error("extractSessionInsightsFromSummary failed:", err);
-    return null;
-  }
+  // Deprecated: we no longer generate or persist session_insights.items/key_sentence.
+  // End-of-session insights should come from the artifact pass (session_insights.reframed).
+  void fullSummary;
+  void conversationId;
+  void sessionId;
+  return null;
 }
 
 async function upsertCuratedStoriesForSession(
@@ -1458,7 +2102,7 @@ async function upsertCuratedStoriesForSession(
         .update({
           title: seed.title,
           curated_text: seed.body,
-          tags: seed.tags ?? null,
+          tags: enrichedTags.length ? enrichedTags : null,
           traits: seed.traits ?? null,
           source_session_ids: mergedSessions,
         })
@@ -1477,7 +2121,7 @@ async function upsertCuratedStoriesForSession(
           story_key: seed.story_key,
           title: seed.title,
           curated_text: seed.body,
-          tags: seed.tags ?? null,
+          tags: enrichedTags.length ? enrichedTags : null,
           traits: seed.traits ?? null,
           source_session_ids: [sessionId],
           metadata: {
@@ -1493,9 +2137,9 @@ async function upsertCuratedStoriesForSession(
 }
 
 async function classifyCoverageFromStoryText(
-  storyText: string,
+  storyText: string | null | undefined,
 ): Promise<{ chapterKeys: CoverageChapterKey[]; themes: string[] } | null> {
-  const trimmed = storyText.trim();
+  const trimmed = String(storyText ?? "").trim();
   if (!trimmed) return null;
 
     const prompt = buildCoverageClassificationPrompt({
@@ -1593,7 +2237,7 @@ export interface LifetimeProfile {
 // buildLanguageLearningSystemPrompt() to choose concrete L2 phrases.
 const LANGUAGE_UNITS: Record<string, LanguageUnitConfig> = {
   // ---------------------------------------------------------------------------
-  // U1 – Greetings & Social Basics (roughly A1)
+  // U1 - Greetings & Social Basics (roughly A1)
   // ---------------------------------------------------------------------------
   U1_GREETINGS: {
     unit_id: "U1_GREETINGS",
@@ -1642,7 +2286,7 @@ const LANGUAGE_UNITS: Record<string, LanguageUnitConfig> = {
   },
 
   // ---------------------------------------------------------------------------
-  // U2 – Everyday Life & Routines (A1 → A2)
+  // U2 - Everyday Life & Routines (A1 → A2)
   // ---------------------------------------------------------------------------
   U2_EVERYDAY_LIFE: {
     unit_id: "U2_EVERYDAY_LIFE",
@@ -1691,7 +2335,7 @@ const LANGUAGE_UNITS: Record<string, LanguageUnitConfig> = {
   },
 
   // ---------------------------------------------------------------------------
-  // U3 – People & Places (A2)
+  // U3 - People & Places (A2)
   // ---------------------------------------------------------------------------
   U3_PEOPLE_PLACES: {
     unit_id: "U3_PEOPLE_PLACES",
@@ -1740,7 +2384,7 @@ const LANGUAGE_UNITS: Record<string, LanguageUnitConfig> = {
   },
 
   // ---------------------------------------------------------------------------
-  // U4 – Practical Tasks & Survival Situations (A2)
+  // U4 - Practical Tasks & Survival Situations (A2)
   // ---------------------------------------------------------------------------
   U4_PRACTICAL_TASKS: {
     unit_id: "U4_PRACTICAL_TASKS",
@@ -1817,29 +2461,51 @@ function jsonResponse(body: unknown, status = 200): Response {
 // Requires rebuild-insights to be deployed with verify_jwt=false and to validate
 // x-internal-key against INTERNAL_FUNCTION_KEY.
 // ---------------------------------------------------------------------------
-async function invokeRebuildInsightsInternal(payload: any): Promise<string> {
-  const url = Deno.env.get("SUPABASE_URL") || "";
-  const internalKey = Deno.env.get("INTERNAL_FUNCTION_KEY") || "";
-  if (!url) throw new Error("Missing SUPABASE_URL");
-  if (!internalKey) throw new Error("Missing INTERNAL_FUNCTION_KEY");
+async function invokeRebuildInsightsInternal(payload: any): Promise<any> {
+  const url = String(Deno.env.get("SUPABASE_URL") ?? "").trim();
+  const internalKey = String(Deno.env.get("INTERNAL_FUNCTION_KEY") ?? "").trim();
+
+  if (!url || !internalKey) {
+    // Do not throw — rebuild-insights is optional.
+    return { ok: false, skipped: true, reason: "missing_config", urlPresent: Boolean(url), keyPresent: Boolean(internalKey) };
+  }
 
   const endpoint = `${url}/functions/v1/rebuild-insights`;
 
-  const resp = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-internal-key": internalKey,
-    },
-    body: JSON.stringify(payload ?? {}),
-  });
-
-  const text = await resp.text();
-  if (!resp.ok) {
-    throw new Error(`rebuild-insights ${resp.status}: ${text}`);
+  let resp: Response;
+  try {
+    resp = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-internal-key": internalKey,
+      },
+      body: JSON.stringify(payload ?? {}),
+    });
+  } catch (e) {
+    // Network / DNS / fetch error — optional path
+    return { ok: false, status: 0, error: "fetch_failed", details: (e as any)?.message ?? String(e) };
   }
-  return text;
+
+  const text = await resp.text().catch(() => "");
+  let parsed: any = null;
+  try { parsed = JSON.parse(text); } catch {}
+
+  const benign =
+    parsed?.ok === true ||
+    parsed?.processed === 200 ||
+    parsed?.meaningful_longitudinal?.ok === true ||
+    /No new longitudinal insights/i.test(text);
+
+  if (!resp.ok && !benign) {
+    // Do not throw — optional path. Return structured failure for caller logging.
+    return { ok: false, status: resp.status, error: "rebuild_failed", body: parsed ?? text };
+  }
+
+  return { ok: true, status: resp.status, body: parsed ?? text };
 }
+
+
 
 function normalizeLocale(raw: unknown, fallback = "und"): string {
   if (typeof raw !== "string") return fallback;
@@ -2017,7 +2683,7 @@ function buildLanguageProgressSummary(
   const lines: string[] = [
     "[L1] Here is your current progress in this language course.",
     `[L1] Your main language (L1) is set to ${preferredLocale}, and your target language (L2) is ${targetLocale}.`,
-    `[L1] You are currently in unit ${unit.unit_id} – "${unit.unit_name}".`,
+    `[L1] You are currently in unit ${unit.unit_id} - "${unit.unit_name}".`,
     `[L1] Current lesson: "${lesson.lesson_name}" (${lesson.lesson_id}).`,
     `[L1] Current stage in this lesson: ${stageLabel}.`,
     `[L1] Overall learning level: ${levelLabel}.`,
@@ -2137,7 +2803,7 @@ function buildMoveAheadReply(
   return [
     "[L1] Got it — I’ll move you ahead to slightly more challenging material.",
     `[L1] Your main language (L1) is ${preferredLocale}, and your target language (L2) is ${targetLocale}.`,
-    `[L1] You are now in unit ${unit.unit_id} – "${unit.unit_name}".`,
+    `[L1] You are now in unit ${unit.unit_id} - "${unit.unit_name}".`,
     `[L1] Current lesson: "${lesson.lesson_name}" (${lesson.lesson_id}).`,
     `[L1] Current stage in this lesson: ${stageLabel}.`,
     `[L1] Overall learning level: ${levelLabel}.`,
@@ -2185,7 +2851,7 @@ function buildGoBackReply(
   return [
     "[L1] Got it — I’ll step back to slightly easier practice for this topic.",
     `[L1] Your main language (L1) is ${preferredLocale}, and your target language (L2) is ${targetLocale}.`,
-    `[L1] You are now in unit ${unit.unit_id} – "${unit.unit_name}".`,
+    `[L1] You are now in unit ${unit.unit_id} - "${unit.unit_name}".`,
     `[L1] Current lesson: "${lesson.lesson_name}" (${lesson.lesson_id}).`,
     `[L1] Current stage in this lesson: ${stageLabel}.`,
     `[L1] Overall learning level: ${levelLabel}.`,
@@ -2402,7 +3068,8 @@ async function persistLearningArtifacts(
         raw_json: { tag, title: b.title ?? null, content, raw_text: b.raw_text ?? "" },
       };
     })
-    .filter(Boolean);
+    .filter(Boolean)
+    .map((r, idx) => ({ ...r, idx }));
 
   if (rows.length === 0) return;
 
@@ -2825,28 +3492,28 @@ function advanceLanguageLessonState(
   // Ordered curriculum path across all units/lessons.
   // This MUST stay in sync with LANGUAGE_UNITS.
   const curriculumPath: Array<{ unitId: string; lessonId: string }> = [
-    // U1 – Greetings & Small Talk
+    // U1 - Greetings & Small Talk
     { unitId: "U1_GREETINGS", unitId: "U1_GREETINGS", lessonId: "L1_HELLO_BASICS" },
     { unitId: "U1_GREETINGS", lessonId: "L2_INTRO_NAME" },
     { unitId: "U1_GREETINGS", lessonId: "L3_WHERE_FROM" },
     { unitId: "U1_GREETINGS", lessonId: "L4_FEELINGS_SIMPLE" },
     { unitId: "U1_GREETINGS", lessonId: "L5_GOODBYES" },
 
-    // U2 – Everyday Life
+    // U2 - Everyday Life
     { unitId: "U2_EVERYDAY_LIFE", lessonId: "L1_TIME_DATE" },
     { unitId: "U2_EVERYDAY_LIFE", lessonId: "L2_DAILY_ROUTINE" },
     { unitId: "U2_EVERYDAY_LIFE", lessonId: "L3_HOME_FAMILY" },
     { unitId: "U2_EVERYDAY_LIFE", lessonId: "L4_WEATHER_SMALL_TALK" },
     { unitId: "U2_EVERYDAY_LIFE", lessonId: "L5_REVIEW_EVERYDAY" },
 
-    // U3 – People & Places
+    // U3 - People & Places
     { unitId: "U3_PEOPLE_PLACES", lessonId: "L1_DESCRIBE_PEOPLE_BASIC" },
     { unitId: "U3_PEOPLE_PLACES", lessonId: "L2_JOBS_STUDY" },
     { unitId: "U3_PEOPLE_PLACES", lessonId: "L3_PLACES_IN_TOWN" },
     { unitId: "U3_PEOPLE_PLACES", lessonId: "L4_GIVING_DIRECTIONS_SIMPLE" },
     { unitId: "U3_PEOPLE_PLACES", lessonId: "L5_REVIEW_PEOPLE_PLACES" },
 
-    // U4 – Practical Tasks
+    // U4 - Practical Tasks
     { unitId: "U4_PRACTICAL_TASKS", lessonId: "L1_SHOPPING_BASICS" },
     { unitId: "U4_PRACTICAL_TASKS", lessonId: "L2_EATING_OUT" },
     { unitId: "U4_PRACTICAL_TASKS", lessonId: "L3_TRANSPORTATION" },
@@ -3151,15 +3818,32 @@ async function logPronunciationAttempt(
 // Around ~ line 27xx in your 4303-line file
 async function buildLegacyContextBlock(
   userId: string,
+  conversationId?: string,
 ): Promise<string> {
   if (!supabase) return "";
   const client = supabase as SupabaseClient;
 
   try {
+    // 0) Recent turns from THIS session (highest-value continuity context)
+    // NOTE: We keep this small and clipped to avoid token bloat.
+    const { data: recentTurns, error: rtError } = conversationId
+      ? await client
+          .from("memory_raw")
+          .select("role, content, created_at")
+          .eq("user_id", userId)
+          .eq("conversation_id", conversationId)
+          .order("created_at", { ascending: false })
+          .limit(14)
+      : { data: null as any, error: null as any };
+
+    if (rtError) {
+      console.error("buildLegacyContextBlock: recent memory_raw (this session) error", rtError);
+    }
+
     // 1) Recent session-level summaries (layer 2)
     const { data: summaries, error: msError } = await client
       .from("memory_summary")
-      .select("id, short_summary, full_summary, created_at")
+      .select("id, short_summary, session_insights, created_at")
       .eq("user_id", userId)
       .order("created_at", { ascending: false })
       .limit(3);
@@ -3180,22 +3864,34 @@ async function buildLegacyContextBlock(
       console.error("buildLegacyContextBlock: memory_insights error", miError);
     }
 
-    // 3) Recent raw memories (layer 1 – specific vivid stories like Murder Crabs)
-    const { data: rawMemories, error: mrError } = await client
-      .from("memory_raw")
-      .select("chapter_key, content, created_at, tags")
-      .eq("user_id", userId)
-      .contains("tags", ["legacy"])
-      .order("created_at", { ascending: false })
-      .limit(20); // extend beyond just a couple of turns
-
-    if (mrError) {
-      console.error("buildLegacyContextBlock: memory_raw error", mrError);
-    }
-
     const lines: string[] = [];
 
-    // Layer 2 – session summaries
+    // Layer 0 - continuity context from this session
+    if (recentTurns && Array.isArray(recentTurns) && recentTurns.length > 0) {
+      // We fetched newest-first; flip back to chronological for readability.
+      const chron = [...(recentTurns as any[])].reverse();
+      lines.push(
+        "RECENT TURNS FROM THIS SESSION (use these to avoid repeating questions; connect the dots):",
+      );
+
+      // Keep to the last ~10-12 turns and clip each line.
+      const tail = chron.length > 12 ? chron.slice(chron.length - 12) : chron;
+      for (const t of tail) {
+        const created = (t as any).created_at
+          ? new Date((t as any).created_at as string)
+              .toISOString()
+              .slice(11, 19)
+          : "--:--:--";
+
+        const role = ((t as any).role as string | null) === "assistant" ? "AI" : "USER";
+        const content = String((t as any).content ?? "").trim();
+        if (!content) continue;
+        const trimmed = content.length > 220 ? content.slice(0, 217) + "..." : content;
+        lines.push(`- [${created}] ${role}: ${trimmed}`);
+      }
+    }
+
+    // Layer 2 - session summaries
     if (summaries && summaries.length > 0) {
       lines.push(
         "RECENT SESSION CONTEXT (do NOT repeat these verbatim; use them only to sound like a friend who remembers past conversations):",
@@ -3209,7 +3905,7 @@ async function buildLegacyContextBlock(
           : "unknown date";
         const label =
           ((s as any).short_summary as string | null) ??
-          ((s as any).full_summary as string | null) ??
+          (((s as any).session_insights as any)?.full_summary as string | null) ??
           "";
         const trimmed =
           label.length > 160 ? label.slice(0, 157) + "..." : label;
@@ -3217,38 +3913,10 @@ async function buildLegacyContextBlock(
       }
     }
 
-    // 🔥 Layer 1 – specific raw stories
-    if (rawMemories && rawMemories.length > 0) {
-      if (lines.length > 0) {
-        lines.push("");
-      }
+    // (We intentionally removed the older "RECENT SPECIFIC STORIES" pull from memory_raw
+    // filtered by tags. It was less useful for in-the-moment continuity and added cost.)
 
-      lines.push(
-        "RECENT SPECIFIC STORIES (you may casually refer back to these when relevant, e.g. \"last time you told me about...\"):",
-      );
-
-      for (const m of rawMemories) {
-        const created = (m as any).created_at
-          ? new Date((m as any).created_at as string)
-              .toISOString()
-              .slice(0, 10)
-          : "unknown date";
-
-        const chapterKey =
-          ((m as any).chapter_key as string | null) ?? "general";
-
-        const content = ((m as any).content as string | null) ?? "";
-        const cleaned = content.trim();
-        if (!cleaned) continue;
-
-        const trimmed =
-          cleaned.length > 220 ? cleaned.slice(0, 217) + "..." : cleaned;
-
-        lines.push(`- [${created}][${chapterKey}] ${trimmed}`);
-      }
-    }
-
-    // Layer 3 – high-level insights
+    // Layer 3 - high-level insights
     if (insights && insights.length > 0) {
       if (lines.length > 0) {
         lines.push("");
@@ -3297,7 +3965,7 @@ function buildEmptyCoverageMap(userId: string): CoverageMap {
   const baseChapters: Record<CoverageChapterKey, CoverageChapter> = {
     early_childhood: {
       key: "early_childhood",
-      label: "Early Childhood (0–10)",
+      label: "Early Childhood (0-10)",
       coverage_score: 0,
       memory_count: 0,
       word_count_estimate: 0,
@@ -3308,7 +3976,7 @@ function buildEmptyCoverageMap(userId: string): CoverageMap {
     },
     adolescence: {
       key: "adolescence",
-      label: "Adolescence (11–18)",
+      label: "Adolescence (11-18)",
       coverage_score: 0,
       memory_count: 0,
       word_count_estimate: 0,
@@ -3319,7 +3987,7 @@ function buildEmptyCoverageMap(userId: string): CoverageMap {
     },
     early_adulthood: {
       key: "early_adulthood",
-      label: "Early Adulthood (19–30)",
+      label: "Early Adulthood (19-30)",
       coverage_score: 0,
       memory_count: 0,
       word_count_estimate: 0,
@@ -3330,7 +3998,7 @@ function buildEmptyCoverageMap(userId: string): CoverageMap {
     },
     midlife: {
       key: "midlife",
-      label: "Midlife (31–55)",
+      label: "Midlife (31-55)",
       coverage_score: 0,
       memory_count: 0,
       word_count_estimate: 0,
@@ -3527,6 +4195,298 @@ async function callGemini(finalPrompt: string): Promise<string> {
   return "Sorry, I could not generate a reply.";
 }
 
+// ============================================================================
+// ON-DEMAND LEARNING BLOCK ENRICHMENT (NO PER-TURN CALLS)
+// ----------------------------------------------------------------------------
+// This path is invoked explicitly by the client UI (e.g., Learning Hub detail
+// sheet). It performs a single Gemini call ONLY when the block lacks enriched
+// fields (romanization/meaning/notes), then caches by updating learning_blocks.raw_json.
+// ============================================================================
+
+type EnrichedVocabItem = {
+  l2: string;
+  romanization?: string;
+  meaning?: string;
+  notes?: string;
+};
+
+
+async function sha256Hex(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  const bytes = Array.from(new Uint8Array(digest));
+  return bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function normalizeThai(text: string): string {
+  // Tight normalization to maximize phrase-level cache hits and avoid duplicates
+  // caused by bullets, numbering, extra whitespace, quotes, or trailing punctuation.
+  let s = (text || "")
+    .replace(/\\u200B/g, "") // zero-width space
+    .replace(/\\u00A0/g, " ") // non-breaking space
+    .trim();
+
+  // Strip leading list markers / numbering (e.g., "1) ...", "- ...", "- ...")
+  s = s.replace(/^\(?\s*\d+\s*[\)\.]\s*/, "");
+  s = s.replace(/^[--·]+(\s*)/, "");
+
+  // Strip wrapping quotes
+  s = s.replace(/^["'“”‘’]+/, "").replace(/["'“”‘’]+$/, "");
+
+  // Collapse internal whitespace
+  s = s.replace(/\s+/g, " ").trim();
+
+  // Strip common trailing punctuation that is not meaningful for Thai phrases
+  s = s.replace(/[\.,;:!\?]+$/g, "").trim();
+
+  return s;
+}
+
+function extractVocabItemsFromRawJson(rawJson: any): EnrichedVocabItem[] {
+  if (!rawJson) return [];
+  // Preferred: rawJson.items = [{ l2, romanization, meaning, notes }, ...]
+  if (Array.isArray(rawJson?.items)) {
+    return rawJson.items
+      .map((it: any) => ({
+        l2: typeof it?.l2 === "string" ? normalizeThai(it.l2) : "",
+        romanization: typeof it?.romanization === "string" ? it.romanization.trim() : undefined,
+        meaning: typeof it?.meaning === "string" ? it.meaning.trim() : undefined,
+        notes: typeof it?.notes === "string" ? it.notes.trim() : undefined,
+      }))
+      .filter((it: EnrichedVocabItem) => it.l2.length > 0);
+  }
+  return [];
+}
+
+function extractPhrasesFromContentFallback(content: string): string[] {
+  // If raw_json is missing, try to parse numbered lines like:
+  // 1) ผู้ชายกินข้าว
+  const out: string[] = [];
+  const lines = (content || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const m = line.match(/^\d+\)\s*(.+)$/);
+    const phrase = normalizeThai(m ? m[1] : line);
+    if (phrase) out.push(phrase);
+  }
+  // de-dupe
+  return Array.from(new Set(out));
+}
+
+function needsEnrichment(items: EnrichedVocabItem[]): boolean {
+  return items.some((it) => !it.romanization || !it.meaning);
+}
+
+function buildThaiVocabEnrichmentPrompt(args: {
+  phrases: string[];
+  preferredLocale: string;
+  targetLocale: string;
+}): string {
+  const { phrases, preferredLocale, targetLocale } = args;
+
+  // Keep it deterministic and lightweight.
+  return [
+    "You are a language tutor. Enrich Thai vocabulary phrases for a beginner learner.",
+    "Return STRICT JSON only, no markdown, no extra text.",
+    "",
+    "TASK:",
+    "- For each Thai phrase, provide:",
+    '  - "l2": the original Thai phrase (exactly as provided)',
+    '  - "romanization": easy-to-read Thai romanization with tone marks (Paiboon-like is fine)',
+    '  - "meaning": a natural English meaning',
+    '  - "notes": very short breakdown of key words (optional but preferred)',
+    "",
+    "OUTPUT JSON SCHEMA:",
+    '{ "items": [ { "l2": "...", "romanization": "...", "meaning": "...", "notes": "..." } ] }',
+    "",
+    `PREFERRED LOCALE (L1): ${preferredLocale}`,
+    `TARGET LOCALE (L2): ${targetLocale}`,
+    "",
+    "PHRASES:",
+    ...phrases.map((p) => `- ${p}`),
+  ].join("\n");
+}
+
+async function enrichLearningBlockOnDemand(args: {
+  userId: string;
+  blockId: string;
+  preferredLocale: string;
+  targetLocale: string;
+}): Promise<{ updatedRawJson: any; updatedContent: string } | null> {
+  const { userId, blockId, preferredLocale, targetLocale } = args;
+
+  // Fetch the block row
+  const { data: blockRow, error } = await supabase
+    .from("learning_blocks")
+    .select("id, user_id, tag, title, content, raw_json")
+    .eq("id", blockId)
+    .maybeSingle();
+
+  if (error) {
+    console.error("enrichLearningBlockOnDemand: fetch error", error);
+    return null;
+  }
+  if (!blockRow) return null;
+  if (blockRow.user_id !== userId) {
+    console.warn("enrichLearningBlockOnDemand: user_id mismatch", { userId, blockUserId: blockRow.user_id });
+    return null;
+  }
+
+  // Only enrich VOCAB blocks (safe + cheap). Others can be added later.
+  const tag = String(blockRow.tag || "").toUpperCase();
+  if (tag !== "VOCAB") {
+    return { updatedRawJson: blockRow.raw_json, updatedContent: String(blockRow.content || "") };
+  }
+
+  const existingRaw = blockRow.raw_json;
+  const existingItems = extractVocabItemsFromRawJson(existingRaw);
+
+  // If already enriched, no-op.
+  if (existingItems.length > 0 && !needsEnrichment(existingItems)) {
+    return { updatedRawJson: existingRaw, updatedContent: String(blockRow.content || "") };
+  }
+
+  // Determine phrases to enrich
+  const phrases =
+    existingItems.length > 0
+      ? existingItems.map((it) => it.l2)
+      : extractPhrasesFromContentFallback(String(blockRow.content || ""));
+
+  if (!phrases.length) {
+    return { updatedRawJson: existingRaw, updatedContent: String(blockRow.content || "") };
+  }
+
+  
+// Normalize + dedupe phrases
+const uniquePhrases = Array.from(
+  new Set(phrases.map((p) => normalizeThai(String(p || ""))).filter((p) => p.length > 0)),
+);
+
+// Phrase-level cache (learning_phrase_cache). Keyed by SHA256(targetLocale::phrase)
+// Compute hashes in parallel to minimize on-demand latency.
+const phraseToHash = new Map<string, string>();
+const hashPairs = await Promise.all(
+  uniquePhrases.map(async (p) => [p, await sha256Hex(`${targetLocale}::${p}`)] as const),
+);
+const hashes: string[] = [];
+for (const [p, h] of hashPairs) {
+  phraseToHash.set(p, h);
+  hashes.push(h);
+}
+
+let cachedItems: EnrichedVocabItem[] = [];
+if (hashes.length > 0) {
+  const { data: cachedRows, error: cacheErr } = await supabase
+    .from("learning_phrase_cache")
+    .select("phrase_hash, l2, romanization, meaning, notes, target_locale")
+    .in("phrase_hash", hashes)
+    .eq("target_locale", targetLocale);
+
+  if (cacheErr) {
+    console.warn("enrichLearningBlockOnDemand: cache read failed (continuing)", cacheErr);
+  } else if (Array.isArray(cachedRows)) {
+    cachedItems = cachedRows
+      .map((r: any) => ({
+        l2: typeof r?.l2 === "string" ? normalizeThai(r.l2) : "",
+        romanization: typeof r?.romanization === "string" ? r.romanization.trim() : undefined,
+        meaning: typeof r?.meaning === "string" ? r.meaning.trim() : undefined,
+        notes: typeof r?.notes === "string" ? r.notes.trim() : undefined,
+      }))
+      .filter((it: EnrichedVocabItem) => it.l2.length > 0);
+  }
+}
+
+const cachedSet = new Set(cachedItems.map((it) => it.l2));
+const missingPhrases = uniquePhrases.filter((p) => !cachedSet.has(p));
+
+let geminiItems: EnrichedVocabItem[] = [];
+if (missingPhrases.length > 0) {
+  const prompt = buildThaiVocabEnrichmentPrompt({
+    phrases: missingPhrases,
+    preferredLocale,
+    targetLocale,
+  });
+
+  const raw = await callGemini(prompt);
+  const parsed = tryExtractJsonObject(raw) as any;
+
+  const itemsRaw = Array.isArray(parsed?.items) ? parsed.items : [];
+  geminiItems = itemsRaw
+    .map((it: any) => ({
+      l2: typeof it?.l2 === "string" ? normalizeThai(it.l2) : "",
+      romanization: typeof it?.romanization === "string" ? it.romanization.trim() : undefined,
+      meaning: typeof it?.meaning === "string" ? it.meaning.trim() : undefined,
+      notes: typeof it?.notes === "string" ? it.notes.trim() : undefined,
+    }))
+    .filter((it: EnrichedVocabItem) => it.l2.length > 0);
+
+  // Upsert missing phrases into cache (best-effort; do not block UI)
+  if (geminiItems.length > 0) {
+    const upserts = geminiItems.map((it) => ({
+      phrase_hash: phraseToHash.get(it.l2) ?? null,
+      target_locale: targetLocale,
+      l2: it.l2,
+      romanization: it.romanization ?? null,
+      meaning: it.meaning ?? null,
+      notes: it.notes ?? null,
+      updated_at: new Date().toISOString(),
+    })).filter((r) => r.phrase_hash);
+
+    if (upserts.length > 0) {
+      const { error: upErr } = await supabase
+        .from("learning_phrase_cache")
+        .upsert(upserts, { onConflict: "phrase_hash" });
+
+      if (upErr) {
+        console.warn("enrichLearningBlockOnDemand: cache upsert failed (continuing)", upErr);
+      }
+    }
+  }
+}
+
+// Combine cache + gemini, preferring gemini for missing, but preserving cached too
+const combinedMap = new Map<string, EnrichedVocabItem>();
+for (const it of cachedItems) combinedMap.set(it.l2, it);
+for (const it of geminiItems) combinedMap.set(it.l2, it);
+const enrichedItems: EnrichedVocabItem[] = Array.from(combinedMap.values()).filter((it) => it.l2);
+
+  if (!enrichedItems.length) {
+    console.warn("enrichLearningBlockOnDemand: Gemini returned no items");
+    return { updatedRawJson: existingRaw, updatedContent: String(blockRow.content || "") };
+  }
+
+  // Merge into raw_json.items
+  const mergedMap = new Map<string, EnrichedVocabItem>();
+  for (const p of phrases) mergedMap.set(normalizeThai(p), { l2: normalizeThai(p) });
+
+  // Seed with existing items (keep anything already present)
+  for (const it of existingItems) mergedMap.set(it.l2, { ...mergedMap.get(it.l2), ...it });
+
+  // Overlay with enriched items
+  for (const it of enrichedItems) mergedMap.set(it.l2, { ...mergedMap.get(it.l2), ...it });
+
+  const mergedItems = Array.from(mergedMap.values()).filter((it) => it.l2);
+
+  const newRawJson = {
+    ...(typeof existingRaw === "object" && existingRaw ? existingRaw : {}),
+    items: mergedItems,
+    enriched_at: new Date().toISOString(),
+    enriched_via: "on_demand",
+  };
+
+  // Persist cache by updating the block row
+  const { error: upErr } = await supabase
+    .from("learning_blocks")
+    .update({ raw_json: newRawJson })
+    .eq("id", blockId);
+
+  if (upErr) {
+    console.error("enrichLearningBlockOnDemand: update error", upErr);
+    // Still return the computed data so the UI can show it immediately
+  }
+
+  return { updatedRawJson: newRawJson, updatedContent: String(blockRow.content || "") };
+}
+
 function extractJsonCandidate(text: string): string | null {
   const t = (text ?? "").trim();
   if (!t) return null;
@@ -3621,6 +4581,109 @@ async function upsertCoverageMapRow(
   }
 }
 
+
+// Best-effort snapshot writer for coverage_timeline.
+// This is intentionally resilient: if the table/columns differ, we log and continue.
+async function tryInsertCoverageTimelineRow(
+  supabase: SupabaseClient,
+  userId: string,
+  map: CoverageMap | null
+) {
+  if (!map) return;
+
+  const preferredBucket = "lifetime";
+  const preferredLifeStage = "unspecified";
+
+  const candidateJsonColumns = ["snapshot", "coverage_map", "map"];
+  const missing = new Set<string>();
+
+  for (const col of candidateJsonColumns) {
+    if (missing.has(col)) continue;
+
+    const row: any = {
+      user_id: userId,
+      bucket: preferredBucket,
+      life_stage: preferredLifeStage,
+    };
+
+    row[col] = map;
+
+    // PRIMARY PATH — idempotent UPSERT
+    let { error } = await supabase
+      .from("coverage_timeline")
+      .upsert(row, {
+        onConflict: "user_id,bucket,life_stage",
+      });
+
+    if (!error) return;
+
+    // PostgREST schema cache missing column
+    if ((error as any)?.code === "PGRST204") {
+      const msg = String((error as any)?.message || "");
+      if (msg.includes(`"${col}"`)) {
+        missing.add(col);
+        continue;
+      }
+
+      // Fallback UPDATE (schema cache may be stale)
+      const updatePayload: any = {};
+      updatePayload[col] = map;
+
+      const { error: updErr } = await supabase
+        .from("coverage_timeline")
+        .update(updatePayload)
+        .match({
+          user_id: userId,
+          bucket: preferredBucket,
+          life_stage: preferredLifeStage,
+        });
+
+      if (!updErr) return;
+
+      console.error("coverage_timeline update fallback failed:", updErr);
+      return;
+    }
+
+    // Duplicate key (defensive — should not occur with upsert)
+    if ((error as any)?.code === "23505") {
+      const updatePayload: any = {};
+      updatePayload[col] = map;
+
+      const { error: updErr } = await supabase
+        .from("coverage_timeline")
+        .update(updatePayload)
+        .match({
+          user_id: userId,
+          bucket: preferredBucket,
+          life_stage: preferredLifeStage,
+        });
+
+      if (!updErr) return;
+
+      console.error("coverage_timeline duplicate recovery failed:", updErr);
+      return;
+    }
+
+    // Enum rejection (life_stage not accepted)
+    if ((error as any)?.code === "22P02") {
+      console.warn(
+        `coverage_timeline skipped: life_stage '${preferredLifeStage}' not accepted by enum`
+      );
+      return;
+    }
+
+    // NOT NULL violation
+    if ((error as any)?.code === "23502") {
+      console.warn("coverage_timeline skipped: NOT NULL constraint violation");
+      return;
+    }
+
+    // Any other error is real
+    console.error("Error writing coverage_timeline:", error);
+    return;
+  }
+}
+
 function inferChapterKeysForLegacySummary(
   text: string,
   themes: string[] = []
@@ -3689,7 +4752,7 @@ function inferChapterKeysForLegacySummary(
     add("health_wellbeing");
   }
 
-  // Hobbies, interests, and your Murder Crabs–style food adventures
+  // Hobbies, interests, and your Murder Crabs-style food adventures
   if (
     /\b(hobby|hobbies|music|sport|sports|cycling|bike|bicycle|travel|trip|vacation|game|gaming|movie|film|reading|book|photography|cooking|cook|kitchen|restaurant|food|crab|seafood)\b/.test(
       lowered,
@@ -3752,7 +4815,7 @@ export async function recomputeCoverageMapForUser(
   const { data, error } = await supabase
     .from("memory_summary")
     .select(
-      "id, user_id, raw_id, created_at, short_summary, full_summary, observations"
+      "id, user_id, raw_id, created_at, short_summary, session_insights, observations"
     )
     .eq("user_id", userId);
 
@@ -3799,16 +4862,14 @@ export async function recomputeCoverageMapForUser(
     //    infer the best-guess chapters from the text + any theme tags.
     if (!chapters.length) {
       const textForInfer =
-        row.full_summary ||
-        row.short_summary ||
+        (row.session_insights as any)?.full_summary || (row.session_insights as any)?.short_summary || row.short_summary ||
         "";
       const themes = Array.isArray(meta.themes) ? meta.themes : [];
       chapters = inferChapterKeysForLegacySummary(textForInfer, themes);
     }
 
     const text =
-      row.full_summary ||
-      row.short_summary ||
+      (row.session_insights as any)?.full_summary || (row.session_insights as any)?.short_summary || row.short_summary ||
       "";
 
     const roughWordCount =
@@ -4032,12 +5093,13 @@ export async function recomputeUserKnowledgeGraphs(
       supabase,
       userId
     );
+    await tryInsertCoverageTimelineRow(supabase, userId, coverage);
     await recomputeLifetimeProfileForUser(
       supabase,
       userId,
       coverage
     );
-  } catch (err) {
+} catch (err) {
     console.error("Error recomputing user knowledge graphs:", err);
   }
 }
@@ -4046,8 +5108,298 @@ export async function recomputeUserKnowledgeGraphs(
   // ============================================================================
   // HTTP Handler
   // ============================================================================
+
+
+// ------------------------------
+// Recall evidence helpers (minimal, fail-closed)
+// These exist to prevent runtime ReferenceErrors and to enforce "no evidence → no claim".
+// ------------------------------
+
+type RecallEvidence = {
+  kind: 'memory_raw' | 'memory_summary' | 'story_seed' | 'browse';
+  id: string;
+  created_at?: string;
+  title?: string;
+  excerpt: string;
+};
+
+function _safeStr(v: unknown, max = 280): string {
+  const s = (typeof v === 'string' ? v : v == null ? '' : String(v)).replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+// Explicit recall tests are things like "what did I say about X", "do you remember", "earlier you said", etc.
+function isExplicitRecallTestIntent(userText: string): boolean {
+  const t = (userText || '').toLowerCase();
+  if (!t) return false;
+  return (
+    /\b(do you remember|remember when|what did i say|what did i tell you|earlier you said|you said earlier|last time i said|previously i said|from our last|in a prior session)\b/.test(t) ||
+    /\brecall test\b/.test(t)
+  );
+}
+
+// Try to extract a short "recall query" from the user's message.
+// Returns "" if we can't reliably extract anything.
+function extractStoryRecallQuery(userText: string): string {
+  const t = (userText || '').trim();
+  if (!t) return '';
+  // Strip common lead-ins.
+  let q = t
+    .replace(/^(do you remember|remember when|what did i say about|what did i tell you about|earlier you said|you said earlier|last time i said)\s+/i, '')
+    .replace(/[?!.]+$/g, '')
+    .trim();
+  // If still looks like a generic question, avoid triggering recall.
+  if (q.length < 3) return '';
+  // Keep it short to avoid noisy DB scans.
+  if (q.length > 120) q = q.slice(0, 120).trim();
+  return q;
+}
+
+
+function detectRecallIntent(userText: string): boolean {
+  const t = (userText || '').toLowerCase();
+  if (!t) return false;
+  // Be conservative: only trigger when user clearly asks about prior content.
+  if (isExplicitRecallTestIntent(t)) return true;
+  return /\b(earlier|previous|last time|before|prior session|in that session|from that day)\b/.test(t) &&
+    /\b(you said|i said|we talked|we discussed|remember|recall|mention)\b/.test(t);
+}
+
+function looksLikeRecallContinuation(userText: string): boolean {
+  const t = (userText || '').toLowerCase().trim();
+  if (!t) return false;
+  // "Tell me about that/it" etc.
+  return /\b(tell me|remind me|what about|more about|expand on)\b/.test(t) && /\b(it|that|this|those|them)\b/.test(t);
+}
+
+async function inferRecallQueryFromRecentTurns(
+  supabase: SupabaseClient,
+  user_id: string,
+  conversation_id: string,
+): Promise<string> {
+  try {
+    // Try to get the most recent prior user turn in this conversation and extract a query from it.
+    const { data } = await supabase
+      .from('memory_raw')
+      .select('content, role, created_at')
+      .eq('user_id', user_id)
+      .eq('conversation_id', conversation_id)
+      .order('created_at', { ascending: false })
+      .limit(10);
+
+    for (const row of data || []) {
+      if (row?.role === 'user' && typeof row.content === 'string' && row.content.trim().length > 0) {
+        const q = extractStoryRecallQuery(row.content);
+        if (q) return q;
+      }
+    }
+    return '';
+  } catch (_err) {
+    return '';
+  }
+}
+
+
+async function hydrateRecallEvidence(
+  supabase: SupabaseClient,
+  user_id: string,
+  userMessageForPrompt: string,
+  storyQuery: string,
+): Promise<RecallEvidence[]> {
+  try {
+    const q = (storyQuery || extractStoryRecallQuery(userMessageForPrompt) || "").trim();
+    if (!q) return [];
+
+    const evidences: RecallEvidence[] = [];
+
+    // Phase 3 narrative capsules are the canonical recall surface (they already normalize summaries).
+    // IMPORTANT: do not query memory_summary.full_summary (deprecated / dropped in schema).
+    const { data: capsules } = await supabase
+      .from("phase3_session_capsules_narrative")
+      .select("summary_id, created_at, short_summary, full_summary")
+      .eq("user_id", user_id)
+      .or(`short_summary.ilike.%${q}%,full_summary.ilike.%${q}%`)
+      .order("created_at", { ascending: false })
+      .limit(6);
+
+    for (const row of capsules || []) {
+      evidences.push({
+        kind: "capsule",
+        id: row.summary_id,
+        created_at: row.created_at,
+        excerpt: _safeStr(row.full_summary || row.short_summary, 420),
+      });
+    }
+
+    // Story seeds are a strong secondary source for recall queries.
+    const { data: seeds } = await supabase
+      .from("story_seeds")
+      .select("id, created_at, title, seed_text")
+      .eq("user_id", user_id)
+      .or(`title.ilike.%${q}%,seed_text.ilike.%${q}%`)
+      .order("created_at", { ascending: false })
+      .limit(6);
+
+    for (const row of seeds || []) {
+      evidences.push({
+        kind: "story_seed",
+        id: row.id,
+        created_at: row.created_at,
+        title: _safeStr(row.title, 120),
+        excerpt: _safeStr(row.seed_text, 420),
+      });
+    }
+
+    // If we still have nothing, do a small raw scan (last resort).
+    if (evidences.length === 0) {
+      const { data: raws } = await supabase
+        .from("memory_raw")
+        .select("id, created_at, content")
+        .eq("user_id", user_id)
+        .ilike("content", `%${q}%`)
+        .order("created_at", { ascending: false })
+        .limit(8);
+
+      for (const row of raws || []) {
+        evidences.push({
+          kind: "memory_raw",
+          id: row.id,
+          created_at: row.created_at,
+          excerpt: _safeStr(row.content, 420),
+        });
+      }
+    }
+
+    return evidences.slice(0, 10);
+  } catch (_err) {
+    return [];
+  }
+}
+
+async function hydrateRecallBrowseEvidence(
+  supabase: SupabaseClient,
+  user_id: string,
+): Promise<RecallEvidence[]> {
+  // "Browse" mode is used for explicit recall tests without a query.
+  // Return a small recent canonical set; the system prompt still enforces evidence-only answers.
+  try {
+    const evidences: RecallEvidence[] = [];
+
+    // Prefer recent narrative capsules (finalized phase2).
+    const { data: capsules } = await supabase
+      .from("phase3_session_capsules_narrative")
+      .select("summary_id, created_at, short_summary, full_summary")
+      .eq("user_id", user_id)
+      .order("created_at", { ascending: false })
+      .limit(6);
+
+    for (const row of capsules || []) {
+      evidences.push({
+        kind: "browse",
+        id: row.summary_id,
+        created_at: row.created_at,
+        excerpt: _safeStr(row.full_summary || row.short_summary, 420),
+      });
+    }
+
+    // Then seeds.
+    if (evidences.length < 6) {
+      const { data: seeds } = await supabase
+        .from("story_seeds")
+        .select("id, created_at, title, seed_text")
+        .eq("user_id", user_id)
+        .order("created_at", { ascending: false })
+        .limit(8);
+
+      for (const row of seeds || []) {
+        evidences.push({
+          kind: "browse",
+          id: row.id,
+          created_at: row.created_at,
+          title: _safeStr(row.title, 120),
+          excerpt: _safeStr(row.seed_text, 420),
+        });
+      }
+    }
+
+    return evidences.slice(0, 10);
+  } catch (_err) {
+    return [];
+  }
+}
+
+function buildRecallEvidenceAddon(evidences: RecallEvidence[]): string {
+  const lines: string[] = [];
+  lines.push('RECALL EVIDENCE (receipts):');
+  for (const e of evidences) {
+    const head = `- [${e.kind}] ${e.id}${e.title ? ` — ${e.title}` : ''}${e.created_at ? ` (${e.created_at})` : ''}`;
+    lines.push(head);
+    lines.push(`  ${_safeStr(e.excerpt, 420)}`);
+  }
+  lines.push('');
+  lines.push('Rules: You MUST only answer recall questions using the evidence above. If the evidence does not support a claim, say you cannot verify it from receipts.');
+  return lines.join('\n');
+}
+
+function buildRecallBrowseAddon(evidences: RecallEvidence[]): string {
+  // Same format; labeled for browse mode.
+  return buildRecallEvidenceAddon(evidences);
+}
+
+function buildNoEvidenceRecallReply(): string {
+  return (
+    "I can't verify that from your receipts yet. " +
+    "If you tell me what story, person, or keyword to look for, I can try again - otherwise I don't want to guess."
+  );
+}
+
+
+function buildSessionLocalRecallFallbackAddon(): string {
+  return [
+    "SESSION-LOCAL RECALL (no canonical receipts found):",
+    "- The user asked you to recall something.",
+    "- You may ONLY use details that appear in the 'RECENT TURNS FROM THIS SESSION' section above.",
+    "- If that section contains relevant details, paraphrase them and frame it explicitly as: 'Earlier in this session you said...'.",
+    "- If the relevant details are NOT present, say you don't have enough details yet and ask the user to remind you briefly.",
+    "- Do NOT guess or invent details.",
+  ].join("\n");
+}
+
+
+
+// Strip unsupported "memory claims" when we do NOT have canonical evidence.
+// This is intentionally conservative and fail-closed.
+function stripUnsupportedRecallClaims(replyText: string): string {
+  const t = (replyText || "").trim();
+  if (!t) return t;
+
+  // If the model already used the safe receipts phrasing, keep it.
+  if (/\b(receipts? yet|can't verify|don't want to guess)\b/i.test(t)) return t;
+
+  // Detect strong "I remember / you told me / last time" style claims.
+  const hasMemoryClaim =
+    /\b(i remember|i recall|you told me|you said earlier|last time|previously you|earlier you|we talked about|we discussed)\b/i.test(
+      t.toLowerCase(),
+    );
+
+  if (!hasMemoryClaim) return t;
+
+  // Replace with a safe, ASCII-only honesty message (TTS-friendly).
+  return buildNoEvidenceRecallReply();
+}
+
+
+
   export async function runTurnPipeline(req: Request): Promise<Response> {
     try {
+      // Diagnostics (does not depend on "meaningful session" thresholds)
+      const urlObj = new URL(req.url);
+      const diagParam = urlObj.searchParams.get("diag");
+      if (diagParam === "1") {
+        return await runDiagnostics({ supabase, authHeader: req.headers.get("Authorization") });
+      }
+
       if (req.method !== "POST") {
         return jsonResponse({ error: "Only POST allowed." }, 405);
       }
@@ -4057,11 +5409,54 @@ export async function recomputeUserKnowledgeGraphs(
         const raw = await req.json();
         console.log("🧠 ai-brain incoming:", raw);
         body = raw as AiBrainPayload;
+
+        if (body?.diagnostic === true) {
+          return await runDiagnostics({ supabase, userId: body?.user_id ?? null, authHeader: req.headers.get("Authorization") });
+        }
       } catch (_err) {
         return jsonResponse({ error: "Invalid JSON body." }, 400);
       }
 
       const { user_id, conversation_id } = body;
+
+      // -------------------------------------------------------------------
+      // OP ROUTING: on-demand actions that must NOT run during normal turns
+      // -------------------------------------------------------------------
+      if (body?.op === "enrich_learning_block") {
+        const blockId = body.block_id;
+        if (!blockId) {
+          return jsonResponse({ error: "Missing block_id." }, 400);
+        }
+
+        const preferredLocale = body.preferred_locale || "en";
+        const targetLocale = body.target_locale || "th-TH";
+
+        try {
+          const enriched = await enrichLearningBlockOnDemand({
+            userId: user_id,
+            blockId,
+            preferredLocale,
+            targetLocale: targetLocale || "th-TH",
+          });
+
+          if (!enriched) {
+            return jsonResponse({ error: "Learning block not found." }, 404);
+          }
+
+          return jsonResponse(
+            {
+              ok: true,
+              block_id: blockId,
+              raw_json: enriched.updatedRawJson ?? null,
+              content: enriched.updatedContent ?? null,
+            },
+            200,
+          );
+        } catch (e) {
+          console.error("enrich_learning_block error:", e);
+          return jsonResponse({ error: "Failed to enrich learning block." }, 500);
+        }
+      }
 
       // -------------------------------------------------------------------
       // Response payload variables (must be defined for all code paths)
@@ -4073,7 +5468,12 @@ export async function recomputeUserKnowledgeGraphs(
 
       // Make message_text mutable (we may normalize it)
       let message_text = (body as any).message_text as string | undefined;
-
+      // Ensure prompt variables exist across all branches (Deno/ESM strict)
+      let rawUserMessageForPrompt: string = "";
+      let userMessageForPrompt: string = "";
+      // Predeclare recall gating so it is always defined across branches
+      let recallTestForThisTurn: boolean = false;
+      let wantsRecallForThisTurn: boolean = false;
       // -------------------------------------------------------------------
       // End-session payloads (must be defined for all code paths)
       // -------------------------------------------------------------------
@@ -4200,7 +5600,7 @@ export async function recomputeUserKnowledgeGraphs(
         const currentState =
           languageState ?? getDefaultLanguageLessonState();
 
-        // 2a) Progress query – describe current position, do NOT advance.
+        // 2a) Progress query - describe current position, do NOT advance.
         if (isProgressQuery(rawUserText)) {
           const summary = buildLanguageProgressSummary(
             preferredLocale,
@@ -4227,7 +5627,7 @@ export async function recomputeUserKnowledgeGraphs(
           });
         }
 
-        // 2b) Go-back query – regress and describe the new position.
+        // 2b) Go-back query - regress and describe the new position.
         if (isGoBackQuery(rawUserText)) {
           const regressed = regressLanguageLessonState(currentState);
 
@@ -4256,7 +5656,7 @@ export async function recomputeUserKnowledgeGraphs(
           });
         }
 
-        // 2c) Move-ahead query – fast-forward and describe the new position.
+        // 2c) Move-ahead query - fast-forward and describe the new position.
         if (isMoveAheadQuery(rawUserText)) {
           const advancedState = fastForwardLanguageState(currentState);
 
@@ -4281,7 +5681,7 @@ export async function recomputeUserKnowledgeGraphs(
             target_locale: hasTarget ? targetLocale : null,
             learning_level: learningLevel,
             conversation_id: effectiveConversationId,
-            state_json: JSON.stringify(advancedState),
+            state_json: "{}",
           });
         }
       }
@@ -4359,7 +5759,7 @@ export async function recomputeUserKnowledgeGraphs(
         systemPrompt = buildAvatarSystemPrompt(preferredLocale);
 
         if (supabase) {
-          contextBlock = await buildLegacyContextBlock(user_id);
+          contextBlock = await buildLegacyContextBlock(user_id, effectiveConversationId);
         }
       } else {
         // Legacy storytelling mode.
@@ -4378,26 +5778,177 @@ export async function recomputeUserKnowledgeGraphs(
         };
 
         systemPrompt = buildLegacySystemPrompt(legacyCtx);
-
-        if (supabase) {
-          contextBlock = await buildLegacyContextBlock(user_id);
-        }
-      }
+        // Enforce companion contract + narrative momentum
+        systemPrompt = `${systemPrompt}\n\n${LEGACY_COMPANION_ROLE_CONTRACT}`;
 
       // -----------------------------------------------------------------------
       // 4) Call Gemini
       // -----------------------------------------------------------------------
-      const rawUserMessageForPrompt =
+      rawUserMessageForPrompt =
         (body.message_text ??
           (body as any).message ??
           (body as any).user_message ??
           (body as any).input ??
           "") as string;
 
-      const userMessageForPrompt =
+      userMessageForPrompt =
         conversationMode === "avatar"
           ? rawUserMessageForPrompt
           : (message_text ?? rawUserMessageForPrompt);
+
+// Precompute recall gating once to prevent accidental "receipts" behavior on normal turns.
+            recallTestForThisTurn =
+        !isEndSession && conversationMode === "legacy"
+          ? isExplicitRecallTestIntent(userMessageForPrompt)
+          : false;
+            wantsRecallForThisTurn =
+        !isEndSession && conversationMode === "legacy"
+          ? (detectRecallIntent(userMessageForPrompt) || recallTestForThisTurn)
+          : false;
+
+        // If the user did not ask for recall, do NOT bring up receipts/verification.
+        if (!wantsRecallForThisTurn) {
+          systemPrompt =
+            systemPrompt +
+            "\n\nIMPORTANT: Unless the user explicitly asks you to recall or look up past content, do not mention receipts, verification, or ask for a story/person/keyword to search. Respond normally to what the user just said.";
+        }
+
+        if (supabase) {
+          contextBlock = await buildLegacyContextBlock(user_id, effectiveConversationId);
+        }
+      }
+
+      
+
+      // -----------------------------------------------------------------------
+      // TURN SIGNAL GATE (Legacy recalibration)
+      // - Do not treat silence/empty text as a signal.
+      // - Keep extremely short legacy turns constrained to prevent "expanding emptiness".
+      // -----------------------------------------------------------------------
+      const _trimmedUserMessageForPrompt = (userMessageForPrompt ?? "").trim();
+
+      // Safety: the client normally does not send empty STT to the server, but guard anyway.
+      if (!_trimmedUserMessageForPrompt) {
+        return jsonResponse({
+          reply_text: null,
+          learning_artifacts: null,
+          legacy_artifacts: null,
+          mode: conversationMode,
+          preferred_locale: preferredLocale,
+          target_locale: hasTarget ? targetLocale : null,
+          learning_level: learningLevel,
+          conversation_id: effectiveConversationId,
+          state_json: "{}",
+          end_session: isEndSession,
+          end_session_summary: null,
+        });
+      }
+
+      
+      // Fast-path: very short greetings / "are you there?" in Legacy mode should not trigger verbose context-driven replies.
+      // Avoid calling Gemini for these to prevent "expanding emptiness" and topic-jumping.
+      const _isLegacyGreeting =
+        !isEndSession &&
+        conversationMode === "legacy" &&
+        /^(hi|hey|hello|yo|sup|are you there\??|you there\??|gemini\s*,?\s*are you there\??)$/i.test(
+          _trimmedUserMessageForPrompt.replace(/\s+/g, " ").trim(),
+        );
+
+      if (_isLegacyGreeting) {
+        return jsonResponse({
+          reply_text: "Yep — I'm here. What would you like to talk about?",
+          learning_artifacts: null,
+          legacy_artifacts: null,
+          mode: conversationMode,
+          preferred_locale: preferredLocale,
+          target_locale: hasTarget ? targetLocale : null,
+          learning_level: learningLevel,
+          conversation_id: effectiveConversationId,
+          state_json: "{}",
+          end_session: isEndSession,
+          end_session_summary: null,
+        });
+      }
+
+const _legacyToneConstraint =
+        !isEndSession &&
+        conversationMode === "legacy"
+          ? "\n\nTONE_CONSTRAINT:\nBe calm, grounded, and neutral. Do not cheerlead or assume the user\'s emotional state unless they explicitly state it. Keep replies concise and ask at most one gentle question."
+          : "";
+
+      const _lowContentLegacyConstraint =
+        !isEndSession &&
+        conversationMode === "legacy" &&
+        _trimmedUserMessageForPrompt.length < 15
+          ? "\n\nTURN_CONSTRAINT:\nThe user spoke briefly. Reply with ONE sentence maximum. Ask no more than one question. Do not interpret or expand beyond what was said. Do NOT introduce new topics (summaries, insights, story seeds, avatars) unless the user explicitly mentioned them in this turn."
+          : "";
+
+
+      // -----------------------------------------------------------------------
+// Recall hydration (Legacy): never pretend to remember a story unless we have canonical evidence.
+// If the user asks for a retell/recall and we can't find evidence, we reply safely (no Gemini call).
+// -----------------------------------------------------------------------
+let forcedLegacyReply: string | null = null;
+let hadCanonicalEvidenceThisTurn = false;
+let hadSessionLocalEvidenceThisTurn = false;
+if (!isEndSession && conversationMode === "legacy") {
+  const recallTest = recallTestForThisTurn;
+  const wantsRecall = wantsRecallForThisTurn;
+  let storyQuery = wantsRecall ? extractStoryRecallQuery(userMessageForPrompt) : "";
+
+	  // If the user is continuing a recall request with pronouns (“tell me about it/that”)
+	  // and we didn't extract a concrete query, try to infer it from the last user turn
+	  // in this conversation (cheap: one small DB read, only on recall turns).
+	  if (wantsRecall && !storyQuery && !recallTest && supabase && effectiveConversationId && looksLikeRecallContinuation(userMessageForPrompt)) {
+	    try {
+	      storyQuery = await inferRecallQueryFromRecentTurns(
+	        supabase as SupabaseClient,
+	        user_id,
+	        effectiveConversationId,
+	      );
+	    } catch (_) {
+	      // ignore
+	    }
+	  }
+  if (wantsRecall && (storyQuery || recallTest)) {
+    if (supabase) {
+      const evidences = recallTest && !storyQuery
+        ? await hydrateRecallBrowseEvidence(
+            supabase as SupabaseClient,
+            user_id,
+          )
+        : await hydrateRecallEvidence(
+            supabase as SupabaseClient,
+            user_id,
+	            userMessageForPrompt,
+	            storyQuery,
+          );
+
+      if (!evidences || evidences.length === 0) {
+        // Safety rule: no speculation, no "memory limits" discussion.
+        // No canonical evidence. Allow a normal Gemini reply, but constrain it to session-local turns only.
+        hadSessionLocalEvidenceThisTurn = true;
+        systemPrompt = `${systemPrompt}\n\n${buildSessionLocalRecallFallbackAddon()}`;
+      } else {
+        // Provide evidence to the model and enforce honesty.
+        hadCanonicalEvidenceThisTurn = true;
+        systemPrompt = `${systemPrompt}\n\n${recallTest && !storyQuery ? buildRecallBrowseAddon(evidences) : buildRecallEvidenceAddon(evidences)}`;
+        const evidenceText = evidences
+          .map((e, idx) => {
+            const t = (e.title ? `Story ${idx + 1}: ${e.title}\n` : `Story ${idx + 1}:\n`);
+            return `${t}${e.text}`.trim();
+          })
+          .join("\n\n---\n\n");
+        contextBlock = `${contextBlock}\n\nCANONICAL_EVIDENCE:\n${evidenceText}`.trim();
+      }
+    } else {
+      forcedLegacyReply = buildNoEvidenceRecallReply();
+    }
+  }
+}
+
+      if (_lowContentLegacyConstraint) systemPrompt = `${systemPrompt}${_lowContentLegacyConstraint}`;
+      if (_legacyToneConstraint) systemPrompt = `${systemPrompt}${_legacyToneConstraint}`;
 
       const finalPrompt = `${systemPrompt}
 
@@ -4409,7 +5960,11 @@ User message:
       let rawReply = "";
 
       if (!isEndSession) {
-        rawReply = await callGemini(finalPrompt);
+        if (forcedLegacyReply) {
+          rawReply = forcedLegacyReply;
+        } else {
+          rawReply = await callGemini(finalPrompt);
+        }
       } else {
         // End-session should not pay per-turn latency for a normal assistant reply.
         rawReply = "";
@@ -4511,6 +6066,16 @@ if (conversationMode === "language_learning" && typeof replyText === "string") {
         replyText = stripRomanizationFromL1Lines(replyText);
       }
 
+
+      // -------------------------------------------------------------------
+      // Legacy recall honesty guard:
+      // If we did not hydrate canonical evidence this turn, do not allow the model
+      // to claim it remembers specific stories or details. Replace with safe reply.
+      // -------------------------------------------------------------------
+      if (conversationMode === "legacy" && !hadCanonicalEvidenceThisTurn && !hadSessionLocalEvidenceThisTurn) {
+        replyText = stripUnsupportedRecallClaims(replyText);
+      }
+
       // Persist the chat-bubble text (null for end-session)
       const trimmedReplyText = replyText.trim();
       reply_text = trimmedReplyText.length > 0 ? trimmedReplyText : null;
@@ -4600,7 +6165,12 @@ if (conversationMode === "language_learning" && typeof replyText === "string") {
             let userText = (message_text ?? "").trim();
             if (userText === "__END_SESSION__") userText = "";
 
-            const aiText = replyText.trim();
+            let aiText = replyText.trim();
+            // Guard: if the model response accidentally echoes the user turn verbatim,
+            // do not write it as an AI message (prevents role-swapped transcript artifacts).
+            if (aiText && userText && aiText.trim() === userText.trim()) {
+              aiText = "";
+            }
             const nowIso = new Date().toISOString();
 
             // Write user + AI turns into memory_raw
@@ -4683,7 +6253,7 @@ if (conversationMode === "language_learning" && typeof replyText === "string") {
                   chapter_title: ls.chapter_title,
                 },
                 tags: ["legacy"],
-                created_at: nowIso,
+                created_at: new Date(Date.parse(nowIso) + 1).toISOString(),
                 chapter_key: primaryTurnChapterKey,
                 word_count_estimate: aiWordCount,
                 is_legacy_story: true,
@@ -4728,11 +6298,187 @@ if (conversationMode === "language_learning" && typeof replyText === "string") {
                   summarizeLegacySessionWithGemini,
                   inferChapterKeysForLegacySummary,
                   classifyCoverageFromStoryText,
+                  extractSummaryThemesWithGemini,
                   upsertStorySeedsForConversation,
                   recomputeUserKnowledgeGraphs,
                   invokeRebuildInsightsInternal,
                 },
               });
+
+              // Ensure longitudinal insights rebuild runs even if the pipeline implementation changes.
+// Best-effort: do not fail the turn if rebuild-insights is misconfigured.
+{
+  const enableRebuild =
+    (Deno.env.get("ENABLE_REBUILD_INSIGHTS") ?? "true").toLowerCase() !== "false";
+  const gemKey =
+    Deno.env.get("GEMINI_API_KEY") ||
+    Deno.env.get("GOOGLE_API_KEY") ||
+    Deno.env.get("GENAI_API_KEY") ||
+    "";
+
+  if (!enableRebuild) {
+    console.log("rebuild-insights skipped: ENABLE_REBUILD_INSIGHTS=false");
+  } else {
+    try {
+      const respText = await invokeRebuildInsightsInternal({
+        user_id,
+        conversation_id: effectiveConversationId,
+        // Always build deterministic longitudinal insights; LLM steps are optional.
+        simple_longitudinal: true,
+        allow_llm: Boolean(gemKey),
+      });
+      console.log(
+        "rebuild-insights response:",
+        typeof respText === "string" ? respText.slice(0, 200) : respText,
+      );
+    } catch (e) {
+      console.warn("invokeRebuildInsightsInternal failed (non-fatal):", e);
+    }
+  }
+}
+
+              // -------------------------------------------------------------------
+              // End-session artifacts for client (NEW): fetch latest memory_summary row,
+              // ensure session_insights.reframed exists, and return via legacy_artifacts.
+              // -------------------------------------------------------------------
+              try {
+                // Fetch latest memory_summary for this conversation (retry briefly because writes can be async)
+                let msRow: any | null = null;
+                for (let attempt = 0; attempt < 5; attempt++) {
+                  const { data, error } = await client
+                    .from("memory_summary")
+                    .select("id, created_at, short_summary, session_insights, observations")
+                    .eq("conversation_id", effectiveConversationId)
+                    .order("created_at", { ascending: false })
+                    .limit(1);
+
+                  if (!error && Array.isArray(data) && data.length > 0) {
+                    msRow = data[0];
+                    break;
+                  }
+                  await new Promise((r) => setTimeout(r, 200 + attempt * 200));
+                }
+
+                if (msRow) {
+                  const msId = String(msRow.id ?? "").trim();
+                  const shortSummary = typeof msRow.short_summary === "string" ? msRow.short_summary : "";
+                  // `full_summary` is deprecated; canonical summaries live in `session_insights`.
+                  const baseSummary =
+                    (msRow.session_insights && typeof msRow.session_insights === "object"
+                      ? String((msRow.session_insights as any)?.full_summary ?? (msRow.session_insights as any)?.short_summary ?? "")
+                      : "") || shortSummary;
+
+                  let sessionInsightsExisting: any = {};
+
+                  sessionInsightsExisting =
+                    msRow.session_insights && typeof msRow.session_insights === "object"
+                      ? msRow.session_insights
+                      : {};
+
+                  const reframedExisting = (sessionInsightsExisting as any)?.reframed;
+
+                  const isValidReframed = (obj: any) => {
+                    if (!obj || typeof obj !== "object") return false;
+                    const ss = typeof obj.short_summary === "string" && obj.short_summary.trim().length > 0;
+                    const refl = Array.isArray(obj.reflections);
+                    const rare = Array.isArray(obj.rare_insights);
+                    return ss && refl && rare;
+                  };
+
+                  let reframed = isValidReframed(reframedExisting) ? reframedExisting : null;
+
+                  if (!reframed && baseSummary) {
+                    // Pull a small user-only excerpt to help Gemini avoid "forced" outputs.
+                    let userExcerpt = "";
+                    try {
+                      const { data: rawRows } = await client
+                        .from("memory_raw")
+                        .select("content, created_at, role")
+                        .eq("conversation_id", effectiveConversationId)
+                        .eq("role", "user")
+                        .order("created_at", { ascending: false })
+                        .limit(12);
+                      if (Array.isArray(rawRows) && rawRows.length > 0) {
+                        userExcerpt = rawRows
+                          .slice()
+                          .reverse()
+                          .map((r: any) => String(r.content ?? "").trim())
+                          .filter(Boolean)
+                          .join("\n");
+                      }
+                    } catch (_) {}
+
+                    const prompt = `
+You are generating an END-OF-SESSION REVIEW for a life-story journaling app.
+
+IMPORTANT:
+- Use SECOND PERSON ("you").
+- Do NOT invent facts.
+- Do NOT force "patterns" from a single session. Only include a "pattern" if you can point to repetition *within this session's excerpt* OR clearly phrase it as a *possible pattern*.
+- If you cannot find something, return an empty array for that section.
+
+Return JSON ONLY with EXACT keys:
+{
+  "short_summary": string,
+  "reflections": string[],
+  "rare_insights": string[]
+}
+
+SESSION SUMMARY (may be short):
+${baseSummary}
+
+USER EXCERPT (may be empty):
+${userExcerpt}
+`.trim();
+
+                    const raw = await callGemini(prompt);
+                    const parsed = tryExtractJsonObject(raw) as any;
+
+                    reframed = {
+                      short_summary:
+                        typeof (parsed as any)?.short_summary === "string" && String((parsed as any).short_summary).trim().length > 0
+                          ? String((parsed as any).short_summary).trim()
+                          : (shortSummary || baseSummary),
+                      reflections: Array.isArray((parsed as any)?.reflections)
+                        ? (parsed as any).reflections.filter((x: any) => typeof x === "string").map((x: any) => String(x).trim()).filter((s: string) => s.length > 0 && !s.endsWith("?") && !/^consider\b/i.test(s) && !/^perhaps\b/i.test(s) && !/\byou could\b/i.test(s) && !/\byou might\b/i.test(s))
+                        : [],
+                      rare_insights: Array.isArray((parsed as any)?.rare_insights)
+                        ? (parsed as any).rare_insights.filter((x: any) => typeof x === "string").map((x: any) => String(x).trim()).filter((s: string) => s.length > 0 && !s.endsWith("?") && !/^consider\b/i.test(s) && !/^perhaps\b/i.test(s) && !/\byou could\b/i.test(s) && !/\byou might\b/i.test(s))
+                        : [],
+                    };
+                    if (reframed) { reframed.reflections = (reframed.reflections || []).slice(0, 4); reframed.rare_insights = (reframed.rare_insights || []).slice(0, 2); }
+                  }
+
+                  const session_insights_updated = reframed
+                    ? { ...sessionInsightsExisting, reframed }
+                    : sessionInsightsExisting;
+                  // NOTE: turn_core is read-only for memory_summary.
+                  // We compute `reframed` for the payload, but we do NOT persist it here.
+// Build payloads consumed by Android screens
+                  endSessionSummaryPayload = {
+                    memory_summary_id: msId || null,
+                    conversation_id: effectiveConversationId,
+                    created_at: msRow.created_at ?? null,
+                    short_summary: (shortSummary && String(shortSummary).trim()) || (reframed?.short_summary ?? (session_insights_updated as any)?.short_summary ?? null),
+                    full_summary: null,
+                    observations: msRow.observations ?? null,
+                    session_insights: session_insights_updated,
+                  };
+
+                  // If your existing insight_moment is stored inside session_insights, surface it;
+                  // otherwise keep it null (screen can use reframed).
+                  const im = (sessionInsightsExisting as any)?.insight_moment;
+                  insightMomentPayload =
+                    im && typeof im === "object"
+                      ? im
+                      : null;
+
+                  summaryIdForSeeds = msId || summaryIdForSeeds;
+                }
+              } catch (e) {
+                console.error("End-session artifact assembly failed:", String(e));
+              }
+
             }
           } catch (err) {
             console.error("Legacy persistence error:", err);
@@ -4784,7 +6530,7 @@ if (conversationMode === "language_learning" && typeof replyText === "string") {
                   learning_level: learningLevel,
                 },
                 tags: ["language_learning"],
-                created_at: nowIso,
+                created_at: new Date(Date.parse(nowIso) + 1).toISOString(),
               });
             }
 
@@ -4872,7 +6618,7 @@ if (conversationMode === "language_learning" && typeof replyText === "string") {
       const safeReplyText = (isEndSession ? null : (reply_text ?? "").trim());
 
       try {
-        const la = (learningArtifacts as any) || null;
+        const la = (learning_artifacts_payload as any) || null;
         const blocksLen = la?.blocks?.length ?? 0;
 
         console.log("LEARNING_ARTIFACTS_DEBUG", {
