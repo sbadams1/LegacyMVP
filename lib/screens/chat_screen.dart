@@ -36,10 +36,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:video_player/video_player.dart';
 
-import '../services/ai_brain_service.dart';
 import '../prompts/media_followup_prompts.dart';
 import 'settings_screen.dart';
 import 'story_library_screen.dart';
+import '../services/ai_brain_service.dart';
 
 part 'chat_screen_models.dart';
 part 'chat_screen_coverage.dart';
@@ -50,6 +50,28 @@ part 'chat_screen_tts.dart';
 
 // Legacy v1: ship as Legacy-only (hide language learning + avatar UI without deleting code)
 const bool kLegacyOnly = false;
+
+// AUTH MODE: disable no-login user_id spoofing
+const bool kEnableDevUserOverride = false;
+
+// ---------------------------------------------------------------------------
+// DEV: quick user_id toggle (no-login testing)
+// - Lets you switch the entire app (Legacy + Avatar) between two datasets.
+// - Stored in SharedPreferences so you don't have to paste UUIDs repeatedly.
+// ---------------------------------------------------------------------------
+const String _kPrefsDevUserA = 'dev_user_id_a';
+const String _kPrefsDevUserB = 'dev_user_id_b';
+const String _kPrefsDevUserActive = 'dev_user_id_active';
+
+// Hardcoded presets (requested)
+const String kDevUser2dc1 = '2dc11e13-f77b-44f0-97ea-b9faa8e948af';
+const String kDevUser7037 = '7037efeb-a6b1-49b4-b782-1843ce300425';
+
+// ---------------------------------------------------------------------------
+// DEV: user_id override (no-login manual testing)
+// - Stores two presets + an active selection in SharedPreferences.
+// - When set, all ai-brain calls send body.user_id = active override.
+// ---------------------------------------------------------------------------
 
 enum _TutorQuickAction {
   showProgress,
@@ -75,7 +97,6 @@ enum _MainMenuAction {
   settings,
   endSession,      // NEW: trigger end-session + heavy processing
 }
-
 
 // ---------------------------------------------------------------------------
 // Summary helpers (UI reads from session_insights only; plain columns are mirrors)
@@ -231,38 +252,205 @@ class ChatScreen extends StatefulWidget {
 
 // In-memory message model for the chat UI
 
-class _ChatScreenState extends State<ChatScreen> {
-  // Cached navigation args so the user can re-open the latest Session Review at any time.
-  Map<String, dynamic>? _lastSessionReviewNavArgs;
+ class _ChatScreenState extends State<ChatScreen> {
+   // Cached navigation args so the user can re-open the latest Session Review at any time.
+   Map<String, dynamic>? _lastSessionReviewNavArgs;
+ 
+  // DEV: user_id toggle state
+  String? _devUserA;
+  String? _devUserB;
+  String? _devUserActive;
 
   // UI controllers
   final TextEditingController _textController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
 
-  // Supabase + AI brain
-  final SupabaseClient _client = Supabase.instance.client;
-  final AIBrainService _aiBrain = AIBrainService.instance;
+   // Supabase + AI brain
+   final SupabaseClient _client = Supabase.instance.client;
+   final AIBrainService _aiBrain = AIBrainService.instance;
 
-  Future<void> _runDiagnostics() async {
-    final user = _client.auth.currentUser;
-    if (user == null) {
+String? get _effectiveUserId {
+  if (kEnableDevUserOverride) {
+    final active = (_devUserActive ?? '').trim();
+    if (active.isNotEmpty) return active;
+  }
+  final authed = _client.auth.currentUser?.id;
+  if (authed != null && authed.trim().isNotEmpty) return authed.trim();
+  return null;
+}
+
+  String _shortId(String? id) {
+    final t = (id ?? '').trim();
+    if (t.isEmpty) return '—';
+    if (t.length <= 10) return t;
+    return '${t.substring(0, 4)}…${t.substring(t.length - 4)}';
+  }
+
+bool get _isE2EDatasetActive {
+  if (!kEnableDevUserOverride) return false;
+  final a = (_effectiveUserId ?? '').trim().toLowerCase();
+  return a.startsWith('2dc1');
+}
+
+  Future<void> _loadDevUserPrefs() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+
+      // Seed presets if missing (requested)
+      final a = (prefs.getString(_kPrefsDevUserA) ?? '').trim();
+      final b = (prefs.getString(_kPrefsDevUserB) ?? '').trim();
+      if (a.isEmpty) await prefs.setString(_kPrefsDevUserA, kDevUser7037);
+      if (b.isEmpty) await prefs.setString(_kPrefsDevUserB, kDevUser2dc1);
+
+      final nextA = (prefs.getString(_kPrefsDevUserA) ?? '').trim();
+      final nextB = (prefs.getString(_kPrefsDevUserB) ?? '').trim();
+      final active = (prefs.getString(_kPrefsDevUserActive) ?? '').trim();
+
+      if (!mounted) return;
+      setState(() {
+        _devUserA = nextA;
+        _devUserB = nextB;
+        _devUserActive = active;
+      });
+    } catch (e) {
+      debugPrint('⚠️ Failed to load dev user prefs: $e');
+    }
+  }
+
+  Future<void> _setActiveDevUserId(String? id) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final v = (id ?? '').trim();
+      if (v.isEmpty) {
+        await prefs.remove(_kPrefsDevUserActive);
+      } else {
+        await prefs.setString(_kPrefsDevUserActive, v);
+      }
+      if (kEnableDevUserOverride) {
+        _loadDevUserPrefs();
+      }
+      _showSnack('Active user_id: ${_shortId(_effectiveUserId)}');
+    } catch (e) {
+      debugPrint('⚠️ Failed to set active dev user id: $e');
+    }
+  }
+
+  Future<void> _showDevUserToggleDialog() async {
+    final a = (_devUserA ?? kDevUser7037).trim();
+    final b = (_devUserB ?? kDevUser2dc1).trim();
+    final active = (_effectiveUserId ?? '').trim();
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Active dataset (dev)') ,
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Current: ${_shortId(active)}', style: const TextStyle(fontWeight: FontWeight.w700)),
+            const SizedBox(height: 10),
+            ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              leading: Radio<String>(
+                value: a,
+                groupValue: (_devUserActive ?? ''),
+                onChanged: (v) => _setActiveDevUserId(v),
+              ),
+              title: Text('DEV (7037…)  ${_shortId(a)}'),
+              onTap: () => _setActiveDevUserId(a),
+            ),
+            ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              leading: Radio<String>(
+                value: b,
+                groupValue: (_devUserActive ?? ''),
+                onChanged: (v) => _setActiveDevUserId(v),
+              ),
+              title: Text('E2E (2dc1…)  ${_shortId(b)}'),
+              onTap: () => _setActiveDevUserId(b),
+            ),
+            ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              leading: Radio<String>(
+                value: '',
+                groupValue: (_devUserActive ?? ''),
+                onChanged: (_) => _setActiveDevUserId(''),
+              ),
+              title: const Text('Use Auth user (no override)'),
+              onTap: () => _setActiveDevUserId(''),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Close')),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDatasetSafetyBanner() {
+    if (!kEnableDevUserOverride) return const SizedBox.shrink();
+    if (!kDebugMode) return const SizedBox.shrink();
+    if (!kEnableDevUserOverride) return const SizedBox.shrink();
+    if (!_isE2EDatasetActive) return const SizedBox.shrink();
+
+    final active = (_effectiveUserId ?? '').trim();
+    final a = (_devUserA ?? kDevUser7037).trim();
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      color: Colors.redAccent,
+      child: SafeArea(
+        bottom: false,
+        child: Row(
+          children: [
+            const Icon(Icons.warning_amber_rounded, color: Colors.white),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                'E2E DATASET ACTIVE  •  user_id ${_shortId(active)}',
+                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w800),
+              ),
+            ),
+            TextButton(
+              onPressed: () => _setActiveDevUserId(a),
+              child: const Text('Switch to DEV', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w800)),
+            ),
+          ],
+        ),
+      ),
+    );
+   }
+ 
+    Future<void> _runDiagnostics() async {
+    final session = _client.auth.currentSession;
+    final uid = session?.user.id;
+    final token = session?.accessToken;
+
+    if (uid == null || uid.trim().isEmpty || token == null || token.isEmpty) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Not signed in')),
+        const SnackBar(content: Text('Please sign in to run diagnostics.')),
       );
       return;
     }
-
-    try {
-      final res = await _client.functions.invoke(
-        'ai-brain',
-        body: {
-          'user_id': user.id,
-          'conversation_id': _conversationId,
-          'message_text': '__DIAGNOSTIC__',
-          'diagnostic': true,
-        },
-      );
+ 
+      try {
+        final res = await _client.functions.invoke(
+          'ai-brain',
+         headers: {
+           'Authorization': 'Bearer $token',
+         },
+          body: {
+            'user_id': uid,
+            'conversation_id': _conversationId,
+           'message_text': '__DIAGNOSTIC__',
+           'diagnostic': true,
+         },
+       );
 
       final pretty = const JsonEncoder.withIndent('  ').convert(res.data);
 
@@ -288,7 +476,6 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-
   // In-memory message list
   final List<_ChatMessage> _messages = [];
 
@@ -311,6 +498,10 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _isRecording = false;
   bool _isTranscribing = false; // NEW: show spinner while STT is running
 
+  // Remote TTS playback (Avatar mode): we play server-generated MP3 bytes.
+  final FlutterSoundPlayer _ttsPlayer = FlutterSoundPlayer();
+  bool _ttsPlayerInited = false;
+ 
   String? _recordingPath;
   int _recordDuration = 0;
   Timer? _recordTimer;
@@ -320,6 +511,83 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _micToastShown = false;
 
   bool _isSending = false;
+
+  // Entry mode: freeform vs interview (used to populate memory_raw.entry_mode / prompt_id)
+  String _entryMode = 'freeform';
+  String? _activePromptId;
+  String? _activePromptText;
+
+  // Minimal prompt set for interview mode (expand later; ids must be stable)
+  static const List<Map<String, String>> _interviewPrompts = [
+    {'id': 'legacy_purpose', 'text': 'What are you building right now, and why does it matter to you?'},
+    {'id': 'recent_reflection', 'text': 'What’s something you noticed about yourself or the world today?'},
+    {'id': 'gratitude', 'text': 'What are you grateful for right now?'},
+    {'id': 'challenge', 'text': 'What’s a challenge you’re facing, and what would a win look like?'},
+  ];
+
+  void _ensureInterviewPromptSelected() {
+    if (_activePromptId != null && _activePromptText != null) return;
+    final first = _interviewPrompts.isNotEmpty ? _interviewPrompts.first : null;
+    _activePromptId = first?['id'];
+    _activePromptText = first?['text'];
+  }
+
+  Future<void> _pickInterviewPrompt() async {
+    if (!mounted) return;
+    final picked = await showModalBottomSheet<Map<String, String>>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: _interviewPrompts.map((p) {
+            final pid = p['id'] ?? '';
+            final txt = p['text'] ?? '';
+            final selected = pid == _activePromptId;
+            return ListTile(
+              title: Text(txt),
+              subtitle: Text(pid),
+              trailing: selected ? const Icon(Icons.check) : null,
+              onTap: () => Navigator.of(ctx).pop(p),
+            );
+          }).toList(),
+        ),
+      ),
+    );
+
+    if (picked != null && mounted) {
+      setState(() {
+        _activePromptId = picked['id'];
+        _activePromptText = picked['text'];
+      });
+    }
+  }
+
+  String? _decorateLegacyStateJson(String? stateJson) {
+    // Merge entry_mode/prompt_id into state_json so older service layers
+    // don't need new method parameters.
+    final payload = <String, dynamic>{
+      'entry_mode': _entryMode,
+      'prompt_id': _entryMode == 'interview' ? _activePromptId : null,
+    };
+
+    if (stateJson == null || stateJson.trim().isEmpty) {
+      return jsonEncode(payload);
+    }
+
+    try {
+      final decoded = jsonDecode(stateJson);
+      if (decoded is Map) {
+        final m = Map<String, dynamic>.from(decoded);
+        m.addAll(payload);
+        return jsonEncode(m);
+      }
+      // If state_json isn't a map, wrap it.
+      return jsonEncode({'state': decoded, ...payload});
+    } catch (_) {
+      // If parsing fails, keep original as a string and attach metadata.
+      return jsonEncode({'state_raw': stateJson, ...payload});
+    }
+  }
 
   // Media picker
   final ImagePicker _imagePicker = ImagePicker();
@@ -537,49 +805,64 @@ class _ChatScreenState extends State<ChatScreen> {
       _targetLocale!.isNotEmpty &&
       _targetLocale != _preferredLocale;
 
-  // Voice tone presets (language-agnostic)
-    final List<_TtsVoiceOption> _voiceOptions = const [
-      _TtsVoiceOption(
-        id: 'warm_female',
-        label: 'Warm (mid-tone)',
-        pitch: 1.05,
-        rateAndroid: 0.5,
-        rateIOS: 0.5,
-      ),
-      _TtsVoiceOption(
-        id: 'deep_male',
-        label: 'Deeper',
-        pitch: 0.9,
-        rateAndroid: 0.5,
-        rateIOS: 0.5,
-      ),
-      _TtsVoiceOption(
-        id: 'calm_neutral',
-        label: 'Calm neutral',
-        pitch: 1.0,
-        rateAndroid: 0.5,
-        rateIOS: 0.5,
-      ),
-    ];
+  // Voice presets (language-agnostic). We try to pick a real TTS engine voice that
+  // matches the preset (young/older, male/female) when available; otherwise we
+  // fall back to pitch + rate only.
+  final List<_TtsVoiceOption> _voiceOptions = const [
+    _TtsVoiceOption(
+      id: 'young_male',
+      label: 'Young male',
+      pitch: 1.08,
+      rateAndroid: 0.52,
+      rateIOS: 0.52,
+    ),
+    _TtsVoiceOption(
+      id: 'older_male',
+      label: 'Older male',
+      pitch: 0.92,
+      rateAndroid: 0.50,
+      rateIOS: 0.50,
+    ),
+    _TtsVoiceOption(
+      id: 'young_female',
+      label: 'Young female',
+      pitch: 1.12,
+      rateAndroid: 0.53,
+      rateIOS: 0.53,
+    ),
+    _TtsVoiceOption(
+      id: 'older_female',
+      label: 'Older female',
+      pitch: 1.00,
+      rateAndroid: 0.50,
+      rateIOS: 0.50,
+    ),
+    _TtsVoiceOption(
+      id: 'neutral',
+      label: 'Neutral',
+      pitch: 1.0,
+      rateAndroid: 0.50,
+      rateIOS: 0.50,
+    ),
+  ];
 
-    String _selectedVoiceId = 'warm_female';
-      _TtsVoiceOption get _currentVoice =>
-        _voiceOptions.firstWhere((v) => v.id == _selectedVoiceId);
-
+  String _selectedVoiceId = 'older_male';
+  _TtsVoiceOption get _currentVoice =>
+      _voiceOptions.firstWhere((v) => v.id == _selectedVoiceId);
     // Voice mode (chatbot vs silent)
     String _voiceMode = 'chatbot';
     bool get _isChatbotMode => _voiceMode == 'chatbot';
 
-    // Conversation mode: 'legacy' | 'language_learning'
+    // Conversation mode: 'legacy' | 'avatar'
     String _mode = 'legacy';
 
   // Language-learning artifacts for the current turn/session
   List<_LearningBlock> _learningBlocksCurrent = <_LearningBlock>[];
 
-    bool get _isLegacyMode => kLegacyOnly ? true : (_mode == 'legacy');
-    bool get _isLanguageLearningMode => kLegacyOnly ? false : (_mode == 'language_learning');
-    bool get _isAvatarMode => kLegacyOnly ? false : (_mode == 'avatar');
-   
+     bool get _isLegacyMode => kLegacyOnly ? true : (_mode == 'legacy');
+     bool get _isLanguageLearningMode => false; // deprecated
+     bool get _isAvatarMode => kLegacyOnly ? false : (_mode == 'avatar');
+
     @override
     void initState() {
       super.initState();
@@ -589,13 +872,18 @@ class _ChatScreenState extends State<ChatScreen> {
         _targetLocale = null;
       }
       _initRecorder();
+      _initTtsPlayer();
       _loadMicPrefs();
       _initTts();
-      _ensureProfileLocaleDefaults(); 
-      _loadProfileLanguagePrefs();
-      _loadVoiceModePreference();
-      _loadConversationModePreference();
-    }
+      if (kEnableDevUserOverride) {
+        _loadDevUserOverride();
+        _loadDevUserPrefs();
+      }
+       _ensureProfileLocaleDefaults();
+       _loadProfileLanguagePrefs();
+       _loadVoiceModePreference();
+       _loadConversationModePreference();
+     }
 
     @override
     void dispose() {
@@ -603,9 +891,20 @@ class _ChatScreenState extends State<ChatScreen> {
       _scrollController.dispose();
       _recordTimer?.cancel();
       _recorder.closeRecorder();
+      _ttsPlayer.closePlayer();
       _tts.stop();
       super.dispose();
    }
+
+  Future<void> _initTtsPlayer() async {
+    if (_ttsPlayerInited) return;
+    try {
+      await _ttsPlayer.openPlayer();
+      _ttsPlayerInited = true;
+    } catch (e) {
+      debugPrint('❌ TTS player init failed: $e');
+    }
+  }
 
     // ===========================================================================
     // UTILITY HELPERS
@@ -614,12 +913,11 @@ class _ChatScreenState extends State<ChatScreen> {
     // -----------------------------------------------------------------------------
   // Force an explicit end-session call to ai-brain (bypasses service layer)
   // -----------------------------------------------------------------------------
-  Future<void> _invokeAiBrainEndSessionDirect() async {
-  final client = Supabase.instance.client;
-  final user = client.auth.currentUser;
-  if (user == null) return;
+   Future<void> _invokeAiBrainEndSessionDirect() async {
+   final client = Supabase.instance.client;
 
-  final String userId = user.id;
+   final String? userId = _effectiveUserId;
+   if (userId == null || userId.trim().isEmpty) return;
 
   // IMPORTANT: use your existing conversation id variable here.
   // If your file uses something else (e.g. _sessionKey), swap it in.
@@ -629,7 +927,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final String mode = _mode; // "legacy" / "language_learning" / "avatar"
 
   final payload = <String, dynamic>{
-    'user_id': userId,
+    'user_id': userId.trim(),
     'conversation_id': conversationId,
     'mode': mode,
 
@@ -648,16 +946,71 @@ class _ChatScreenState extends State<ChatScreen> {
   }
   }
 
-    void _showSnack(String msg) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(msg)),
-      );
-    }
+     void _showSnack(String msg) {
+       if (!mounted) return;
+       ScaffoldMessenger.of(context).showSnackBar(
+         SnackBar(content: Text(msg)),
+       );
+     }
+ 
+  bool _isUuid(String? s) {
+    final t = (s ?? '').trim();
+    if (t.isEmpty) return false;
+    return RegExp(
+      r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$',
+    ).hasMatch(t);
+  }
 
-  Future<void> _speakL2Text(String text, String locale) async {
-    final t = text.trim();
-    if (t.isEmpty) return;
+  Future<void> _loadDevUserOverride() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final a = prefs.getString(_kPrefsDevUserA);
+      final b = prefs.getString(_kPrefsDevUserB);
+      final active = prefs.getString(_kPrefsDevUserActive);
+      if (!mounted) return;
+      setState(() {
+        _devUserA = a;
+        _devUserB = b;
+        _devUserActive = active;
+      });
+    } catch (e) {
+      debugPrint('⚠️ Failed to load dev user override: $e');
+    }
+  }
+
+  Future<void> _saveDevUserOverride({String? a, String? b, String? active}) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (a != null) {
+        if (a.trim().isEmpty) {
+          await prefs.remove(_kPrefsDevUserA);
+        } else {
+          await prefs.setString(_kPrefsDevUserA, a.trim());
+        }
+      }
+      if (b != null) {
+        if (b.trim().isEmpty) {
+          await prefs.remove(_kPrefsDevUserB);
+        } else {
+          await prefs.setString(_kPrefsDevUserB, b.trim());
+        }
+      }
+      if (active != null) {
+        if (active.trim().isEmpty) {
+          await prefs.remove(_kPrefsDevUserActive);
+        } else {
+          await prefs.setString(_kPrefsDevUserActive, active.trim());
+        }
+      }
+      await _loadDevUserOverride();
+    } catch (e) {
+      debugPrint('⚠️ Failed to save dev user override: $e');
+    }
+  }
+
+   Future<void> _speakL2Text(String text, String locale) async {
+     final t = text.trim();
+     if (t.isEmpty) return;
 
     try {
       // Manual playback should work even if auto-voice is "silent".
@@ -792,25 +1145,72 @@ class _ChatScreenState extends State<ChatScreen> {
       final mm = m.toString().padLeft(2, '0');
       final ss = s.toString().padLeft(2, '0');
       return '$mm:$ss';
-    }
+      }
+  
+      String _normalizeLocale(String? raw, {String fallback = ''}) {
+      final s0 = (raw ?? '').trim();
+      final fb0 = fallback.trim();
 
-    String _normalizeLocale(String? raw, {String fallback = ''}) {
-      final s = (raw ?? '').trim();
-      if (s.isEmpty) return fallback.isNotEmpty ? fallback : WidgetsBinding.instance.platformDispatcher.locale.toLanguageTag();
+      // Default to the platform locale tag if both raw and fallback are empty.
+      final platformTag = WidgetsBinding.instance.platformDispatcher.locale.toLanguageTag();
 
-      // normalize separators
-      final norm = s.replaceAll('_', '-');
+      // Helper: very small BCP-47-ish validator (lang + optional region).
+      bool _isValidLang(String s) => RegExp(r'^[a-z]{2,3}$').hasMatch(s);
+      bool _isValidRegion(String s) => RegExp(r'^([A-Z]{2}|\d{3})$').hasMatch(s);
 
-      // If it’s a short language tag, map to a stable BCP-47 default.
-      final lower = norm.toLowerCase();
-      // (no hardcoded language mappings)
-      // (no hardcoded language mappings)
-      // (no hardcoded language mappings)
+      if (s0.isEmpty) {
+        return fb0.isNotEmpty ? _normalizeLocale(fb0, fallback: platformTag) : platformTag;
+      }
 
-      return norm;
-    }
+      // Normalize separators: en_US -> en-US
+      final norm = s0.replaceAll('_', '-');
 
-    String _deviceLocaleBcp47() {
+      final parts = norm.split('-').where((p) => p.trim().isNotEmpty).toList();
+      if (parts.isEmpty) return fb0.isNotEmpty ? _normalizeLocale(fb0, fallback: platformTag) : platformTag;
+
+      final lang = parts[0].toLowerCase();
+      if (!_isValidLang(lang)) {
+        // e.g., "English" -> fallback
+        return fb0.isNotEmpty ? _normalizeLocale(fb0, fallback: platformTag) : platformTag;
+      }
+
+      String? region;
+
+      // If the caller provided a region-ish part, validate it.
+      if (parts.length >= 2) {
+        final p1 = parts[1].toUpperCase();
+        if (_isValidRegion(p1)) region = p1;
+      }
+
+      if (region == null) {
+        // If fallback/platform has same language + a region, reuse that region.
+        final fb = (fb0.isNotEmpty ? fb0 : platformTag).replaceAll('_', '-');
+        final fbParts = fb.split('-').where((p) => p.trim().isNotEmpty).toList();
+        if (fbParts.length >= 2 && fbParts[0].toLowerCase() == lang) {
+          final fbRegion = fbParts[1].toUpperCase();
+          if (_isValidRegion(fbRegion)) region = fbRegion;
+        }
+      }
+
+      // If still no region, pick a sane default for common languages so Google STT v2
+      // doesn't reject a bare language tag.
+      region ??= () {
+        switch (lang) {
+          case 'en':
+            return 'US';
+          case 'th':
+            return 'TH';
+          case 'es':
+            return 'ES';
+          default:
+            return null;
+        }
+      }();
+
+      return region == null ? lang : '$lang-$region';
+     }
+ 
+     String _deviceLocaleBcp47() {
       final loc = WidgetsBinding.instance.platformDispatcher.locale;
       final lang = loc.languageCode.trim();
       final country = (loc.countryCode ?? '').trim();
@@ -1117,11 +1517,11 @@ class _ChatScreenState extends State<ChatScreen> {
   // ===========================================================================
 
   Future<void> _showLanguageLearningSettingsSheet() async {
-    final user = _client.auth.currentUser;
-    if (user == null) {
-      _showSnack('You must be logged in to change language settings.');
-      return;
-    }
+  final uid = _effectiveUserId;
+  if (uid == null || uid.trim().isEmpty) {
+    _showSnack('No user_id selected (tap the badge icon).');
+     return;
+   }
 
     final theme = Theme.of(context);
 
@@ -1344,14 +1744,15 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _applyEffectiveTtsConfig() async {
-    // Choose TTS language:
-    // - In language-learning mode, prefer target language (if set).
-    // - Otherwise use preferred/native language.
-    final effectiveLocale = _isLanguageLearningMode && _hasTargetLanguage
-        ? _targetLocale!
-        : _preferredLocale;
+    // Choose TTS language (language-agnostic): prefer user locale, else device locale.
+    final effectiveLocale = _normalizeLocale(
+      _preferredLocale,
+      fallback: _deviceLocaleBcp47(),
+    );
 
     await _tts.setLanguage(effectiveLocale);
+    // Try to select an actual engine voice for the chosen preset (if supported on this device).
+    await _applySelectedVoiceToEngine(effectiveLocale);
 
     final v = _currentVoice;
     if (Platform.isAndroid) {
@@ -1364,6 +1765,104 @@ class _ChatScreenState extends State<ChatScreen> {
     // ignore: avoid_print
     print('🔊 TTS configured: locale=$effectiveLocale pitch=${v.pitch}');
   }
+
+  List<String> _voiceHintsForPresetId(String id) {
+    switch (id) {
+      case 'young_male':
+        return const ['young', 'boy', 'male', 'man', 'm'];
+      case 'older_male':
+        return const ['old', 'older', 'senior', 'male', 'man', 'm', 'deep'];
+      case 'young_female':
+        return const ['young', 'girl', 'female', 'woman', 'f'];
+      case 'older_female':
+        return const ['old', 'older', 'senior', 'female', 'woman', 'f', 'warm'];
+      default:
+        return const [];
+    }
+  }
+
+  Future<void> _applySelectedVoiceToEngine(String locale) async {
+    // flutter_tts voices are platform-specific; this is best-effort.
+    try {
+      final dynamic voicesDyn = await _tts.getVoices;
+      if (voicesDyn is! List) return;
+
+      final picked = _pickBestVoiceForPreset(
+        voicesDyn,
+        locale: locale,
+        presetId: _currentVoice.id,
+      );
+      if (picked == null) return;
+
+      await _tts.setVoice(picked);
+      debugPrint('🔊 TTS setVoice: $picked');
+    } catch (e) {
+      debugPrint('TTS setVoice error: $e');
+    }
+  }
+
+  Map<String, String>? _pickBestVoiceForPreset(
+    List voices, {
+    required String locale,
+    required String presetId,
+  }) {
+    final wantLocale = _normalizeLocale(locale).toLowerCase();
+    final wantLang = wantLocale.split('-').first;
+    final hints = _voiceHintsForPresetId(presetId);
+
+    int bestScore = -1;
+    Map<String, String>? best;
+
+    for (final v in voices) {
+      if (v is! Map) continue;
+
+      final nameRaw =
+          (v['name'] ?? v['identifier'] ?? v['id'] ?? '').toString();
+      final localeRaw =
+          (v['locale'] ?? v['language'] ?? v['lang'] ?? '').toString();
+
+      final name = nameRaw.toLowerCase();
+      final loc = _normalizeLocale(localeRaw).toLowerCase();
+      final lang = loc.isEmpty ? '' : loc.split('-').first;
+
+      int score = 0;
+
+      // Locale match (strongest)
+      if (loc.isNotEmpty && wantLocale.isNotEmpty) {
+        if (loc == wantLocale) score += 60;
+        if (loc.startsWith(wantLocale)) score += 50;
+        if (wantLocale.startsWith(loc)) score += 30;
+      }
+      // Language match (fallback)
+      if (lang.isNotEmpty && lang == wantLang) score += 20;
+
+      // Preset hint match (weak; platform strings vary wildly)
+      for (final h in hints) {
+        final hh = h.toLowerCase().trim();
+        if (hh.isEmpty) continue;
+        if (name.contains(hh)) score += 6;
+      }
+
+      if (score > bestScore) {
+        bestScore = score;
+        final pickedName = nameRaw.isNotEmpty ? nameRaw : '';
+        final pickedLocale = loc.isNotEmpty ? loc : wantLocale;
+
+        if (pickedName.isNotEmpty && pickedLocale.isNotEmpty) {
+          best = {'name': pickedName, 'locale': pickedLocale};
+        } else if (pickedName.isNotEmpty) {
+          best = {'name': pickedName};
+        } else {
+          best = null;
+        }
+      }
+    }
+
+    // Avoid "random" picks if we couldn't match locale/lang at all.
+    if (bestScore < 20) return null;
+    return best;
+  }
+
 
   Future<void> _saveVoicePref(String id) async {
     final prefs = await SharedPreferences.getInstance();
@@ -1390,6 +1889,13 @@ class _ChatScreenState extends State<ChatScreen> {
     // Purpose: remove things that TTS engines tend to *read aloud* (URLs, markdown,
     // code-ish punctuation), while preserving Thai script when present.
     var cleaned = text;
+
+    // Normalize common “smart punctuation” that can break pronunciation (e.g., don’t -> don-T).
+    cleaned = cleaned
+        .replaceAll('’', "'")
+        .replaceAll('‘', "'")
+        .replaceAll('“', '"')
+        .replaceAll('”', '"');
 
     // 0) Strip explicit language labels like "L1:" / "L2:" or "[L1]" / "[L2]".
     cleaned = cleaned.replaceAll(RegExp(r'^\s*(?:\[\s*(?:L1|L2)\s*\]|(?:L1|L2))\s*[:\-–—]?\s*', caseSensitive: false, multiLine: true), '');
@@ -1694,6 +2200,18 @@ String _stripRomanizationParens(String text) {
     final raw = msg.text.trim();
     if (raw.isEmpty) return;
 
+    // ------------------------------------------------------------------------
+    // Avatar mode: use remote TTS (server-generated MP3) so we can later swap
+    // to the user’s enrolled/custom voice without changing UI plumbing.
+    // ------------------------------------------------------------------------
+    if (_isAvatarMode) {
+      final displayText = _stripLeadingTagsForDisplay(raw);
+      final cleaned = _cleanForTts(displayText);
+      if (cleaned.isEmpty) return;
+      await _playAvatarRemoteTts(cleaned);
+      return;
+    }
+
     // IMPORTANT: Do NOT run _cleanForTts() before segmentation, because it strips [L1]/[L2] tags.
     final rawForSegmentation = raw;
 
@@ -1863,6 +2381,7 @@ String _stripRomanizationParens(String text) {
     // Configure TTS for this segment
     try {
     await _tts.setLanguage(lang);
+    await _applySelectedVoiceToEngine(lang);
     } catch (e) {
     debugPrint('TTS setLanguage error ($lang): $e');
     }
@@ -1871,9 +2390,9 @@ String _stripRomanizationParens(String text) {
     try {
     final v = _currentVoice;
     if (Platform.isAndroid) {
-    await _tts.setSpeechRate(v.rateAndroid);
+    await _tts.setSpeechRate(v.rateAndroid * _ttsRateFactor);
     } else if (Platform.isIOS) {
-    await _tts.setSpeechRate(v.rateIOS);
+    await _tts.setSpeechRate(v.rateIOS * _ttsRateFactor);
     }
     await _tts.setPitch(v.pitch);
     } catch (e) {
@@ -1893,7 +2412,117 @@ String _stripRomanizationParens(String text) {
     _showSnack('Audio playback failed.');
     }
     }
-    
+
+  Future<void> _playAvatarRemoteTts(String text) async {
+    // Speaker button in Avatar mode → call Supabase Edge Function "avatar" with action=speak
+  final client = Supabase.instance.client;
+  final session = client.auth.currentSession;
+  final user = session?.user;
+
+    if (user == null) {
+    _showSnack('Not signed in; cannot play voice.');
+    return;
+    }  
+
+    if (!_ttsPlayerInited) {
+      await _initTtsPlayer();
+      if (!_ttsPlayerInited) return;
+    }
+     try {
+       final res = await client.functions.invoke(
+         'avatar',
+         body: <String, dynamic>{
+           'action': 'speak',
+           'text': text,
+           'voice_id': _selectedVoiceId, // maps to a built-in voice on the server for now
+           'format': 'mp3',
+         },
+       );
+ 
+      dynamic data = res.data;
+      if (data is String) {
+        // Some Edge Function responses come back as a JSON string.
+        data = jsonDecode(data);
+      }
+
+      final ok = (data is Map) ? (data['ok'] == true) : false;
+       if (!ok) {
+         final err = (data is Map) ? (data['error']?.toString() ?? 'unknown') : 'unknown';
+         _showSnack('Voice failed: $err');
+         return;
+       }
+ 
+       Uint8List bytes;
+       final map = data as Map;
+ 
+       final audioUrl = map['audio_url']?.toString() ?? '';
+       final rawB64 = map['audio_base64']?.toString() ?? '';
+ 
+
+      // Prefer base64 when available to avoid a second network hop that can 403 if the URL is protected.
+      if (rawB64.isNotEmpty) {
+ 
+         // Strip data URL prefix if present: "data:audio/mpeg;base64,..."
+         final comma = rawB64.indexOf(',');
+         final b64 = (rawB64.startsWith('data:') && comma != -1)
+             ? rawB64.substring(comma + 1)
+             : rawB64;
+ 
+         try {
+           bytes = base64Decode(base64.normalize(b64));
+         } catch (e) {
+           debugPrint('❌ base64 decode failed (len=${b64.length}): $e');
+           _showSnack('Voice failed: bad audio data');
+           return;
+         }
+      } else if (audioUrl.isNotEmpty) {
+        // If the server returns a URL instead of base64, fetch bytes.
+        // IMPORTANT: attach auth header; otherwise this fetch can 403 with no Edge logs.
+        final uri = Uri.parse(audioUrl);
+        final session = client.auth.currentSession;
+        final accessToken = session?.accessToken;
+
+        final http = HttpClient();
+        final req = await http.getUrl(uri);
+        if (accessToken != null && accessToken.isNotEmpty) {
+          req.headers.set('Authorization', 'Bearer $accessToken');
+        }
+        final resp = await req.close();
+
+        if (resp.statusCode < 200 || resp.statusCode >= 300) {
+          _showSnack('Voice failed: audio fetch ${resp.statusCode}');
+          return;
+        }
+        bytes = await consolidateHttpClientResponseBytes(resp);
+        if (bytes.isEmpty) {
+          _showSnack('Voice failed: empty audio.');
+          return;
+       }
+      } else {
+        _showSnack('Voice failed: empty audio.');
+        return;
+       }
+
+       final dir = await getTemporaryDirectory();
+       final path = '${dir.path}/avatar_tts_${DateTime.now().millisecondsSinceEpoch}.mp3';
+       final f = File(path);
+       await f.writeAsBytes(bytes, flush: true);
+ 
+       // Stop any previous playback before starting a new one
+       await _ttsPlayer.stopPlayer();
+       await _ttsPlayer.startPlayer(
+         fromURI: path,
+         codec: Codec.mp3,
+         whenFinished: () {
+           // no-op
+         },
+       );
+     } catch (e) {
+       debugPrint('❌ Avatar remote TTS failed: $e');
+       _showSnack('Voice failed: $e');
+    }
+   }
+
   Future<void> _showVoicePicker() async {
     final chosen = await showModalBottomSheet<String>(
       context: context,
@@ -2132,16 +2761,9 @@ String _stripRomanizationParens(String text) {
         _mode == 'avatar' ? 'legacy' : 'avatar';
     await _setConversationMode(next);
 
-    if (!mounted) return;
-
-    if (next == 'language_learning') {
-      final labelLang = _hasTargetLanguage ? _targetLocale : _preferredLocale;
-      _showSnack(
-        'Language learning mode: practicing in $labelLang.',
-      );
-    } else {
-      _showSnack('Legacy storytelling mode.');
-    }
+     if (!mounted) return;
+ 
+    _showSnack(next == 'avatar' ? 'Avatar mode.' : 'Legacy storytelling mode.');
   }
 
   void _activateAvatarMode() {
@@ -2156,28 +2778,28 @@ String _stripRomanizationParens(String text) {
     );
   }
 
-  void _openLearningHub() {
-  final user = _client.auth.currentUser;
-  if (user == null) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Not signed in.')),
-    );
-    return;
-  }
+   void _openLearningHub() {
+  final userId = _effectiveUserId;
+  if (userId == null || userId.trim().isEmpty) {
+     ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('No user_id selected (tap the badge icon).')),
+     );
+     return;
+   }
 
   Navigator.of(context).push(
     MaterialPageRoute(
-      builder: (_) => _LearningHubScreen(
-        client: _client,
-        userId: user.id,
-        currentBlocks: _learningBlocksCurrent,
-        preferredLocale: _preferredLocale,
-        targetLocale: _targetLocale,
-        onSpeakL2: (text, locale) => _speakL2Text(text, locale),
-      ),
-    ),
-  );
-}
+       builder: (_) => _LearningHubScreen(
+         client: _client,
+         userId: userId.trim(),
+         currentBlocks: _learningBlocksCurrent,
+         preferredLocale: _preferredLocale,
+         targetLocale: _targetLocale,
+         onSpeakL2: (text, locale) => _speakL2Text(text, locale),
+       ),
+     ),
+   );
+ }
 
   void _openCoverageScreen() {
     Navigator.of(context).push(
@@ -2229,6 +2851,152 @@ String _stripRomanizationParens(String text) {
     }
   }
 
+  Future<void> _showStoryLibrarySheet() async {
+    final user = _client.auth.currentUser;
+    if (user == null || !mounted) {
+      _showSnack('Please sign in.');
+      return;
+    }
+
+    Future<List<Map<String, dynamic>>> load() async {
+      final res = await _client
+          .from('story_recall')
+          .select('id, title, synopsis, conversation_id, updated_at, evidence_json')
+          .eq('user_id', user.id)
+          .order('updated_at', ascending: false)
+          .limit(200);
+      if (res is List) {
+        return res.cast<Map<String, dynamic>>();
+      }
+      return <Map<String, dynamic>>[];
+    }
+
+    bool isLocked(Map<String, dynamic> row) {
+      final ej = row['evidence_json'];
+      if (ej is Map) {
+        final v = ej['locked'];
+        return v?.toString() == 'true';
+      }
+      return false;
+    }
+
+    Future<void> toggleLock(String id, bool locked) async {
+      try {
+        await _client.functions.invoke('ai-brain', body: <String, dynamic>{
+          'op': 'story_lock_toggle',
+          'user_id': user.id,
+          'story_recall_id': id,
+          'locked': locked,
+        });
+      } catch (e) {
+        _showSnack('Failed to update lock');
+        debugPrint('❌ story_lock_toggle error: $e');
+      }
+    }
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: Padding(
+            padding: EdgeInsets.only(
+              left: 16,
+              right: 16,
+              top: 12,
+              bottom: MediaQuery.of(ctx).viewInsets.bottom + 16,
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text('Stories', style: Theme.of(ctx).textTheme.titleLarge),
+                    ),
+                    IconButton(
+                      tooltip: 'Rebuild stories & insights from edits',
+                      icon: const Icon(Icons.refresh),
+                      onPressed: () async {
+                        // This triggers the heavy rebuild path so edits propagate.
+                        try {
+                          await _client.functions.invoke('ai-brain', body: <String, dynamic>{
+                            'op': 'rebuild_conversation_artifacts',
+                            'user_id': user.id,
+                            'conversation_id': _conversationId,
+                          });
+                          _showSnack('Rebuild started.');
+                        } catch (e) {
+                          _showSnack('Rebuild failed to start.');
+                          debugPrint('❌ rebuild_conversation_artifacts error: $e');
+                        }
+                      },
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close),
+                      onPressed: () => Navigator.of(ctx).pop(),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Expanded(
+                  child: FutureBuilder<List<Map<String, dynamic>>>(
+                    future: load(),
+                    builder: (context, snap) {
+                      final rows = snap.data ?? <Map<String, dynamic>>[];
+                      if (snap.connectionState != ConnectionState.done) {
+                        return const Center(child: CircularProgressIndicator());
+                      }
+                      if (rows.isEmpty) {
+                        return const Center(child: Text('No stories yet.'));
+                      }
+
+                      return ListView.separated(
+                        itemCount: rows.length,
+                        separatorBuilder: (_, __) => const Divider(height: 16),
+                        itemBuilder: (_, i) {
+                          final r = rows[i];
+                          final id = (r['id'] ?? '').toString();
+                          final title = (r['title'] ?? '').toString().trim();
+                          final synopsis = (r['synopsis'] ?? '').toString().trim();
+                          final locked = isLocked(r);
+
+                          return ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            title: Text(title.isNotEmpty ? title : 'Untitled'),
+                            subtitle: (synopsis.isNotEmpty)
+                                ? Text(synopsis, maxLines: 2, overflow: TextOverflow.ellipsis)
+                                : null,
+                            trailing: IconButton(
+                              tooltip: locked ? 'Unlock story' : 'Lock story',
+                              icon: Icon(locked ? Icons.lock : Icons.lock_open),
+                              onPressed: id.isEmpty
+                                  ? null
+                                  : () async {
+                                      await toggleLock(id, !locked);
+                                      // Force-refresh sheet by closing/reopening quickly
+                                      if (Navigator.of(ctx).canPop()) Navigator.of(ctx).pop();
+                                      _showStoryLibrarySheet();
+                                    },
+                            ),
+                          );
+                        },
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
   
   Future<bool> _ensureLastSessionReviewNavArgs() async {
     if (_lastSessionReviewNavArgs != null) return true;
@@ -2533,29 +3301,37 @@ Future<void> _handlePinPressed() async {
   }
 }
 
-  Future<void> _sendMetaCommand(String command) async {
-    // Reuse the normal send pipeline, but we can keep this as a separate
-    // helper in case we ever want to treat meta-commands differently.
-    await _sendTextMessage(command, showUserBubble: true);
-  }
+   Future<void> _sendMetaCommand(String command) async {
+     // Reuse the normal send pipeline, but we can keep this as a separate
+     // helper in case we ever want to treat meta-commands differently.
+     await _sendTextMessage(command, showUserBubble: true);
+   }
+ 
+   Future<void> _sendTextMessage(
+      String text, {
+       bool showUserBubble = true,
+       bool endSession = false,
+     }) async {
+     if (_isSending) return;
+ 
+  final session = _client.auth.currentSession;
+  final authedUserId = session?.user.id;
+  final token = session?.accessToken;
 
-  Future<void> _sendTextMessage(
-  String text, {
-  bool showUserBubble = true,
-  bool endSession = false,
-}) async {
-  if (_isSending) return;
-
-  final user = _client.auth.currentUser;
-  if (user == null) {
-    _showSnack('You must be logged in.');
+  if (authedUserId == null || authedUserId.trim().isEmpty || token == null || token.isEmpty) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Please sign in to continue.')),
+    );
     return;
   }
 
-  String trimmed = text.trim();
-
-  // Allow empty text only when we're explicitly ending the session.
-  if (!endSession && trimmed.isEmpty) return;
+  // Prefer the authenticated user id (prevents mismatch / no-JWT paths).
+  final userId = authedUserId.trim();
+ 
+   String trimmed = text.trim();
+ 
+   // Allow empty text only when we're explicitly ending the session.
+   if (!endSession && trimmed.isEmpty) return;
 
   // Backend requires message_text to be present; for end-session,
   // send a tiny placeholder but don't show a user bubble.
@@ -2578,33 +3354,43 @@ Future<void> _handlePinPressed() async {
     _scrollToBottom();
   }
 
-  setState(() => _isSending = true);
+     setState(() => _isSending = true);
+    
+     try {
+     final wrapped = _buildModeWrappedPrompt(trimmed);
+       final String? stateJson = _mode == 'language_learning'
+           ? _languageStateJson
+           : (_mode == 'avatar' ? _legacyStateJson : _decorateLegacyStateJson(_legacyStateJson));
+ 
+      final payload = <String, dynamic>{
+        'user_id': userId,
+        'conversation_id': _conversationId,
+        'message_text': wrapped,
+        'mode': _mode,
+        'preferred_locale': _preferredLocale,
+       'target_locale': _targetLocale,
+       'learning_level': _mode == 'language_learning' ? _learningLevel : null,
+       'state_json': stateJson,
+        'end_session': endSession,
+      };
+ 
+     final res = await _client.functions.invoke(
+       'ai-brain',
+       headers: {
+         'Authorization': 'Bearer $token',
+       },
+       body: payload,
+     );
+      final data = res.data;
+      if (data is! Map) {
+        throw Exception('ai-brain returned non-object: ${data.runtimeType}');
+     }
+     final Map<String, dynamic> result = Map<String, dynamic>.from(data as Map);
 
-  try {
-    final wrapped = _buildModeWrappedPrompt(trimmed);
-
-    final result = await _aiBrain.askBrain(
-      message: wrapped,
-      mode: _mode,
-      preferredLocale: _preferredLocale,
-      targetLocale: _targetLocale,
-      learningLevel: _learningLevel,
-
-      // ✅ keep the same session across turns
-      conversationId: _conversationId,
-
-      stateJson: _mode == 'language_learning'
-          ? _languageStateJson
-          : _legacyStateJson,
-
-      // ✅ CRITICAL: forward end-session flag through service layer
-      endSession: endSession,
-    );
-
-    final convId = result['conversation_id'] as String?;
-    if (convId != null && convId.isNotEmpty) {
-      if (mounted) {
-        setState(() => _conversationId = convId);
+     final convId = result['conversation_id'] as String?;
+     if (convId != null && convId.isNotEmpty) {
+       if (mounted) {
+         setState(() => _conversationId = convId);
       } else {
         _conversationId = convId;
       }
@@ -2613,22 +3399,49 @@ Future<void> _handlePinPressed() async {
     // --- Parse ai-brain response (supports both legacy keys and new contracts) ---
     final bool serverEndSession = (result['end_session'] == true);
 
-    // Prefer reply_text, fallback to text (older service mapping)
-    final String aiTextRaw = ((result['reply_text'] ?? result['text']) ?? '').toString();
+     // Prefer reply_text, fallback to other common keys (older service mappings / avatar variants)
+     String _pickString(dynamic v) => (v == null) ? '' : v.toString();
+     final String aiTextRaw =
+         _pickString(result['reply_text']).trim().isNotEmpty ? _pickString(result['reply_text']) :
+         _pickString(result['answer']).trim().isNotEmpty ? _pickString(result['answer']) :
+         _pickString(result['text']).trim().isNotEmpty ? _pickString(result['text']) :
+         _pickString(result['reply']).trim().isNotEmpty ? _pickString(result['reply']) :
+         _pickString(result['message']).trim().isNotEmpty ? _pickString(result['message']) :
+         _pickString(result['assistant_text']).trim().isNotEmpty ? _pickString(result['assistant_text']) :
+         _pickString(result['assistant_reply']).trim().isNotEmpty ? _pickString(result['assistant_reply']) :
+         _pickString(result['output_text']).trim().isNotEmpty ? _pickString(result['output_text']) :
+         '';
+
     var aiText = aiTextRaw.trim();
 
-    // Parse learning artifacts (new contract)
+     // If we still have nothing, surface a visible debug message instead of "doing nothing".
+     if (aiText.isEmpty) {
+       final keys = (result is Map) ? (result.keys.map((k) => k.toString()).toList()..sort()) : <String>[];
+      final String errText = (result is Map && result['error'] != null)
+          ? result['error'].toString().trim()
+          : '';
+       debugPrint('⚠️ ai-brain returned empty reply. keys=$keys result=$result');
+      aiText = (errText.isNotEmpty)
+          ? ("⚠️ AI error: $errText\n"
+              "Mode=$_mode\n"
+              "Keys: ${keys.join(', ')}")
+          : ("⚠️ No reply_text returned from ai-brain.\n"
+              "Mode=$_mode\n"
+              "Keys: ${keys.join(', ')}");
+     }
+    // Parse learning artifacts ONLY in language_learning mode.
     _learningBlocksCurrent = <_LearningBlock>[];
-    final dynamic la = result['learning_artifacts'];
-    final dynamic blocks = (la is Map) ? la['blocks'] : null;
-    if (blocks is List) {
-      _learningBlocksCurrent = blocks
-          .where((b) => b is Map)
-          .map((b) => _LearningBlock.fromJson(b as Map))
-          .where((b) => b.content.trim().isNotEmpty)
-          .toList(growable: false);
+    if (_mode == 'language_learning') {
+      final dynamic la = result['learning_artifacts'];
+      final dynamic blocks = (la is Map) ? la['blocks'] : null;
+      if (blocks is List) {
+        _learningBlocksCurrent = blocks
+            .where((b) => b is Map)
+            .map((b) => _LearningBlock.fromJson(b as Map))
+            .where((b) => b.content.trim().isNotEmpty)
+            .toList(growable: false);
+      }
     }
-
 
     // state_json may be a String (JSON) or Map; normalize to String?
     String? newStateJson;
@@ -2698,13 +3511,13 @@ Future<void> _handlePinPressed() async {
       }
       return;
     }
-// If we have pronunciation feedback, append it in a readable way.
-    final pronLine = result['pronunciation_score_line'];
-    if (_mode == 'language_learning' &&
-        pronLine is String &&
-        pronLine.trim().isNotEmpty) {
-      aiText = '$aiText\n\n$pronLine';
-    }
+     // If we have pronunciation feedback, append it in a readable way.
+     final pronLine = result['pronunciation_score_line'];
+     if (_mode == 'language_learning' &&
+         pronLine is String &&
+         pronLine.trim().isNotEmpty) {
+       aiText = '$aiText\n\n$pronLine';
+     }
 
     if (_mode == 'language_learning') {
       _languageStateJson = newStateJson;
@@ -2748,44 +3561,64 @@ Future<void> _handlePinPressed() async {
       return;
     }
 
-    final user = _client.auth.currentUser;
-    if (user == null) {
+    final session = _client.auth.currentSession;
+    final user = session?.user;
+
+      if (user == null) {
       _showSnack('Not signed in; cannot send audio.');
       return;
-    }
+      }
 
     try {
       final bytes = await file.readAsBytes();
       final base64Audio = base64Encode(bytes);
 
-      if (mounted) {
-        setState(() => _isTranscribing = true);
+       if (mounted) {
+         setState(() => _isTranscribing = true);
+       }
+ 
+      // STT routing:
+      // - In legacy mode, do NOT allow Thai (or any L2) to creep into transcription.
+      //   Force English unless the user explicitly set _sttLanguageCode.
+      final legacyDefault = 'en-US';
+      final primaryCode = (_mode == 'legacy')
+          ? _normalizeLocale(
+              (_sttLanguageCode ?? '').trim().isNotEmpty ? _sttLanguageCode : _preferredLocale,
+              fallback: legacyDefault,
+            )
+          : _normalizeLocale(
+              _preferredLocale,
+              fallback: _deviceLocaleBcp47(),
+            );
+ 
+       // Alternative languages (best-effort): include target locale if set and distinct.
+       final altCodes = <String>{
+        // In legacy mode, do NOT include target locale as an alternate language.
+        if (_mode != 'legacy' && (_targetLocale ?? '').trim().isNotEmpty)
+          _normalizeLocale(_targetLocale, fallback: ''),
+        _normalizeLocale(_preferredLocale, fallback: ''),
+       }.where((s) => s.trim().isNotEmpty && s.trim() != primaryCode).toList();
+
+      final token = session?.accessToken;
+      if (token == null || token.isEmpty) {
+        throw Exception('User is not authenticated. No access token available.');
       }
 
-      // Mode + language routing
-      final mode = _mode; // 'legacy' | 'language_learning' | 'avatar'
-      final primaryCode = (mode == 'language_learning') ? _sttLanguageCode : _preferredLocale;
-
-      // Allow alternate languages ONLY in language_learning mode.
-      // In legacy/avatar/etc, listen exclusively in L1 to avoid cross-language mis-detection.
-      final altCodes = <String>{};
-      if (mode == 'language_learning') {
-        final pref = _preferredLocale.trim();
-        final targ = (_targetLocale ?? '').trim();
-
-        if (pref.isNotEmpty && pref != primaryCode) altCodes.add(pref);
-        if (targ.isNotEmpty && targ != primaryCode) altCodes.add(targ);
-      }
-final sttRes = await _client.functions.invoke(
-        'speech-to-text',
-        body: {
-          'user_id': user.id,
-          'audio_base64': base64Audio,
-          'mime_type': 'audio/aac',
-          'language_code': primaryCode,
-          'alt_language_codes': altCodes.toList(),
+       final sttRes = await _client.functions.invoke(
+         'speech-to-text',
+        headers: {
+          'Authorization': 'Bearer $token',
         },
-      );
+         body: {
+          // user_id is derived from JWT on the server; optional body_user_id is checked for mismatch
+           'user_id': user.id,
+           'audio_base64': base64Audio,
+           'mime_type': 'audio/aac',
+           'device_locale': _deviceLocaleBcp47(),
+           'language_code': primaryCode,
+           'alt_language_codes': altCodes,
+         },
+       );
 
       final data = sttRes.data;
 
@@ -2804,7 +3637,7 @@ final sttRes = await _client.functions.invoke(
       if (!mounted) return;
 
       debugPrint(
-        'STT routing → mode=$mode (primary=$primaryCode, alt=${altCodes.toList()})',
+       'STT routing → mode=$_mode (primary=$primaryCode, alt=${altCodes.toList()})',
       );
 
       // Push transcript into the text box (user can edit if desired).
@@ -3106,14 +3939,22 @@ final sttRes = await _client.functions.invoke(
 
     return Scaffold(
       resizeToAvoidBottomInset: false,
-      appBar: AppBar(
-        title: Text(kLegacyOnly ? 'Legacy' : (_mode == 'avatar' ? 'Avatar' : 'Legacy')),
-        actions: [
+       appBar: AppBar(
+         title: Text(kLegacyOnly ? 'Legacy' : (_mode == 'avatar' ? 'Avatar' : 'Legacy')),
+         actions: [
+           if (kDebugMode)
+             IconButton(
+               icon: const Icon(Icons.bug_report),
+               tooltip: 'Run diagnostics',
+               onPressed: _runDiagnostics,
+             ),
+
+          // DEV: dataset toggle (7037… vs 2dc1…)
           if (kDebugMode)
             IconButton(
-              icon: const Icon(Icons.bug_report),
-              tooltip: 'Run diagnostics',
-              onPressed: _runDiagnostics,
+              icon: const Icon(Icons.badge),
+              tooltip: 'Active user_id: ${_shortId(_effectiveUserId)}',
+              onPressed: _showDevUserToggleDialog,
             ),
 
           // Conversation mode picker (hidden in Legacy v1)
@@ -3173,7 +4014,7 @@ final sttRes = await _client.functions.invoke(
                   value: _MainMenuAction.sessionReview,
                   child: Text('Session Review (latest)'),
                 ),
-const PopupMenuItem<_MainMenuAction>(
+                const PopupMenuItem<_MainMenuAction>(
                   value: _MainMenuAction.coverage,
                   child: Text('Coverage Map'),
                 ),
@@ -3273,15 +4114,16 @@ const PopupMenuItem<_MainMenuAction>(
             ),
         ],
       ),
-      body: SafeArea(
-        top: false,
-        child: Column(
-          children: [
-          if (_showUploadProgress)
-            LinearProgressIndicator(
-              value: _uploadProgress == 0.0 ? null : _uploadProgress,
-              minHeight: 4,
-            ),
+       body: SafeArea(
+         top: false,
+         child: Column(
+           children: [
+          _buildDatasetSafetyBanner(),
+           if (_showUploadProgress)
+             LinearProgressIndicator(
+               value: _uploadProgress == 0.0 ? null : _uploadProgress,
+               minHeight: 4,
+             ),
           Expanded(
             child: _messages.isEmpty
                 ? _buildEmptyState(theme)
@@ -3505,6 +4347,17 @@ const PopupMenuItem<_MainMenuAction>(
             icon: const Icon(Icons.videocam),
             label: const Text('Add Video'),
           ),
+          const Spacer(),
+          IconButton(
+            tooltip: 'Send',
+            onPressed: _isSending ? null : _handleSendPressed,
+            icon: _isSending
+                ? const SizedBox(
+                    width: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.send),
+          ),
         ],
       ),
     );
@@ -3602,85 +4455,176 @@ const PopupMenuItem<_MainMenuAction>(
             ),
           ],
         ),
-        child: Row(
-          children: [
-            IconButton(
-              onPressed: () async {
-                if (!_micEnabled) {
-                  _showSnack(
-                    'Mic is OFF. Enable it using the top-right mic icon.',
-                  );
-                  return;
-                }
-                if (_isRecording) {
-                  await _stopRecordingAndSend();
-                } else {
-                  await _startRecording();
-                }
-              },
-              icon: Icon(
-                _isRecording ? Icons.stop : Icons.mic,
-                color: _micEnabled
-                    ? theme.colorScheme.primary
-                    : theme.disabledColor,
-              ),
-            ),
-            IconButton(
-              tooltip: 'Just here (presence)',
-              onPressed: _isSending
-                  ? null
-                  : () async {
-                      await _sendTextMessage(
-                        "__PRESENCE__",
-                        showUserBubble: false,
-                        endSession: false,
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final isNarrow = constraints.maxWidth < 420;
+
+            Widget buildOverflowMenu() {
+              return PopupMenuButton<String>(
+                tooltip: 'More composer actions',
+                icon: const Icon(Icons.more_horiz),
+                onSelected: (value) async {
+                  if (value == 'toggle_interview') {
+                    if (_isSending) return;
+                    setState(() {
+                      if (_entryMode == 'interview') {
+                        _entryMode = 'freeform';
+                      } else {
+                        _entryMode = 'interview';
+                        _ensureInterviewPromptSelected();
+                      }
+                    });
+                    return;
+                  }
+                  if (value == 'pick_prompt') {
+                    if (_isSending) return;
+                    await _pickInterviewPrompt();
+                    return;
+                  }
+                  if (value == 'pin_seed') {
+                    if (_isSending) return;
+                    _pinStorySeed();
+                    return;
+                  }
+                  if (value == 'presence') {
+                    if (_isSending) return;
+                    await _sendTextMessage(
+                      "__PRESENCE__",
+                      showUserBubble: false,
+                      endSession: false,
+                    );
+                    return;
+                  }
+                },
+                itemBuilder: (context) => <PopupMenuEntry<String>>[
+                  PopupMenuItem<String>(
+                    value: 'toggle_interview',
+                    child: Text(
+                      _entryMode == 'interview' ? 'Interview mode: ON' : 'Interview mode: OFF',
+                    ),
+                  ),
+                  if (_entryMode == 'interview')
+                    const PopupMenuItem<String>(
+                      value: 'pick_prompt',
+                      child: Text('Choose interview prompt'),
+                    ),
+                  const PopupMenuItem<String>(
+                    value: 'pin_seed',
+                    child: Text('Pin as story seed'),
+                  ),
+                  const PopupMenuItem<String>(
+                    value: 'presence',
+                    child: Text('Just here (presence)'),
+                  ),
+                ],
+              );
+            }
+
+            return Row(
+              children: [
+                if (!isNarrow) ...[
+                  IconButton(
+                    tooltip: _entryMode == 'interview'
+                        ? 'Interview mode (on)'
+                        : 'Interview mode (off)',
+                    onPressed: _isSending
+                        ? null
+                        : () {
+                            setState(() {
+                              if (_entryMode == 'interview') {
+                                _entryMode = 'freeform';
+                              } else {
+                                _entryMode = 'interview';
+                                _ensureInterviewPromptSelected();
+                              }
+                            });
+                          },
+                    icon: Icon(
+                      Icons.quiz,
+                      color: _entryMode == 'interview'
+                          ? theme.colorScheme.primary
+                          : theme.disabledColor,
+                    ),
+                  ),
+                  if (_entryMode == 'interview')
+                    IconButton(
+                      tooltip: 'Choose interview prompt',
+                      onPressed: _isSending ? null : _pickInterviewPrompt,
+                      icon: Icon(Icons.list_alt, color: theme.colorScheme.primary),
+                    ),
+                  IconButton(
+                    tooltip: 'Just here (presence)',
+                    onPressed: _isSending
+                        ? null
+                        : () async {
+                            await _sendTextMessage(
+                              "__PRESENCE__",
+                              showUserBubble: false,
+                              endSession: false,
+                            );
+                          },
+                    icon: Icon(
+                      Icons.self_improvement,
+                      color: _isSending
+                          ? theme.disabledColor
+                          : theme.colorScheme.primary,
+                    ),
+                  ),
+                ] else ...[
+                  buildOverflowMenu(),
+                ],
+
+                IconButton(
+                  onPressed: () async {
+                    if (!_micEnabled) {
+                      _showSnack(
+                        'Mic is OFF. Enable it using the top-right mic icon.',
                       );
-                    },
-              icon: Icon(
-                Icons.self_improvement,
-                color: _isSending ? theme.disabledColor : theme.colorScheme.primary,
-              ),
-            ),
-            const SizedBox(width: 4),
-           
-            Expanded(
-              child: TextField(
-                controller: _textController,
-                textInputAction: TextInputAction.send,
-                onSubmitted: (_) => _handleSendPressed(),
-                decoration: const InputDecoration(
-                  hintText: 'Type a message or record your story…',
-                  border: OutlineInputBorder(),
-                  isDense: true,
-                  contentPadding: EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 10,
+                      return;
+                    }
+                    if (_isRecording) {
+                      await _stopRecordingAndSend();
+                    } else {
+                      await _startRecording();
+                    }
+                  },
+                  icon: Icon(
+                    _isRecording ? Icons.stop : Icons.mic,
+                    color: _micEnabled
+                        ? theme.colorScheme.primary
+                        : theme.disabledColor,
                   ),
                 ),
-                minLines: 1,
-                maxLines: 4,
-              ),
-            ),
-            const SizedBox(width: 8),
 
-            IconButton(
-              icon: const Icon(Icons.push_pin),
-              tooltip: 'Pin as story seed',
-              onPressed: _pinStorySeed,
-            ),
+                const SizedBox(width: 4),
 
-            const SizedBox(width: 4),
-
-            IconButton(
-              onPressed: _isSending ? null : _handleSendPressed,
-              icon: _isSending
-                ? const SizedBox(
-                width: 18,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              )
-            : const Icon(Icons.send),
-            ),
-          ],
+                Expanded(
+                  child: TextField(
+                    controller: _textController,
+                    textInputAction: TextInputAction.send,
+                    onSubmitted: (_) => _handleSendPressed(),
+                    decoration: InputDecoration(
+                      hintText: (_entryMode == 'interview' &&
+                              (_activePromptText ?? '').isNotEmpty)
+                          ? 'Interview: ${_activePromptText!}'
+                          : 'Type a message or record your story…',
+                      border: const OutlineInputBorder(),
+                      isDense: true,
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 10,
+                      ),
+                    ),
+                    minLines: 1,
+                    maxLines: 4,
+                  ),
+                ),
+               // Pushpin and Send buttons removed from composer row.
+                // Pushpin is now in overflow menu.
+                // Send button is now in the media toolbar row.
+              ],
+            );
+          },
         ),
       ),
     );
@@ -3741,6 +4685,10 @@ const PopupMenuItem<_MainMenuAction>(
     final shortSummary = _pickSummaryFromSessionInsights(si, full: false);
     final fullSummary = _pickSummaryFromSessionInsights(si, full: true);
 
+    final shortSummaryRaw = (row['short_summary'] ?? '').toString().trim();
+    final shortSummaryEffective = shortSummary.isNotEmpty ? shortSummary : shortSummaryRaw;
+    final fullSummaryEffective = fullSummary.isNotEmpty ? fullSummary : shortSummaryEffective;
+
     final obs = row['observations'];
     String? sessionKey;
     if (obs is Map && obs['session_key'] != null) {
@@ -3760,37 +4708,40 @@ const PopupMenuItem<_MainMenuAction>(
       'sessionKey': (sessionKey ?? ''),
       'dateLabel': dateLabel,
       'fallbackTitle': 'Session Review',
-      'fallbackBody': (fullSummary.isNotEmpty
-              ? fullSummary
-              : (shortSummary.isNotEmpty ? shortSummary : '')).trim(),
-      'shortSummary': shortSummary,
-      'fullSummary': fullSummary,
-      'sessionInsights': sessionInsights,
-    };
+      'fallbackBody': (fullSummaryEffective.isNotEmpty
+              ? fullSummaryEffective
+              : (shortSummaryEffective.isNotEmpty ? shortSummaryEffective : '')).trim(),
+      'shortSummary': shortSummaryEffective,
+      'fullSummary': fullSummaryEffective,
+       'sessionInsights': sessionInsights,
+     };
 
-
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => EndSessionReviewScreen(
-          memorySummaryId: memorySummaryId.isNotEmpty ? memorySummaryId : 'n/a',
-          sessionKey: (sessionKey ?? ''),
-          dateLabel: dateLabel,
-          fallbackTitle: 'Session Review',
-          fallbackBody: (fullSummary.isNotEmpty
-                  ? fullSummary
-                  : (endSessionSummary is Map && endSessionSummary['full_summary'] != null
-                      ? endSessionSummary['full_summary'].toString()
-                      : ''))
-              .trim(),
-          shortSummary: shortSummary,
-          fullSummary: fullSummary,
-          sessionInsights: sessionInsights,
+    // Android: defer navigation to the next frame to avoid silent no-op pushes
+    // during async UI churn (STT stop / setState / lifecycle transitions).
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => EndSessionReviewScreen(
+            memorySummaryId: memorySummaryId.isNotEmpty ? memorySummaryId : 'n/a',
+            sessionKey: (sessionKey ?? ''),
+            dateLabel: dateLabel,
+            fallbackTitle: 'Session Review',
+            fallbackBody: (fullSummary.isNotEmpty
+                    ? fullSummary
+                    : (endSessionSummary is Map && endSessionSummary['full_summary'] != null
+                        ? endSessionSummary['full_summary'].toString()
+                        : ''))
+                 .trim(),
+            shortSummary: shortSummaryEffective,
+            fullSummary: fullSummaryEffective,
+            sessionInsights: sessionInsights,
+           ),
         ),
-      ),
-    );
-
+      );
+    });
     return true;
-  }
+    }
 
 Future<void> _showEndSessionRevealSheet({
   Map<String, dynamic>? insightMoment,
@@ -4367,11 +5318,8 @@ class _LearningHubScreenState extends State<_LearningHubScreen> with SingleTicke
       'target_locale': widget.targetLocale,
       // required by the existing ai-brain payload schema, but ignored for op routing:
       'message_text': '',
-      'mode': 'language_learning',
-      // optional hints (ai-brain defaults safely if missing)
-      'preferred_locale': 'en',
-      'target_locale': 'th-TH',
-    };
+      'mode': 'legacy',
+     };
 
     final res = await widget.client.functions.invoke('ai-brain', body: payload);
     final data = res.data;

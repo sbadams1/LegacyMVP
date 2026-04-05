@@ -1,0 +1,30 @@
+﻿{
+    "totalProcessed":  5052,
+    "lastResponse":  {
+                         "mode":  "facts",
+                         "processed":  2,
+                         "updated":  7,
+                         "skipped":  0,
+                         "errors":  0,
+                         "done":  true,
+                         "cursor_next":  "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0yNFQxMjowNDowMS41NzMrMDA6MDAiLCJpZCI6IjliYWRlNzgwLTE3MTctNGUwYS1iMWY3LTNkOGM4MmM3NzdmNCJ9",
+                         "samples":  [
+                                         {
+                                             "id":  "867db0b8-6be0-492e-9f77-8cd788be2267",
+                                             "status":  "updated",
+                                             "facts":  5
+                                         },
+                                         {
+                                             "id":  "9bade780-1717-4e0a-b1f7-3d8c82c777f4",
+                                             "status":  "updated",
+                                             "facts":  2
+                                         }
+                                     ]
+                     },
+    "iter":  203,
+    "totalSkipped":  3211,
+    "totalErrors":  38,
+    "totalUpdated":  3878,
+    "last_cursor":  "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0yNFQxMjowNDowMS41NzMrMDA6MDAiLCJpZCI6IjliYWRlNzgwLTE3MTctNGUwYS1iMWY3LTNkOGM4MmM3NzdmNCJ9",
+    "timestamp":  "2026-01-25T14:37:14"
+}

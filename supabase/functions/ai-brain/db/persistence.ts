@@ -268,3 +268,165 @@ export async function persistLegacyAndLearningTurn(args: {
   
   // -----------------------------------------------------------------------
 }
+
+// ------------------------------
+// Avatar Identity Snapshot (NO-JWT friendly)
+// These helpers assume the calling context is a trusted server/edge function using a service-role Supabase client.
+// Do NOT call these directly from an unauthenticated client.
+// ------------------------------
+
+export type AvatarIdentitySnapshotStatus = "draft" | "approved" | "revoked";
+
+export type AvatarIdentitySnapshotRow = {
+  id: string;
+  user_id: string;
+  snapshot_version: string;
+  status: AvatarIdentitySnapshotStatus;
+  snapshot_json: any;
+  derived_at: string;
+  derived_from: string;
+  approved_at: string | null;
+  revoked_at: string | null;
+  notes: string | null;
+};
+
+export async function upsertAvatarDraftSnapshot(args: {
+  supabase: SupabaseClient | null;
+  user_id: string;
+  snapshot_json: any;
+  snapshot_version?: string;
+  derived_from?: string;
+  notes?: string | null;
+}): Promise<{ id: string }> {
+  const {
+    supabase,
+    user_id,
+    snapshot_json,
+    snapshot_version = "v0-draft",
+    derived_from = "edge",
+    notes = null,
+  } = args;
+
+  if (!supabase) throw new Error("upsertAvatarDraftSnapshot: supabase client is null");
+  if (!user_id) throw new Error("upsertAvatarDraftSnapshot: user_id is required");
+
+  const { data: existing, error: fetchErr } = await supabase
+    .from("avatar_identity_snapshot")
+    .select("id")
+    .eq("user_id", user_id)
+    .eq("status", "draft")
+    .order("derived_at", { ascending: false })
+    .limit(1);
+
+  if (fetchErr) throw fetchErr;
+
+  const existingId = (existing && existing.length > 0) ? (existing[0] as any).id as string : null;
+
+  if (!existingId) {
+    const { data: inserted, error: insErr } = await supabase
+      .from("avatar_identity_snapshot")
+      .insert({
+        user_id,
+        snapshot_version,
+        status: "draft",
+        snapshot_json,
+        derived_from,
+        notes,
+      })
+      .select("id")
+      .limit(1);
+
+    if (insErr) throw insErr;
+    const id = (inserted && inserted.length > 0) ? (inserted[0] as any).id as string : "";
+    if (!id) throw new Error("upsertAvatarDraftSnapshot: insert returned no id");
+    return { id };
+  }
+
+  const { data: updated, error: updErr } = await supabase
+    .from("avatar_identity_snapshot")
+    .update({
+      snapshot_version,
+      snapshot_json,
+      derived_from,
+      notes,
+      derived_at: new Date().toISOString(),
+    })
+    .eq("id", existingId)
+    .select("id")
+    .limit(1);
+
+  if (updErr) throw updErr;
+  const id = (updated && updated.length > 0) ? (updated[0] as any).id as string : existingId;
+  return { id };
+}
+
+export async function approveAvatarSnapshot(args: {
+  supabase: SupabaseClient | null;
+  user_id: string;
+  draft_id: string;
+  approved_snapshot_json: any;
+  snapshot_version?: string;
+  derived_from?: string;
+  notes?: string | null;
+}): Promise<{ approved_id: string }> {
+  const {
+    supabase,
+    user_id,
+    draft_id,
+    approved_snapshot_json,
+    snapshot_version = "v0-approved",
+    derived_from = "edge-approve",
+    notes = null,
+  } = args;
+
+  if (!supabase) throw new Error("approveAvatarSnapshot: supabase client is null");
+  if (!user_id) throw new Error("approveAvatarSnapshot: user_id is required");
+  if (!draft_id) throw new Error("approveAvatarSnapshot: draft_id is required");
+
+  const { data: prior, error: priorErr } = await supabase
+    .from("avatar_identity_snapshot")
+    .select("id")
+    .eq("user_id", user_id)
+    .eq("status", "approved")
+    .order("approved_at", { ascending: false })
+    .limit(10);
+
+  if (priorErr) throw priorErr;
+
+  if (prior && prior.length > 0) {
+    const priorIds = prior.map((r: any) => r.id).filter(Boolean);
+    if (priorIds.length > 0) {
+      const { error: revokeErr } = await supabase
+        .from("avatar_identity_snapshot")
+        .update({ status: "revoked", revoked_at: new Date().toISOString() })
+        .in("id", priorIds);
+      if (revokeErr) throw revokeErr;
+    }
+  }
+
+  const { data: inserted, error: insErr } = await supabase
+    .from("avatar_identity_snapshot")
+    .insert({
+      user_id,
+      snapshot_version,
+      status: "approved",
+      snapshot_json: approved_snapshot_json,
+      derived_from,
+      approved_at: new Date().toISOString(),
+      notes,
+    })
+    .select("id")
+    .limit(1);
+
+  if (insErr) throw insErr;
+
+  const approved_id = (inserted && inserted.length > 0) ? (inserted[0] as any).id as string : "";
+  if (!approved_id) throw new Error("approveAvatarSnapshot: insert returned no id");
+
+  await supabase
+    .from("avatar_identity_snapshot")
+    .update({ notes: (notes ?? null) })
+    .eq("id", draft_id);
+
+  return { approved_id };
+}

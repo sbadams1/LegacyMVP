@@ -204,7 +204,13 @@ NO markdown, NO prose.
 
 short_summary: ONE sentence in third person.
 full_summary: 1–3 short paragraphs in third person, include distinctive anecdotes if present.
-observations: must include chapter_keys (1–3) from ALLOWED list, and themes (array of strings).
+observations: must include chapter_keys (1–3) from ALLOWED list (ORDERED: primary → secondary → tertiary), and themes (array of strings).
+
+ALLOWED chapter_keys:
+
+GUIDANCE:
+- If work/career is only mentioned as background (e.g., retirement context), do NOT make "work_career" the primary key unless the session is mainly about work.
+- If this is a reflection about identity, freedom, meaning, or life philosophy, consider "beliefs_values" as a secondary key.
 
 ALLOWED chapter_keys:
 ${allowedChapterKeys.map((k) => `- "${k}"`).join("\n")}

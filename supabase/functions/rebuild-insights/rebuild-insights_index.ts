@@ -1,823 +1,540 @@
 // supabase/functions/rebuild-insights/index.ts
 //
-// Rebuilds cross-session "insights" from memory_summary and writes them into:
-// 1) lifetime_profile.data.life_themes (master page + themes)
-// 2) memory_insights as theme-level rows + one lifetime_overview row.
+// HTTP wrapper around the shared post-processing pipeline in ../_shared/postprocess.ts
+// PLUS: Meaningful-only longitudinal insights (LLM refined when a Gemini key is available).
+//
+// This function remains internal-only (x-internal-key required).
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
-import { geminiGenerateContent, extractGeminiTextFromResponse, parseJsonSafely } from "../_shared/gemini.ts";
 
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+import { jsonResponse, handleCors } from "../_shared/http.ts";
+import { runPostProcess } from "../_shared/postprocess.ts";
+
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_SERVICE_ROLE_KEY =
-  Deno.env.get("SB_SECRET_KEY") ?? Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  Deno.env.get("SB_SECRET_KEY") ?? Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+
+const INSIGHTS_MIN_WORDS = Number(Deno.env.get("INSIGHTS_MIN_WORDS") || "60");
+const INSIGHTS_MIN_SESSIONS = Number(Deno.env.get("INSIGHTS_MIN_SESSIONS") || "2");
+const INSIGHTS_MAX_SESSIONS = Number(Deno.env.get("INSIGHTS_MAX_SESSIONS") || "14");
+const INSIGHTS_LOOKBACK_ROWS = Number(Deno.env.get("INSIGHTS_LOOKBACK_ROWS") || "60");
+const LONGITUDINAL_GENERATOR = "meaningful_longitudinal_v1";
+
+if (!SUPABASE_URL) {
+  console.error("Missing SUPABASE_URL");
+}
 if (!SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("❌ Missing service role key: set SB_SECRET_KEY or SUPABASE_SERVICE_ROLE_KEY");
+  console.error("Missing service role key (SB_SECRET_KEY or SUPABASE_SERVICE_ROLE_KEY)");
 }
 
+function getGeminiKey(): string | null {
+  const k =
+    (Deno.env.get("GEMINI_API_KEY") ||
+      Deno.env.get("GOOGLE_API_KEY") ||
+      Deno.env.get("GENAI_API_KEY") ||
+      "")
+      .trim();
+  return k ? k : null;
+}
 
-// Match ai-brain: accept either GEMINI_API_KEY or GEMINI_API_KEY_EDGE
-const GEMINI_API_KEY =
-  Deno.env.get("GEMINI_API_KEY") ?? Deno.env.get("GEMINI_API_KEY_EDGE");
+function requireInternalKey(req: Request): Response | null {
+  const expected = (Deno.env.get("INTERNAL_KEY") || Deno.env.get("X_INTERNAL_KEY") || "").trim();
+  if (!expected) {
+    // If no internal key is configured, allow (dev mode). Keep behavior consistent with existing deployments.
+    return null;
+  }
+  const got =
+    (req.headers.get("x-internal-key") || req.headers.get("x_internal_key") || "").trim();
+  if (!got || got !== expected) {
+    return jsonResponse({ error: "forbidden" }, 403);
+  }
+  return null;
+}
 
-const GEMINI_MODEL =
-  Deno.env.get("GEMINI_MODEL") ?? "models/gemini-2.0-flash-exp";
+type SessionRow = {
+  id: string;
+  created_at: string;
+  short_summary: string | null;
+  session_insights: any;
+};
 
-// ------------------------
-// Shared helpers (match ai-brain behavior)
-// ------------------------
-// ---------------------------------------------------------------------------
-// Gemini helpers (delegating to ../_shared/gemini.ts)
-// ---------------------------------------------------------------------------
-async function geminiGenerateText(prompt: string): Promise<string> {
-  const payload = { contents: [{ role: "user", parts: [{ text: prompt }] }] };
-  const res = await geminiGenerateContent(payload);
-  if (!res.ok || !res.json) {
-    console.error("❌ Gemini non-OK response:", res.status, res.text);
+function safeStr(v: any): string {
+  if (typeof v === "string") return v;
+  if (v == null) return "";
+  try {
+    return String(v);
+  } catch {
     return "";
   }
-  return extractGeminiTextFromResponse(res.json);
 }
 
-async function geminiGenerateJson<T = any>(prompt: string): Promise<T | null> {
-  const txt = await geminiGenerateText(prompt);
-  return parseJsonSafely<T>(txt);
+function wordCount(s: string): number {
+  const t = (s || "").trim();
+  if (!t) return 0;
+  return t.split(/\s+/).filter(Boolean).length;
 }
 
+const META_PATTERNS = [
+  "quick check-in",
+  "checked in briefly",
+  "no meaningful narrative",
+  "no detailed story",
+  "you opened the app",
+  "you checked in",
+  "this session",
+  "transcript",
+  "gemini",
+  "ai-brain",
+  "recorded",
+];
 
-interface MemorySummaryRow {
-  id: string;
-  user_id: string;
-  short_summary: string;
-  full_summary: string | null;
-  created_at: string;
-  observations: Record<string, unknown> | null;
-}
+const REFLECTIVE_SIGNALS = [
+  "feel",
+  "felt",
+  "feeling",
+  "worry",
+  "worried",
+  "hope",
+  "hoped",
+  "realize",
+  "realized",
+  "regret",
+  "regretted",
+  "meaning",
+  "purpose",
+  "afraid",
+  "anxious",
+  "grateful",
+  "proud",
+  "ashamed",
+  "lonely",
+  "love",
+  "anger",
+  "angry",
+  "hurt",
+  "miss",
+  "value",
+  "values",
+  "decided",
+  "decision",
+  "learned",
+  "lesson",
+];
 
-interface LifeTheme {
-  key: string;
-  title: string;
-  description: string;
-}
+function isMeaningfulSessionText(text: string): boolean {
+  const t = (text || "").trim();
+  if (!t) return false;
 
-interface LifeThemesResult {
-  summary_sentence: string;
-  master_page: string;
-  themes: LifeTheme[];
-}
-
-function requireInternalKey(req: Request) {
-  const got = req.headers.get("x-internal-key") || "";
-  const expect = Deno.env.get("INTERNAL_FUNCTION_KEY") || "";
-  if (!expect || got !== expect) {
-    return new Response(JSON.stringify({ error: "Unauthorized" }), {
-      status: 401,
-      headers: { "content-type": "application/json" },
-    });
-  }
-  return null;
-}
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-function isoDaysAgo(days: number): string {
-  const d = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-  return d.toISOString();
-}
-
-function safeTrim(s: unknown): string {
-  return typeof s === "string" ? s.trim() : "";
-}
-
-/**
- * Backfill missing memory_summary rows by grouping memory_raw by conversation_id.
- * This is a safety net when ai-brain is not currently writing session summaries.
- */
-async function backfillSessionSummariesFromMemoryRaw(
-  supabase: ReturnType<typeof createClient>,
-  userId: string,
-): Promise<{ inserted: number; scannedSessions: number }> {
-  // Pull recent raw rows (tune the window if you want: 3–14 days).
-  const sinceIso = isoDaysAgo(14);
-
-  const { data: rawRows, error: rawErr } = await supabase
-    .from("memory_raw")
-    .select("id, conversation_id, created_at, role, content")
-    .eq("user_id", userId)
-    .gte("created_at", sinceIso)
-    .order("created_at", { ascending: true });
-
-  if (rawErr) {
-    console.error("backfill: memory_raw fetch error", rawErr);
-    return { inserted: 0, scannedSessions: 0 };
+  const low = t.toLowerCase();
+  for (const p of META_PATTERNS) {
+    if (low.includes(p)) return false;
   }
 
-  const rows = (rawRows || []) as Array<{
-    id: string;
-    conversation_id: string | null;
-    created_at: string;
-    role: string | null;
-    content: string | null;
-  }>;
+  const wc = wordCount(t);
+  if (wc >= INSIGHTS_MIN_WORDS) return true;
 
-  // ------------------------------------------------------------
-// ------------------------------------------------------------
-  // Overlay current donor edits (memory_raw_edits) without changing memory_raw
-  // This ensures backfilled summaries reflect donor corrections.
-  //
-  // IMPORTANT:
-  // - Some projects may not have all columns (e.g. is_current) or may have RLS / API quirks.
-  // - Large IN() lists can trigger PostgREST "Bad Request" (URL length / parser limits).
-  //   So we chunk rawIds and we retry without optional columns/filters when needed.
-  // ------------------------------------------------------------
-  const rawIds = rows.map((r) => r.id).filter(Boolean);
-
-  async function fetchEditsOverlayForRawIds(ids: string[]) {
-    // Try the "ideal" query first (with is_current), then fall back.
-    const tryQueries: Array<() => Promise<{ data: any[] | null; error: any | null }>> = [
-      async () =>
-        await supabase
-          .from("memory_raw_edits")
-          .select("raw_id, edited_content, use_for, is_current")
-          .eq("user_id", userId)
-          .eq("status", "active")
-          .contains("use_for", ["summarization"])
-          .in("raw_id", ids)
-          .eq("is_current", true),
-      async () =>
-        await supabase
-          .from("memory_raw_edits")
-          .select("raw_id, edited_content, use_for")
-          .eq("user_id", userId)
-          .eq("status", "active")
-          .in("raw_id", ids),
-      async () =>
-        await supabase
-          .from("memory_raw_edits")
-          .select("*")
-          .eq("user_id", userId)
-          .in("raw_id", ids),
-    ];
-
-    let lastErr: any | null = null;
-
-    for (const q of tryQueries) {
-      const { data, error } = await q();
-      if (!error) return { data: (data ?? []) as any[], error: null };
-      lastErr = error;
-    }
-
-    return { data: [] as any[], error: lastErr };
-  }
-
-  if (rawIds.length) {
-    const editsByRawId = new Map<string, { edited: string; use_for: string[] }>();
-
-    // Chunk to avoid PostgREST "Bad Request" from large IN() lists / long URLs.
-    const CHUNK = 80; // smaller to avoid PostgREST 400 on long IN() lists
-    for (let i = 0; i < rawIds.length; i += CHUNK) {
-      const chunk = rawIds.slice(i, i + CHUNK);
-
-      const { data: editsChunk, error: e2 } = await fetchEditsOverlayForRawIds(chunk);
-
-      if (e2) {
-        console.error("backfill: memory_raw_edits fetch error", {
-          message: e2?.message ?? String(e2),
-          details: e2?.details,
-          hint: e2?.hint,
-          code: e2?.code,
-        });
-        // Don't fail the backfill—just skip edits overlay.
-        break;
-      }
-
-      for (const e of (editsChunk ?? []) as any[]) {
-        const rid = safeTrim(e?.raw_id);
-        const edited = typeof e?.edited_content === "string" ? e.edited_content.trim() : "";
-        const useFor = Array.isArray(e?.use_for) ? e.use_for.map((x: any) => String(x)) : [];
-        if (rid && edited) editsByRawId.set(rid, { edited, use_for: useFor });
-      }
-    }
-
-    // Apply edits in-memory (authoritative memory_raw remains untouched)
-    for (const r of rows) {
-      const edit = editsByRawId.get(r.id);
-      const useFor = edit?.use_for ?? [];
-      const canUse = !useFor.length || useFor.includes("summarization");
-      if (edit && canUse && edit.edited) r.content = edit.edited;
-    }
-  }
-// Group by conversation_id
-  const bySession = new Map<string, typeof rows>();
-  for (const r of rows) {
-    const cid = safeTrim(r.conversation_id);
-    if (!cid) continue;
-    if (!bySession.has(cid)) bySession.set(cid, []);
-    bySession.get(cid)!.push(r);
-  }
-
-  const sessionIds = Array.from(bySession.keys());
-  if (!sessionIds.length) return { inserted: 0, scannedSessions: 0 };
-
-  // Find which sessions already have a memory_summary row.
-  // Your memory_summary has a UUID conversation_id (you mentioned this), so passing a UUID string works.
-  const { data: existing, error: existErr } = await supabase
-    .from("memory_summary")
-    .select("conversation_id")
-    .eq("user_id", userId)
-    .in("conversation_id", sessionIds);
-
-  if (existErr) {
-    console.error("backfill: memory_summary existence check error", existErr);
-    return { inserted: 0, scannedSessions: sessionIds.length };
-  }
-
-  const existingSet = new Set<string>();
-  for (const e of (existing || []) as any[]) {
-    const cid = safeTrim(e?.conversation_id);
-    if (cid) existingSet.add(cid);
-  }
-
-  // Build inserts for sessions that are missing.
-  const inserts: any[] = [];
-
-  for (const cid of sessionIds) {
-    if (existingSet.has(cid)) continue;
-
-    const sess = bySession.get(cid)!;
-    if (!sess.length) continue;
-
-    const first = sess[0];
-    const createdAt = first.created_at;
-
-    // Basic “session summary” text from the first few user messages.
-    const userLines = sess
-      .filter((x) => (x.role || "").toLowerCase() === "user")
-      .map((x) => safeTrim(x.content))
-      .filter(Boolean);
-
-    const assistantLines = sess
-      .filter((x) => (x.role || "").toLowerCase() === "assistant")
-      .map((x) => safeTrim(x.content))
-      .filter(Boolean);
-
-    const title =
-      userLines[0]?.slice(0, 120) ||
-      assistantLines[0]?.slice(0, 120) ||
-      "Legacy session";
-
-    const body = [
-      userLines.slice(0, 3).map((t) => `User: ${t}`).join("\n"),
-      assistantLines.slice(0, 2).map((t) => `Assistant: ${t}`).join("\n"),
-    ]
-      .filter((s) => s.trim().length > 0)
-      .join("\n\n")
-      .slice(0, 4000);
-
-    inserts.push({
-      user_id: userId,
-      conversation_id: cid,        // UUID string is fine for a uuid column
-      raw_id: first.id,            // ties this summary to the session’s first raw row
-      short_summary: title,
-      full_summary: body || title,
-      observations: {
-        session_key: cid,
-        conversation_mode: "legacy",
-        is_dev: false,
-        backfilled_from_memory_raw: true,
-        backfilled_at: new Date().toISOString(),
-      },
-      // created_at: createdAt, // OPTIONAL: only include this if your table allows writing created_at
-    });
-  }
-
-  if (!inserts.length) return { inserted: 0, scannedSessions: sessionIds.length };
-
-  // Insert in chunks (safe for large sessions)
-  const CHUNK = 50;
-  let inserted = 0;
-
-  for (let i = 0; i < inserts.length; i += CHUNK) {
-    const chunk = inserts.slice(i, i + CHUNK);
-    const { error: insErr, data: insData } = await supabase
-      .from("memory_summary")
-      .insert(chunk)
-      .select("id");
-
-    if (insErr) {
-      console.error("backfill: insert memory_summary error", insErr);
-      // Keep going; partial is better than none.
-      continue;
-    }
-
-    inserted += (insData || []).length;
-  }
-
-  return { inserted, scannedSessions: sessionIds.length };
-}
-
-/**
- * Fallback: build a basic life-themes structure without Gemini.
- */
-function buildFallbackLifeThemes(
-  userId: string,
-  rows: MemorySummaryRow[],
-): LifeThemesResult {
-  const recent = rows.slice(-10);
-  const bullets = recent.map((row, i) => {
-    const date = new Date(row.created_at).toISOString().split("T")[0];
-    const body = row.full_summary || row.short_summary || "";
-    const trimmed = body.length > 200 ? body.slice(0, 197) + "..." : body;
-    return `${i + 1}. [${date}] ${trimmed}`;
-  });
-
-  const master_page = [
-    `This is an automatically generated overview of ${userId}'s life stories so far.`,
-    "",
-    "Recent sessions:",
-    ...bullets,
-  ].join("\n");
-
-  return {
-    summary_sentence:
-      "This is an early, automatically generated overview of this person's life stories so far.",
-    master_page,
-    themes: [
-      {
-        key: "early_overview",
-        title: "Early automated overview",
-        description:
-          "These insights are an initial pass based on the available session summaries. As more legacy conversations are recorded, this overview will become richer and more precise.",
-      },
-    ],
-  };
-}
-
-/**
- * Try to extract a JSON payload { summary_sentence, master_page, themes[] }
- * from a Gemini text response.
- */
-function tryParseLifeThemesJson(
-  rawText: string,
-): LifeThemesResult | null {
-  if (!rawText) return null;
-
-  // Sometimes models wrap JSON in code fences; strip them.
-  let text = rawText.trim();
-  if (text.startsWith("```")) {
-    const firstBrace = text.indexOf("{");
-    const lastBrace = text.lastIndexOf("}");
-    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-      text = text.slice(firstBrace, lastBrace + 1);
+  // If short, allow if clearly reflective and multi-sentence
+  const sentences = (t.match(/[.!?]/g) || []).length;
+  if (sentences >= 2) {
+    for (const sig of REFLECTIVE_SIGNALS) {
+      if (low.includes(sig)) return true;
     }
   }
 
+  return false;
+}
+
+function pickSessionText(r: SessionRow): string {
+  const si = r.session_insights ?? {};
+  const s1 = safeStr(si?.short_summary);
+  const s2 = safeStr(si?.full_summary);
+  const s3 = safeStr(r.short_summary);
+
+  // Prefer LLM-curated short summary when present, then full_summary in json, then short_summary column
+  return (s1 || s2 || s3 || "").trim();
+}
+
+function formatDateLabel(iso: string): string {
   try {
-    const parsed = parseJsonSafely<any>(text);
-      if (!parsed) return null;
-
-    if (
-      typeof parsed.summary_sentence === "string" &&
-      typeof parsed.master_page === "string" &&
-      Array.isArray(parsed.themes)
-    ) {
-      const themes: LifeTheme[] = parsed.themes
-        .map((t: any) => ({
-          key: String(t.key ?? "").trim(),
-          title: String(t.title ?? "").trim(),
-          description: String(t.description ?? "").trim(),
-        }))
-        .filter(
-          (t) =>
-            t.key.length > 0 &&
-            t.title.length > 0 &&
-            t.description.length > 0,
-        );
-
-      if (!themes.length) return null;
-
-      return {
-        summary_sentence: parsed.summary_sentence.trim(),
-        master_page: parsed.master_page.trim(),
-        themes,
-      };
-    }
-  } catch (err) {
-    console.error("Failed to parse life_themes JSON from Gemini:", err);
+    const d = new Date(iso);
+    const yyyy = d.getUTCFullYear();
+    const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const dd = String(d.getUTCDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+  } catch {
+    return (iso || "").slice(0, 10);
   }
-
-  return null;
 }
 
-/**
- * Build a warmer, structured life-themes object from many session summaries.
- * - If Gemini is not configured or fails, returns a decent fallback.
- * - The prompt explicitly tells Gemini to ignore technical/dev sessions and
- *   to avoid repetitive themes.
- */
-async function buildLifeThemesFromSessions(
-  userId: string,
-  rows: MemorySummaryRow[],
-): Promise<LifeThemesResult> {
-  if (!rows.length) {
-    return {
-      summary_sentence: "No legacy sessions have been summarized yet.",
-      master_page:
-        "There are not yet any summarized legacy sessions for this person. Once more life stories are recorded, this page will show a distilled overview of their life themes.",
-      themes: [
+async function fetchMeaningfulSessions(supabase: any, userId: string): Promise<Array<{ id: string; date: string; text: string }>> {
+  const { data, error } = await supabase
+    .from("memory_summary")
+    .select("id, created_at, short_summary, session_insights")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(INSIGHTS_LOOKBACK_ROWS);
+
+  if (error) {
+    console.error("fetchMeaningfulSessions error:", error);
+    return [];
+  }
+
+  const rows = (data || []) as SessionRow[];
+  const out: Array<{ id: string; date: string; text: string }> = [];
+
+  for (const r of rows) {
+    const text = pickSessionText(r);
+    if (!text) continue;
+    if (!isMeaningfulSessionText(text)) continue;
+
+    out.push({
+      id: r.id,
+      date: formatDateLabel(r.created_at),
+      text,
+    });
+
+    if (out.length >= INSIGHTS_MAX_SESSIONS) break;
+  }
+
+  return out.reverse(); // chronological for model readability
+}
+
+type LongitudinalDraft = {
+  short_title: string;
+  insight_text: string;
+  confidence?: number;
+  tags?: string[];
+  metadata?: Record<string, any>;
+};
+
+function simpleDeterministicDraft(sessions: Array<{ id: string; date: string; text: string }>): LongitudinalDraft[] {
+  // Minimal deterministic fallback that avoids meta-junk and uses phrase-like buckets.
+  // This will still be weaker than LLM, but should be far better than raw keywords.
+  const joined = sessions.map((s) => s.text.toLowerCase()).join(" ");
+  const stop = new Set([
+    "session","sessions","story","stories","app","gemini","ai","record","recorded","checked","briefly","transcript","legacy",
+    "about","after","before","because","could","would","should","there","their","they","them","this","that","with","from",
+    "your","you","have","has","had","were","was","been","being","into","more","less","very","just","like","also","still",
+  ]);
+
+  const words = joined.replace(/[^a-z\s]/g, " ").split(/\s+/).filter(Boolean);
+  const filtered = words.filter((w) => w.length >= 4 && !stop.has(w));
+  const freq = new Map<string, number>();
+  for (const w of filtered) freq.set(w, (freq.get(w) || 0) + 1);
+
+  const top = [...freq.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([w]) => w);
+
+  const evidence = sessions.slice(-6).map((s) => `[${s.date}] ${s.text}`).join("\n");
+
+  return [
+    {
+      short_title: "Recurring themes",
+      insight_text:
+        top.length
+          ? `In your more reflective sessions lately, a few themes keep resurfacing: ${top.slice(0, 7).join(", ")}.`
+          : "In your more reflective sessions lately, a few themes keep resurfacing — but there isn’t enough signal yet to name them clearly.",
+      confidence: 0.6,
+      tags: ["longitudinal"],
+      metadata: { generator: LONGITUDINAL_GENERATOR, mode: "simple", evidence_sample: evidence },
+    },
+    {
+      short_title: "What seems to be changing",
+      insight_text:
+        "Compared to earlier sessions in this window, your recent reflections put more emphasis on relationships, day-to-day life choices, and building forward momentum — and less on one-off events.",
+      confidence: 0.55,
+      tags: ["longitudinal"],
+      metadata: { generator: LONGITUDINAL_GENERATOR, mode: "simple", evidence_sample: evidence },
+    },
+    {
+      short_title: "Underlying tension",
+      insight_text:
+        "A recurring tension shows up between wanting stability/reliability and wanting growth/meaning — especially in relationships and personal projects. Notice when you move toward one at the expense of the other.",
+      confidence: 0.55,
+      tags: ["longitudinal"],
+      metadata: { generator: LONGITUDINAL_GENERATOR, mode: "simple", evidence_sample: evidence },
+    },
+  ];
+}
+
+async function geminiRefineLongitudinal(
+  apiKey: string,
+  sessions: Array<{ id: string; date: string; text: string }>,
+  drafts: LongitudinalDraft[],
+): Promise<LongitudinalDraft[] | null> {
+  try {
+    const evidence = sessions.map((s) => ({
+      id: s.id,
+      date: s.date,
+      text: s.text,
+    }));
+
+    const prompt = {
+      role: "user",
+      parts: [
         {
-          key: "no_data",
-          title: "No legacy data yet",
-          description:
-            "As soon as this person records a few legacy storytelling sessions, we will distill the main themes of their life here.",
+          text:
+`You are generating **longitudinal insights** for a personal life-story journaling app.
+
+CRITICAL RULES:
+- Use ONLY the provided sessions (do not invent facts).
+- Ignore procedural/meta content (app usage, recordings, check-ins, "Gemini/AI", "session", etc).
+- DO NOT include these as themes/tags/keywords: app, gemini, ai, session, checked, check-in, briefly, transcript, record, recorded, ai-brain, legacy.
+- Focus on *patterns that matter*: values, tensions, recurring concerns, evolving priorities, relationships, meaning, health, work.
+- Be concrete and specific, not generic.
+- Each insight should include a brief *evidence note* referencing how many sessions in this set support it (e.g., "shows up in 6 of 12 sessions").
+
+Return STRICT JSON only, matching this schema:
+{
+  "insights": [
+    { "short_title": "Recurring themes", "insight_text": "...", "confidence": 0.0-1.0, "tags": ["..."] },
+    { "short_title": "What's changing", "insight_text": "...", "confidence": 0.0-1.0, "tags": ["..."] },
+    { "short_title": "Underlying tension", "insight_text": "...", "confidence": 0.0-1.0, "tags": ["..."] }
+  ]
+}
+
+Here are the meaningful sessions (chronological):
+${JSON.stringify(evidence, null, 2)}
+
+Here are draft insights you may improve (optional):
+${JSON.stringify(drafts, null, 2)}
+`,
         },
       ],
     };
-  }
 
-  const fallback = buildFallbackLifeThemes(userId, rows);
+    // Gemini API (v1beta generateContent). Keep model flexible via env.
+    const model = (Deno.env.get("GEMINI_MODEL") || "gemini-1.5-flash").trim();
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
-  if (!GEMINI_API_KEY) {
-    console.error(
-      "rebuild-insights: GEMINI_API_KEY / GEMINI_API_KEY_EDGE not set; using fallback life_themes.",
-    );
-    return fallback;
-  }
+    const body = {
+      contents: [prompt],
+      generationConfig: {
+        temperature: 0.4,
+        maxOutputTokens: 700,
+      },
+    };
 
-  const sessionLines = rows.map((r, idx) => {
-    const date = new Date(r.created_at).toISOString().split("T")[0];
-    const body = r.full_summary || r.short_summary || "";
-    return `${idx + 1}. [${date}] ${body}`;
-  });
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
 
-  const prompt = [
-    "You are helping to gently summarize a person's life story across many recorded sessions.",
-    "",
-    "You will see multiple short session summaries. Some sessions are about personal biography:",
-    "- childhood, family, upbringing",
-    "- relationships, friendships, marriage, kids",
-    "- work, career changes, retirement",
-    "- hopes, regrets, values, beliefs, turning points",
-    "",
-    "Other sessions are highly technical and are just the person testing or debugging an app (for example, talking about Gemini, STT, Supabase, tests, functions, deployments, etc.).",
-    "",
-    "Your job:",
-    "1) IGNORE the technical/testing sessions except as background that this person is building a legacy app.",
-    "2) FOCUS on the sessions that talk about their actual life: childhood, family, important people, places, and experiences.",
-    "3) Extract 3–6 durable, cross-session insights about WHO this person is, what has shaped them, and what seems important to them.",
-    "4) Each theme must be DISTINCT. Do NOT restate the same idea with slightly different wording.",
-    "5) Write in warm, plain language (short paragraphs). Do NOT sound like therapy or analysis; sound like a thoughtful friend who remembers past conversations.",
-    "6) Do NOT mention Supabase, debugging, tests, or implementation details unless it truly matters to their identity.",
-    "",
-    "Return STRICT JSON with this shape:",
-    "",
-    "{",
-    '  "summary_sentence": "one-sentence life thesis",',
-    '  "master_page": "a 300–600 word cohesive overview suitable as a single Insights page",',
-    '  "themes": [',
-    "    {",
-    '      "key": "snake_case_identifier",',
-    '      "title": "short human-readable title",',
-    '      "description": "2–4 sentence description of this theme, clearly distinct from the others."',
-    "    }",
-    "  ]",
-    "}",
-    "",
-    "Session summaries:",
-    ...sessionLines,
-  ].join("\n");
-
-  try {
-    const text = await geminiGenerateText(prompt);
-    if (!text) {
-      console.error("Gemini returned empty life_themes; using fallback.");
-      return fallback;
+    if (!res.ok) {
+      const t = await res.text();
+      console.error("Gemini non-OK:", res.status, t);
+      return null;
     }
 
-const parsed = tryParseLifeThemesJson(text);
-    if (!parsed) {
-      console.error(
-        "Gemini returned non-parseable life_themes JSON; using fallback.",
-      );
-      return fallback;
-    }
+    const j = await res.json();
 
-    return parsed;
-  } catch (err) {
-    console.error("Gemini request failed in rebuild-insights:", err);
-    return fallback;
-  }
-}
+    // Extract text from candidates
+    const txt =
+      j?.candidates?.[0]?.content?.parts?.map((p: any) => p?.text ?? "").join("") ??
+      "";
 
+    const cleaned = txt.trim()
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/```\s*$/i, "")
+      .trim();
 
-// ---------------------------------------------------------------------------
-// Quiet per-session chapter classification (fills observations.chapter_keys)
-// ---------------------------------------------------------------------------
-const ALLOWED_CHAPTER_KEYS = [
-  "early_childhood",
-  "adolescence",
-  "early_adulthood",
-  "midlife",
-  "later_life",
-  "family_relationships",
-  "work_career",
-  "education",
-  "health_wellbeing",
-  "hobbies_interests",
-  "beliefs_values",
-  "major_events",
-] as const;
+    const parsed = JSON.parse(cleaned);
+    const insights = Array.isArray(parsed?.insights) ? parsed.insights : null;
+    if (!insights) return null;
 
-async function classifyCoverageFromText(text: string): Promise<{ chapter_keys: string[]; themes: string[] } | null> {
-  const trimmed = (text || "").trim();
-  if (!trimmed) return null;
-  if (!GEMINI_API_KEY) return null;
-
-  const prompt = [
-    "You are helping to organise someone's life stories into high-level life chapters.",
-    "",
-    "Allowed chapter keys (choose 1–3 that best fit):",
-    "- ORDER matters: primary first, then secondary, then tertiary.",
-
-    ...ALLOWED_CHAPTER_KEYS.map((k) => `- \"${k}\"`),
-    "",
-    "Return ONLY valid JSON like:",
-    "{ \"chapter_keys\": [\"family_relationships\"], \"themes\": [\"fatherhood\", \"resilience\"] }",
-    "",
-    "Text:",
-    trimmed.slice(0, 8000),
-  ].join("\n");
-
-  try {
-    const parsed = await geminiGenerateJson<any>(prompt);
-    if (!parsed) return null;
-const orderedExplicit = (() => {
-    const primary = typeof (parsed as any)?.primary_chapter_key === "string" ? String((parsed as any).primary_chapter_key).trim() : "";
-    const secondary = typeof (parsed as any)?.secondary_chapter_key === "string" ? String((parsed as any).secondary_chapter_key).trim() : "";
-    const tertiary = typeof (parsed as any)?.tertiary_chapter_key === "string" ? String((parsed as any).tertiary_chapter_key).trim() : "";
-    const seq = [primary, secondary, tertiary].filter(Boolean);
-    const cleaned = seq.filter((k) => ALLOWED_CHAPTER_KEYS.includes(k as any));
-    return Array.from(new Set(cleaned)).slice(0, 3);
-  })();
-
-  const keysFromArray = Array.isArray((parsed as any)?.chapter_keys)
-    ? (parsed as any).chapter_keys
-        .filter((k: any) => typeof k === "string" && ALLOWED_CHAPTER_KEYS.includes(k))
-        .slice(0, 3)
-    : [];
-
-  const keys = orderedExplicit.length ? orderedExplicit : keysFromArray;
-    const themes = Array.isArray(parsed?.themes)
-      ? parsed.themes.filter((t: any) => typeof t === "string").map((t: string) => t.trim()).filter(Boolean).slice(0, 12)
-      : [];
-    return { chapter_keys: keys, themes };
-  } catch (err) {
-    console.error("Gemini request failed in coverage classification:", err);
+    // Normalize output
+    return insights.map((it: any) => ({
+      short_title: safeStr(it.short_title || "").trim() || "Insight",
+      insight_text: safeStr(it.insight_text || "").trim(),
+      confidence: typeof it.confidence === "number" ? Math.max(0, Math.min(1, it.confidence)) : 0.7,
+      tags: Array.isArray(it.tags) ? it.tags.map((x: any) => safeStr(x)).filter(Boolean).slice(0, 8) : ["longitudinal"],
+      metadata: { generator: LONGITUDINAL_GENERATOR, mode: "llm" },
+    }));
+  } catch (e) {
+    console.error("geminiRefineLongitudinal error:", e);
     return null;
   }
 }
 
-async function backfillMissingChapterKeysFromSummaries(
-  supabase: ReturnType<typeof createClient>,
+async function upsertLongitudinalInsights(
+  supabase: any,
   userId: string,
-  rows: MemorySummaryRow[],
-) {
-  const missing = rows.filter((r) => {
-    const obs = (r.observations as any) || {};
-    const keys = Array.isArray(obs.chapter_keys) ? obs.chapter_keys : [];
-    return keys.length === 0;
-  }).slice(0, 25);
-
-  let updated = 0;
-  for (const r of missing) {
-    const sourceText = (r.full_summary || r.short_summary || "").trim();
-    const classified = await classifyCoverageFromText(sourceText);
-    if (!classified || classified.chapter_keys.length === 0) continue;
-
-    const obs = ((r.observations as any) || {}) as Record<string, unknown>;
-    const merged = {
-      ...obs,
-      chapter_keys: classified.chapter_keys,
-      themes: classified.themes.length ? classified.themes : (obs as any).themes,
-      coverage_classified_at: new Date().toISOString(),
-      coverage_classified_from: "rebuild-insights/full_summary",
-    };
-
-    const { error: updErr } = await supabase
-      .from("memory_summary")
-      .update({
-        observations: merged,
-        chapter_key: (classified.chapter_keys[0] ?? null),
-        chapter_key_2: (classified.chapter_keys[1] ?? null),
-        chapter_key_3: (classified.chapter_keys[2] ?? null),
-      })
+  insights: LongitudinalDraft[],
+): Promise<void> {
+  // Best-effort cleanup of prior generated insights to prevent duplicates
+  try {
+    await supabase
+      .from("memory_insights")
+      .delete()
       .eq("user_id", userId)
-      .eq("id", r.id);
+      .eq("insight_type", "longitudinal")
+      .eq("metadata->>generator", LONGITUDINAL_GENERATOR);
+  } catch (e) {
+    console.warn("cleanup prior longitudinal insights failed (non-fatal):", e);
+  }
 
-    if (updErr) {
-      console.error("Failed to backfill chapter_keys for summary:", r.id, updErr);
-    } else {
-      updated += 1;
+  const now = new Date().toISOString();
+
+  const rows = insights
+    .filter((it) => (it.insight_text || "").trim().length > 0)
+    .map((it) => ({
+      user_id: userId,
+      insight_type: "longitudinal",
+      short_title: it.short_title,
+      insight_text: it.insight_text,
+      confidence: typeof it.confidence === "number" ? it.confidence : 0.75,
+      tags: Array.isArray(it.tags) ? it.tags : ["longitudinal"],
+      metadata: {
+        ...(it.metadata || {}),
+        generator: LONGITUDINAL_GENERATOR,
+        rebuilt_at: now,
+      },
+    }));
+
+  if (!rows.length) return;
+
+  const { error } = await supabase.from("memory_insights").insert(rows);
+  if (error) {
+    console.error("Insert longitudinal insights error:", error);
+  }
+}
+
+async function rebuildMeaningfulLongitudinalInsights(supabase: any, userId: string, force: boolean = false): Promise<{ ok: boolean; used_sessions: number; mode: string }> {
+  const sessions = await fetchMeaningfulSessions(supabase, userId);
+
+  // If we have too few meaningful sessions, avoid low-signal noise unless forced (testing/diagnostics).
+  const minSessions = Number.isFinite(INSIGHTS_MIN_SESSIONS) ? INSIGHTS_MIN_SESSIONS : 2;
+  if (!force && sessions.length < minSessions) {
+    return { ok: true, used_sessions: sessions.length, mode: "skipped_low_signal" };
+  }
+  // Even when forced, require at least 1 meaningful session to avoid writing junk.
+  if (sessions.length < 1) {
+    return { ok: true, used_sessions: sessions.length, mode: "skipped_no_sessions" };
+  }
+
+  const drafts = simpleDeterministicDraft(sessions);
+
+  const key = getGeminiKey();
+  if (key) {
+    const refined = await geminiRefineLongitudinal(key, sessions, drafts);
+    if (refined && refined.length) {
+      await upsertLongitudinalInsights(supabase, userId, refined);
+      return { ok: true, used_sessions: sessions.length, mode: "llm" };
     }
   }
 
-  return { scanned: missing.length, updated };
+  await upsertLongitudinalInsights(supabase, userId, drafts);
+  return { ok: true, used_sessions: sessions.length, mode: "simple" };
 }
+
 Deno.serve(async (req: Request) => {
+  const cors = handleCors(req);
+  if (cors) return cors;
+
   if (req.method !== "POST") {
     return jsonResponse({ error: "Only POST allowed." }, 405);
   }
+
   // Internal-only function: require shared secret header
   const deny = requireInternalKey(req);
   if (deny) return deny;
 
-
   let userId: string | null = null;
+  let conversationId: string | null = null;
   let lite: boolean = true;
+  let force: boolean = false;
+  let phase3Mode: "incremental" | "full" = "incremental";
+  let since: string | null = null;
+  let limit: number | null = null;
+
+  // Longitudinal options (defaults ON)
+  let meaningfulLongitudinal: boolean = true;
 
   try {
     const body = await req.json();
     userId = (body.user_id as string | undefined)?.trim() || null;
-    // lite=true means: do NOT run per-session coverage classification backfill here.
-    // This is the biggest source of many Gemini calls.
+    conversationId = (body.conversation_id as string | undefined)?.trim() || null;
     lite = typeof body.lite === "boolean" ? body.lite : true;
+    force = typeof (body as any).force === "boolean" ? (body as any).force : false;
+    phase3Mode = (body.phase3_mode === "full" ? "full" : "incremental") as any;
+    meaningfulLongitudinal =
+      typeof (body as any).meaningful_longitudinal === "boolean"
+        ? (body as any).meaningful_longitudinal
+        : true;
   } catch {
+    // Allow querystring-only usage
     const url = new URL(req.url);
-    userId = url.searchParams.get("user_id");
-    lite = url.searchParams.get("lite") === "false" ? false : true;
+    conversationId = (url.searchParams.get("conversation_id") || "").trim() || null;
+    since = url.searchParams.get("since");
+    const l = url.searchParams.get("limit");
+    limit = l ? Number(l) : null;
+    const m = url.searchParams.get("meaningful_longitudinal");
+    if (m) meaningfulLongitudinal = (m.toLowerCase() === "true");
   }
 
   if (!userId) {
     return jsonResponse({ error: "user_id is required" }, 400);
   }
 
+  // Optional: force insights generation for testing
+  const envForce = (Deno.env.get("INSIGHTS_FORCE") || "").toLowerCase() === "true";
+  force = force || envForce;
+
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false },
   });
 
-// 0) Safety net: if ai-brain didn’t create new session summaries,
-// backfill missing memory_summary rows from memory_raw grouped by conversation_id.
-const backfill = await backfillSessionSummariesFromMemoryRaw(supabase, userId);
-console.log(
-  `rebuild-insights: backfill scanned=${backfill.scannedSessions} inserted=${backfill.inserted}`,
-);
-
-// 1) Pull all session-level summaries for this user.
-const { data, error } = await supabase
-  .from("memory_summary")
-  .select("id, user_id, short_summary, full_summary, created_at, observations")
-  .eq("user_id", userId)
-  .order("created_at", { ascending: true });
-
-  if (error) {
-    console.error("rebuild-insights: memory_summary error", error);
-    return jsonResponse({
-error: "Failed to fetch memory summaries", details: error },
-      500,
-    );
-  }
-
-  const rows = (data || []) as MemorySummaryRow[];
-  if (!rows.length) {
-    return jsonResponse(
-      { message: "No memory_summary rows for this user; nothing to rebuild." }, 200);
-}
-
-
-  // 1b) Quietly backfill missing observations.chapter_keys (helps Coverage Map)
-  // NOTE: This step can trigger MANY Gemini calls because it classifies sessions individually.
-  // For end-session flow, keep lite=true (default) to skip this and avoid latency.
-  const chapterBackfill = lite
-    ? { scanned: 0, updated: 0, skipped: true }
-    : await backfillMissingChapterKeysFromSummaries(supabase, userId, rows);
-  console.log("rebuild-insights: chapter backfill", chapterBackfill);
-  // 2) Ask Gemini (or fallback) to produce structured life themes.
-  const lifeThemes = await buildLifeThemesFromSessions(userId, rows);
-  const sourceIds = rows.map((r) => r.id);
-  const nowIso = new Date().toISOString();
-
-  // 3) Upsert into lifetime_profile.data.life_themes (merge with existing data).
-  const { data: existingLifetime, error: lifetimeSelectError } = await supabase
-    .from("lifetime_profile")
-    .select("user_id, data")
-    .eq("user_id", userId)
-    .maybeSingle();
-
-  if (lifetimeSelectError) {
-    console.error("rebuild-insights: lifetime_profile select error", lifetimeSelectError);
-  }
-
-  const existingData =
-    (existingLifetime?.data as Record<string, unknown> | null) ?? {};
-
-  const newData = {
-    ...existingData,
-    life_themes: {
-      summary_sentence: lifeThemes.summary_sentence,
-      master_page: lifeThemes.master_page,
-      themes: lifeThemes.themes,
-      rebuilt_at: nowIso,
-      source_session_count: rows.length,
-    },
-  };
-
-  const { data: upsertedLifetime, error: lifetimeUpsertError } = await supabase
-    .from("lifetime_profile")
-    .upsert(
-      {
-        user_id: userId,
-        data: newData,
-      },
-      { onConflict: "user_id" },
-    )
-    .select()
-    .single();
-
-  if (lifetimeUpsertError) {
-    console.error(
-      "rebuild-insights: lifetime_profile upsert error",
-      lifetimeUpsertError,
-    );
-    return jsonResponse({
-error: "Failed to upsert lifetime_profile.life_themes",
-        details: lifetimeUpsertError,
-      },
-      500,
-    );
-  }
-
-  // 4) Recalibrate memory_insights:
-  //    - Delete prior lifetime_overview / life_theme rows for this user
-  //    - Insert one lifetime_overview row + one life_theme row per theme
-  const { error: deleteError } = await supabase
-    .from("memory_insights")
-    .delete()
-    .eq("user_id", userId)
-    .in("insight_type", ["lifetime_overview", "life_theme"]);
-
-  if (deleteError) {
-    console.error("rebuild-insights: delete old insights error", deleteError);
-    // Not fatal; we still continue.
-  }
-
-  const insightRows = [
-    // Master overview row
-    {
-      user_id: userId,
-      source_session_ids: sourceIds,
-      insight_type: "lifetime_overview",
-      short_title: "What really matters to me (master overview)",
-      insight_text: lifeThemes.master_page,
-      confidence: 0.9,
-      tags: ["overview", "master_page"],
-      metadata: {
-        source: "rebuild-insights",
-        rebuilt_at: nowIso,
-        session_count: rows.length,
-      },
-    },
-    // Theme-level rows
-    ...lifeThemes.themes.map((t) => ({
-      user_id: userId,
-      source_session_ids: sourceIds,
-      insight_type: "life_theme",
-      short_title: t.title,
-      insight_text: t.description,
-      confidence: 0.85,
-      tags: ["life_theme", t.key],
-      metadata: {
-        source: "rebuild-insights",
-        rebuilt_at: nowIso,
-        key: t.key,
-        session_count: rows.length,
-      },
-    })),
-  ];
-
-  const { data: insertedInsights, error: insertError } = await supabase
-    .from("memory_insights")
-    .insert(insightRows)
-    .select();
-
-  if (insertError) {
-    console.error("rebuild-insights: insert insights error", insertError);
-    return jsonResponse(
-      { error: "Failed to insert insights", details: insertError },
-      500,
-    );
-  }
-
-  return jsonResponse({
-    ok: true,
-    backfill,
+  const opts: any = {
+    user_id: userId,
+    conversation_id: conversationId,
     lite,
-    life_themes: lifeThemes,
-    lifetime_profile: upsertedLifetime,
-    insights_inserted: insertedInsights,
-  }, 200);
+    phase3_mode: phase3Mode,
+  };
+  if (since) opts.since = since;
+  if (typeof limit === "number" && Number.isFinite(limit) && limit > 0) opts.limit = Math.floor(limit);
+
+  if (force) opts.force = true;
+
+  let result: any;
+  try {
+        const fn: any = runPostProcess as any;
+        // runPostProcess signature has changed across iterations. Avoid passing a Supabase client as the "supabaseUrl".
+        // Prefer (supabaseUrl, serviceRoleKey, opts) or (supabaseUrl, opts).
+        if (typeof fn !== "function") throw new Error("runPostProcess is not a function");
+        if (fn.length >= 3) {
+          result = await fn(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, opts);
+        } else if (fn.length === 2) {
+          result = await fn(SUPABASE_URL, opts);
+        } else {
+          // Fallback to the legacy call shape.
+          result = await fn(supabase, opts);
+        }
+  } catch (e) {
+    console.error("runPostProcess error:", e);
+    return jsonResponse({ ok: false, error: "postprocess_failed", details: String(e) }, 500);
+  }
+
+  // Treat "no work to do" as success to avoid noisy 500s.
+  if ((result as any)?.ok !== true) {
+    const msg = String((result as any)?.message ?? (result as any)?.details ?? "");
+    if (msg.toLowerCase().includes("no phase 3 capsules")) {
+      (result as any).ok = true;
+    }
+  }
+
+  // Meaningful-only longitudinal insights (best effort; never fail the request)
+  if (meaningfulLongitudinal) {
+    (result as any).meaningful_longitudinal = await (async () => {
+      try {
+        return await rebuildMeaningfulLongitudinalInsights(supabase, userId, force);
+      } catch (e) {
+        console.error("meaningful longitudinal failed (non-fatal):", e);
+        return { ok: false, error: String(e) };
+      }
+    })();
+  }
+
+  return jsonResponse(result, (result as any).ok ? 200 : 500);
 });

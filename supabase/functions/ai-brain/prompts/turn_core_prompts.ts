@@ -102,23 +102,31 @@ ${args.transcriptText}
 `.trim();
 }
 
-export function buildExtractStoriesPrompt(args: { transcriptText: string }): string {
+ export function buildExtractStoriesPrompt(args: { transcriptText: string }): string {
   return `
 You are an expert autobiographical editor.
-You will be given a transcript of a conversation containing one or more personal anecdotes.
+You will be given a transcript of a conversation that may contain personal anecdotes.
 
-Identify distinct STORIES in the transcript. A story is a concrete remembered event (time, place, people, actions).
-Do not treat general opinions as stories unless tied to a specific event.
+Your job: identify DISTINCT STORIES worth saving.
+
+Core rule: a story must meet ALL of these:
+- Has a clear scene (where/with whom/what situation)
+- Has time anchoring (e.g., "When I was 16…", "One time in Thailand…", a year, a life period)
+- Has a sequence of actions (things that happened, in order)
+- Has an outcome OR emotional resolution (what happened / how it ended / how it felt)
+- Is NOT a belief statement
+- Is NOT a system instruction (save this / deploy / code / app debugging)
+- Is NOT a question
+
+If it doesn’t satisfy ALL of the above, it is NOT a story and must be excluded.
 
 Return ONLY valid JSON of this exact shape:
 {
   "stories": [
     {
-      "title": "Short title",
+      "title": "Short title (2–8 words)",
       "body": "3–12 sentences narrating the event (third person).",
       "tags": ["short", "tags"],
-      "chapter_keys": ["optional 0–3 chapter keys"],
-      "themes": ["optional 1–5 short phrases"],
       "confidence": 0.0
     }
   ]
@@ -129,12 +137,12 @@ Rules:
 - stories may be [].
 - confidence is 0.0–1.0.
 - Make body suitable to be saved as a standalone story for a memory library.
-- Do not invent new events that aren't implied by the transcript.
+- Do not invent new events that aren’t implied by the transcript.
 
 Transcript:
 ${args.transcriptText}
 `.trim();
-}
+ }
 
 export function buildSessionInsightsPrompt(args: { fullSummary: string }): string {
   return `

@@ -1,9 +1,7 @@
-import 'dart:convert';
-import 'package:http/http.dart' as http;
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 class BrainService {
-  final String baseUrl =
-      'https://us-central1-legacymvp-477713.cloudfunctions.net/brain';
+  final SupabaseClient _client = Supabase.instance.client;
 
   /// Call the Brain (Cloud Function) / Gemini pipeline.
   ///
@@ -16,48 +14,41 @@ class BrainService {
   /// - [mediaType]: 'audio', 'image', 'video', etc. (for future use)
   /// - [mediaUrl]: public URL to the media, if any
   Future<String> callBrain({
-    required String userId,
+    required String userId, // kept for backward compatibility; JWT is source of truth now
     required String message,
     String? sessionId,
     String? mediaType,
     String? mediaUrl,
   }) async {
-    final uri = Uri.parse(baseUrl);
 
+    // Auth must be present; Edge Functions rely on JWT.
+    final session = _client.auth.currentSession ?? (await _client.auth.getSession()).data.session;
+    if (session?.user == null) {
+      throw Exception('Not signed in.');
+    }
+
+    // IMPORTANT: do not send user_id from the client; server derives from JWT.
     final Map<String, dynamic> payload = {
-      'userId': userId,
-      'message': message,
+      'message_text': message,
+      'mode': 'legacy',
     };
+    if (sessionId != null && sessionId.isNotEmpty) payload['conversation_id'] = sessionId;
+    if (mediaType != null && mediaType.isNotEmpty) payload['media_type'] = mediaType;
+    if (mediaUrl != null && mediaUrl.isNotEmpty) payload['media_url'] = mediaUrl;
 
-    // Optional fields (backend can use these to populate session_id, media_type, etc.)
-    if (sessionId != null && sessionId.isNotEmpty) {
-      payload['sessionId'] = sessionId;
+    final res = await _client.functions.invoke('ai-brain', body: payload);
+    final data = res.data;
+    if (data is! Map) {
+      throw Exception('Brain error: ai-brain returned non-object: ${data.runtimeType}');
     }
-    if (mediaType != null && mediaType.isNotEmpty) {
-      payload['mediaType'] = mediaType;
-    }
-    if (mediaUrl != null && mediaUrl.isNotEmpty) {
-      payload['mediaUrl'] = mediaUrl;
-    }
-
-    final response = await http.post(
-      uri,
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode(payload),
-    );
-
-    if (response.statusCode != 200) {
-      throw Exception(
-          'Brain error: ${response.statusCode} ${response.body}');
+    if (data['error'] != null) {
+      throw Exception('Brain error: ${data['error']}');
     }
 
-    final data = jsonDecode(response.body) as Map<String, dynamic>;
-    final reply = data['reply'];
-
-    if (reply is String) {
-      return reply;
-    } else {
-      throw Exception('Brain error: unexpected response format');
+    final reply = (data['reply_text'] ?? data['reply']) as String?;
+    if (reply == null || reply.trim().isEmpty) {
+      throw Exception('Brain error: empty reply');
     }
-  }
-}
+    return reply;
+   }
+ }

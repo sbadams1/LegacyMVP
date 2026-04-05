@@ -135,8 +135,8 @@ function isMeaningfulSessionText(text: string): boolean {
   if (wc >= INSIGHTS_MIN_WORDS) return true;
 
   // If short, allow if clearly reflective and multi-sentence
-  const sentences = (t.match(/[.!?]/g) || []).length;
-  if (sentences >= 2) {
+  const sentenceCount = (t.match(/[.!?]/g) || []).length;
+  if (sentenceCount >= 2) {
     for (const sig of REFLECTIVE_SIGNALS) {
       if (low.includes(sig)) return true;
     }
@@ -146,13 +146,36 @@ function isMeaningfulSessionText(text: string): boolean {
 }
 
 function pickSessionText(r: SessionRow): string {
-  const si = r.session_insights ?? {};
-  const s1 = safeStr(si?.short_summary);
-  const s2 = safeStr(si?.full_summary);
-  const s3 = safeStr(r.short_summary);
+  // NOTE: session_insights may come back as JSON (object) or as a JSON string,
+  // depending on how the column is typed and how Supabase returns it.
+  const siRaw: any = (r as any)?.session_insights ?? null;
 
-  // Prefer LLM-curated short summary when present, then full_summary in json, then short_summary column
-  return (s1 || s2 || s3 || "").trim();
+  let si: any = siRaw;
+  if (typeof siRaw === "string") {
+    try {
+      si = JSON.parse(siRaw);
+    } catch {
+      si = null;
+    }
+  }
+
+  // Prefer richer text when available.
+  const fromInsights = [
+    safeStr(si?.full_summary),
+    safeStr(si?.short_summary),
+    safeStr((si as any)?.summary),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  const fromRow = [
+    safeStr((r as any)?.full_summary),
+    safeStr((r as any)?.short_summary),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  return (fromInsights || fromRow).trim();
 }
 
 function formatDateLabel(iso: string): string {
@@ -304,9 +327,13 @@ ${JSON.stringify(drafts, null, 2)}
     };
 
     // Gemini API (v1beta generateContent). Keep model flexible via env.
-    const model = (Deno.env.get("GEMINI_MODEL") || "gemini-1.5-flash").trim();
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
-
+    // IMPORTANT: Normalize to avoid accidental "models/models/..." which causes 404s when GEMINI_MODEL already includes "models/".
+    const requestedModel = (
+      Deno.env.get("GEMINI_MODEL") || Deno.env.get("GEMINI_API_MODEL") || "gemini-1.5-flash"
+    ).trim();
+    const modelName = requestedModel.startsWith("models/") ? requestedModel : `models/${requestedModel}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`;
+ 
     const body = {
       contents: [prompt],
       generationConfig: {
@@ -323,7 +350,7 @@ ${JSON.stringify(drafts, null, 2)}
 
     if (!res.ok) {
       const t = await res.text();
-      console.error("Gemini non-OK:", res.status, t);
+      console.error("Gemini non-OK:", { status: res.status, model: modelName, body: t.slice(0, 800) });
       return null;
     }
 

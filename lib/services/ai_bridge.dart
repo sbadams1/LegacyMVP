@@ -9,38 +9,38 @@ final SupabaseClient _supabase = Supabase.instance.client;
 /// Call Gemini via the Supabase Edge Function `legacy-ai`.
 /// Expects the function to respond with:
 ///   { "reply": "<text>" }
-Future<String> callGemini(String prompt) async {
-  try {
-    final response = await _supabase.functions.invoke(
-      'legacy-ai',
-      body: {
-        'provider': 'gemini',
-        'prompt': prompt,
-      },
-    );
+ Future<String> callGemini(String prompt) async {
+   try {
+     final response = await _supabase.functions.invoke(
+      'ai-brain',
+       body: {
+        'message_text': prompt,
+        'mode': 'legacy',
+       },
+     );
 
-    final data = response.data;
-    if (data is! Map<String, dynamic>) {
-      throw Exception(
-        'Unexpected response type for Gemini: ${data.runtimeType}',
-      );
-    }
+     final data = response.data;
+     if (data is! Map<String, dynamic>) {
+       throw Exception(
+         'Unexpected response type for Gemini: ${data.runtimeType}',
+       );
+     }
 
-    final error = data['error'];
-    if (error != null) {
-      throw Exception('Gemini error: $error');
-    }
+     final error = data['error'];
+     if (error != null) {
+       throw Exception('Gemini error: $error');
+     }
 
-    final reply = data['reply'] as String?;
-    if (reply == null || reply.isEmpty) {
-      throw Exception('Gemini returned empty reply');
-    }
+    final reply = (data['reply_text'] ?? data['reply']) as String?;
+     if (reply == null || reply.isEmpty) {
+       throw Exception('Gemini returned empty reply');
+     }
 
-    return reply;
-  } catch (e) {
-    throw Exception('Failed to call Gemini: $e');
-  }
-}
+     return reply;
+   } catch (e) {
+     throw Exception('Failed to call Gemini: $e');
+   }
+ }
 
 /// Call ElevenLabs TTS via the Supabase Edge Function `legacy-ai`.
 /// Expects the function to respond with:

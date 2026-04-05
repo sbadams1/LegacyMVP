@@ -1,7 +1,6 @@
 import 'dart:convert';
+import 'dart:async';
 import 'dart:math';
-
-
 
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -141,35 +140,33 @@ String _secondPersonifySummary(String input) {
   var s = input.trim();
   if (s.isEmpty) return s;
 
-  // Only transform if it clearly uses the third-person "The user" voice.
-  // If it already starts with "You ", leave it alone.
-  if (RegExp(r'^You\b', caseSensitive: false).hasMatch(s)) return s;
-  if (!RegExp(r'\bThe user\b', caseSensitive: false).hasMatch(s) &&
-      !RegExp(r'\bthe user\b', caseSensitive: false).hasMatch(s)) {
-    return s;
+  // 1) Normalize leading third-person subject → second person
+  s = s.replaceAll(RegExp(r'^\s*The user\b', caseSensitive: false), 'You');
+  s = s.replaceAll(RegExp(r'^\s*This user\b', caseSensitive: false), 'You');
+  s = s.replaceAll(RegExp(r'^\s*User\b', caseSensitive: false), 'You');
+
+  // 2) Possessive forms
+  s = s.replaceAll(RegExp(r"\bthe user's\b", caseSensitive: false), 'your');
+  s = s.replaceAll(RegExp(r"\buser's\b", caseSensitive: false), 'your');
+
+  // 3) If sentence now refers to "You", normalize dependent pronouns
+  //    This prevents: "You ... their ..." / "You ... They ..."
+  s = s.replaceAll(RegExp(r'\bthey are\b', caseSensitive: false), 'you are');
+  s = s.replaceAll(RegExp(r'\bthey\b', caseSensitive: false), 'you');
+  s = s.replaceAll(RegExp(r'\btheir\b', caseSensitive: false), 'your');
+  s = s.replaceAll(RegExp(r'\bthem\b', caseSensitive: false), 'you');
+  s = s.replaceAll(RegExp(r'\btheirs\b', caseSensitive: false), 'yours');
+
+  // 4) Grammar cleanup
+  s = s.replaceAll(RegExp(r'\byou was\b', caseSensitive: false), 'you were');
+
+  // 5) Capitalize first letter
+  if (s.isNotEmpty) {
+    s = s[0].toUpperCase() + s.substring(1);
   }
 
-  // Handle leading subject with correct verb agreement.
-  s = s.replaceFirst(RegExp(r'^The user is\b', caseSensitive: false), 'You are');
-  s = s.replaceFirst(RegExp(r'^The user was\b', caseSensitive: false), 'You were');
-  s = s.replaceFirst(RegExp(r'^The user has\b', caseSensitive: false), 'You have');
-  s = s.replaceFirst(RegExp(r'^The user had\b', caseSensitive: false), 'You had');
-  s = s.replaceFirst(RegExp(r'^The user does\b', caseSensitive: false), 'You do');
-  s = s.replaceFirst(RegExp(r'^The user did\b', caseSensitive: false), 'You did');
-  s = s.replaceFirst(RegExp(r'^The user can\b', caseSensitive: false), 'You can');
-  s = s.replaceFirst(RegExp(r'^The user will\b', caseSensitive: false), 'You will');
-  s = s.replaceFirst(RegExp(r'^The user\b', caseSensitive: false), 'You');
-
-  // Replace remaining references conservatively.
-  s = s.replaceAll(RegExp(r'\bthe user\b', caseSensitive: false), 'you');
-
-  // Fix a couple of common agreement artifacts after replacement.
-  s = s.replaceAll(RegExp(r'\bYou is\b'), 'You are');
-  s = s.replaceAll(RegExp(r'\byou is\b'), 'you are');
-
-  return s.trim();
+  return s;
 }
-
 
 class StoryLibraryScreen extends StatefulWidget {
   const StoryLibraryScreen({super.key});
@@ -495,7 +492,7 @@ class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
           .eq('user_id', user.id)
           .order('created_at', ascending: false);
 
-      final rows = (res as List<dynamic>).cast<Map<String, dynamic>>();
+      final rows = (res as List<dynamic>).whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList();
 
       // Filter out non-session rows (the "mini transcript" one) and dedupe to 1 row per session.
       final seen = <String, Map<String, dynamic>>{};
@@ -521,8 +518,64 @@ class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
       });
     }
   }
+ 
+  Future<void> _rebuildSummariesAndFacts() async {
+    final user = _client.auth.currentUser;
+    if (user == null) {
+      _showSnack('You must be logged in.');
+      return;
+    }
 
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
 
+    try {
+      // Single rebuild path: ALWAYS run the end-session pipeline via ai-brain.
+      // This re-generates memory_summary, extracts facts, and captures stories.
+      final rows = List<Map<String, dynamic>>.from(_rows);
+      if (rows.isEmpty) {
+        _showSnack('No sessions to rebuild.');
+        setState(() {
+          _loading = false;
+        });
+        return;
+      }
+
+      int ok = 0;
+      int fail = 0;
+      for (final row in rows) {
+        final convId = (row['conversation_id'] as String? ?? '').trim();
+        if (convId.isEmpty) continue;
+        try {
+          await _client.functions.invoke(
+            'ai-brain',
+            body: {
+              'op': 'rebuild_conversation_artifacts',
+              'conversation_id': convId,
+              'end_session': true,
+              'message_text': '__END_SESSION__',
+            },
+          );
+          ok++;
+        } catch (_) {
+          fail++;
+        }
+      }
+
+      if (!mounted) return;
+      _showSnack('Rebuild complete. OK=$ok, failed=$fail. Refreshing…');
+      await _loadStories();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = 'Rebuild failed: $e';
+      });
+      _showSnack('Rebuild failed.');
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -547,14 +600,19 @@ class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
         child: const Text('Story Library'),
       ),
         actions: [
+            IconButton(
+             tooltip: 'Refresh',
+             icon: const Icon(Icons.refresh),
+             onPressed: _loadStories,
+           ),
           IconButton(
-            tooltip: 'Refresh',
-            icon: const Icon(Icons.refresh),
-            onPressed: _loadStories,
+            tooltip: 'Rebuild session artifacts',
+            icon: const Icon(Icons.auto_fix_high),
+            onPressed: _rebuildSummariesAndFacts,
           ),
-        ],
-      ),
-      body: _loading
+         ],
+       ),
+       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : (_error != null)
               ? Center(
@@ -628,7 +686,7 @@ class _StoryLibraryScreenState extends State<StoryLibraryScreen> {
                               children: [
                                 if (_revealPanels)
                                   Text(
-                                    sessionSummary,
+                                    _secondPersonifySummary(sessionSummary),
                                     style: theme.textTheme.bodyMedium,
                                   )
                                 else
@@ -1295,14 +1353,24 @@ if (items.isNotEmpty) ...[
       );
 
       // 2) Note: memory_summary.full_summary column was removed; curated text is stored in memory_curated only.
-// 3) Kick off an insights rebuild
-      try {
-        await _client.functions
-            .invoke('rebuild-insights', body: {'user_id': user.id});
-      } catch (e) {
-        // Non-fatal
-        // ignore: avoid_print
-        print('rebuild-insights failed: $e');
+      // 3) Single rebuild path: best-effort re-run end-session artifacts for this session.
+      final convId = (widget.sessionKey ?? '').trim();
+      if (convId.isNotEmpty) {
+        try {
+          await _client.functions.invoke(
+            'ai-brain',
+            body: {
+              'op': 'rebuild_conversation_artifacts',
+              'conversation_id': convId,
+              'end_session': true,
+              'message_text': '__END_SESSION__',
+            },
+          );
+        } catch (e) {
+          // Non-fatal
+          // ignore: avoid_print
+          print('ai-brain rebuild failed after curated save (non-fatal): $e');
+        }
       }
 
       _showSnack('Curated story saved.');
@@ -1385,15 +1453,7 @@ if (items.isNotEmpty) ...[
           .eq('id', widget.memorySummaryId)
           .eq('user_id', user.id);
 
-      // 4) Trigger insights rebuild (best-effort)
-      try {
-        await _client.functions
-            .invoke('rebuild-insights', body: {'user_id': user.id});
-      } catch (e) {
-        // Non-fatal
-        // ignore: avoid_print
-        print('rebuild-insights after delete failed: $e');
-      }
+      // No rebuild call here (session is deleted). Keep behavior deterministic.
 
       _showSnack('Story deleted.');
 
@@ -1433,9 +1493,9 @@ if (items.isNotEmpty) ...[
                         .trim(),
                     shortSummary: widget.shortSummary,
                     fullSummary: widget.fullSummary,
-                    sessionInsights: (widget.sessionInsights is Map)
-                        ? (widget.sessionInsights as Map).cast<String, dynamic>()
-                        : (widget.sessionInsights ?? const {}),
+                     sessionInsights: (widget.sessionInsights is Map)
+                         ? Map<String, dynamic>.from(widget.sessionInsights as Map)
+                         : (widget.sessionInsights ?? const {}),
                   ),
                 ),
               );
@@ -1643,6 +1703,22 @@ class _MemoryEditorScreenState extends State<MemoryEditorScreen> {
         print('⚠️ memory_raw_edits logging failed (non-fatal): $e');
       }
 
+      // 2.5) Best-effort: mark impacted story seeds stale so future retells reflect edits.
+      // This runs server-side because it uses overlap queries across story_seeds/story_recall.
+      try {
+        await _client.functions.invoke(
+          'mark-story-seeds-stale',
+          body: {
+            'user_id': user.id,
+            'edited_raw_ids': [widget.memoryId],
+            'reason': 'memory_raw_edit',
+          },
+        );
+      } catch (e) {
+        // ignore: avoid_print
+        print('mark-story-seeds-stale failed (non-fatal): $e');
+      }
+
       // Look up conversation_id (session key) for optional targeted rebuild
       String? conversationId;
       try {
@@ -1660,50 +1736,65 @@ class _MemoryEditorScreenState extends State<MemoryEditorScreen> {
         // ignore
       }
 
-      // 3) Best-effort: rebuild only this session summary (preferred).
+      // Fallback: derive conversation_id from memory_summary using raw_id if needed.
+      if (conversationId == null || conversationId!.isEmpty) {
+        try {
+          final Map<String, dynamic>? sRow = await _client
+              .from('memory_summary')
+              .select('conversation_id')
+              .eq('user_id', user.id)
+              .eq('raw_id', widget.memoryId)
+              .maybeSingle();
+          final v = sRow?['conversation_id'];
+          if (v is String && v.trim().isNotEmpty) {
+            conversationId = v.trim();
+          }
+        } catch (_) {
+          // ignore
+        }
+      }
+
+      // 3) Single rebuild path: rebuild this session artifacts via ai-brain.
       if (conversationId != null && conversationId!.isNotEmpty) {
         try {
           await _client.functions.invoke(
-            'rebuild-session-summary',
-            body: {'user_id': user.id, 'conversation_id': conversationId},
+            'ai-brain',
+            body: {
+              'op': 'rebuild_conversation_artifacts',
+              'conversation_id': conversationId,
+              'end_session': true,
+              'message_text': '__END_SESSION__',
+            },
           );
         } catch (e) {
           final msg = e.toString();
           if (!(msg.contains('NOT_FOUND') || msg.contains('404'))) {
             // ignore: avoid_print
-            print('rebuild-session-summary failed after edit: $e');
+            print('ai-brain session rebuild failed after edit: $e');
           }
         }
-      } else {
-        // Fallback: previous behavior (heavier) if we couldn't identify session
-        try {
-          await _client.functions.invoke(
-            'rebuild-insights',
-            body: {'user_id': user.id},
-          );
-        } catch (e) {
-          // ignore: avoid_print
-          print('rebuild-insights failed after memory edit: $e');
-        }
-      }
-
+       } else {
+         // No conversation id: don't do a bulk rebuild (avoids non-deterministic partial rebuild paths).
+         // ignore: avoid_print
+         print('ai-brain rebuild skipped after edit: missing conversation_id');
+       }
       if (!mounted) return;
-      Navigator.of(context).pop(edited);
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Failed to save memory: $e'),
-        ),
-      );
-    } finally {
-      if (mounted) {
-        setState(() {
-          _saving = false;
-        });
-      }
-    }
-  }
+       Navigator.of(context).pop(edited);
+     } catch (e) {
+       if (!mounted) return;
+       ScaffoldMessenger.of(context).showSnackBar(
+         SnackBar(
+           content: Text('Failed to save memory: $e'),
+         ),
+       );
+     } finally {
+       if (mounted) {
+         setState(() {
+           _saving = false;
+         });
+       }
+     }
+   }
 
   @override
   Widget build(BuildContext context) {
@@ -1792,7 +1883,7 @@ class _InsightsScreenState extends State<InsightsScreen> {
       final list = (res as List<dynamic>? ?? <dynamic>[]);
 
       setState(() {
-        _insights = list.map((e) => e as Map<String, dynamic>).toList();
+        _insights = list.map((e) => Map<String, dynamic>.from(e as Map)).toList();
         _loading = false;
       });
     } catch (e) {
@@ -1920,7 +2011,17 @@ class _SessionHistoryScreenState extends State<SessionHistoryScreen> {
   @override
   void initState() {
     super.initState();
-    _load();
+    _load().whenComplete(() {
+      // Phase B writes fact_candidates asynchronously. Wire the UI to fetch immediately,
+      // then listen for inserts (with a light polling fallback).
+      _initFactsPipeline();
+    });
+  }
+
+  @override
+  void dispose() {
+    _stopFactsPipeline();
+    super.dispose();
   }
 
   Future<void> _load() async {
@@ -1950,15 +2051,77 @@ class _SessionHistoryScreenState extends State<SessionHistoryScreen> {
     setState(() { _loading = false; });
   }
 
-  String _formatTs(dynamic ts) {
-    try {
-      final d = DateTime.parse(ts.toString()).toLocal();
-      return '${d.year.toString().padLeft(4,'0')}-${d.month.toString().padLeft(2,'0')}-${d.day.toString().padLeft(2,'0')} '
-             '${d.hour.toString().padLeft(2,'0')}:${d.minute.toString().padLeft(2,'0')}';
-    } catch (_) {
-      return ts?.toString() ?? '';
+   // NOTE: no-op stubs to satisfy builds if this screen calls them.
+   // Facts display wiring lives in EndSessionReviewScreen below.
+   void _initFactsPipeline() {}
+   void _stopFactsPipeline() {}
+ 
+  Future<void> _rebuildSessions() async {
+    final user = _client.auth.currentUser;
+    if (user == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('You must be logged in.')),
+      );
+      return;
     }
+
+    setState(() {
+      _loading = true;
+      _error = '';
+    });
+
+    int ok = 0;
+    int fail = 0;
+
+    try {
+      // Rebuild artifacts for the sessions currently shown in the list.
+      // (Fast, predictable. If you later want "all sessions", add paging.)
+      for (final row in _rows) {
+        final convId = (row['conversation_id'] ?? '').toString().trim();
+        if (convId.isEmpty) continue;
+
+        try {
+          await _client.functions.invoke(
+            'ai-brain',
+            body: {
+              'op': 'rebuild_conversation_artifacts',
+              'conversation_id': convId,
+              'end_session': true,
+              'message_text': '__END_SESSION__',
+            },
+          );
+          ok++;
+        } catch (_) {
+          fail++;
+        }
+      }
+    } finally {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+      });
+    }
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Rebuild complete. OK=$ok, failed=$fail. Refreshing…')),
+    );
+    await _load();
   }
+
+String _formatTs(dynamic ts) {
+  try {
+    final d = DateTime.parse(ts.toString()).toLocal();
+    return '${d.year.toString().padLeft(4, '0')}-'
+           '${d.month.toString().padLeft(2, '0')}-'
+           '${d.day.toString().padLeft(2, '0')} '
+           '${d.hour.toString().padLeft(2, '0')}:'
+           '${d.minute.toString().padLeft(2, '0')}';
+  } catch (_) {
+    return '';
+  }
+}
 
   @override
   Widget build(BuildContext context) {
@@ -1966,14 +2129,19 @@ class _SessionHistoryScreenState extends State<SessionHistoryScreen> {
       appBar: AppBar(
         title: const Text('Session history'),
         actions: [
+           IconButton(
+             tooltip: 'Refresh',
+             onPressed: _loading ? null : _load,
+             icon: const Icon(Icons.refresh),
+           ),
           IconButton(
-            tooltip: 'Refresh',
-            onPressed: _loading ? null : _load,
-            icon: const Icon(Icons.refresh),
+            tooltip: 'Rebuild session artifacts',
+            onPressed: _loading ? null : _rebuildSessions,
+            icon: const Icon(Icons.auto_fix_high),
           ),
-        ],
-      ),
-      body: _loading
+         ],
+       ),
+       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : _error.isNotEmpty
               ? Center(child: Padding(
@@ -1987,35 +2155,44 @@ class _SessionHistoryScreenState extends State<SessionHistoryScreen> {
                   itemBuilder: (context, i) {
                     final r = _rows[i];
                     final id = (r['id'] ?? '').toString();
-                    final date = _formatTs(r['created_at']);
-                    
-                    final si = parseJsonMap(r['session_insights']) ?? const <String, dynamic>{};
-                    final displayShort = pickSummaryFromSessionInsights(si, full: false);
-                    final fullS = pickSummaryFromSessionInsights(si, full: true);
-
-                    return Card(
-                      child: ListTile(
-                        title: Text(date.isEmpty ? 'Session' : date),
-                          subtitle: Text(displayShort.isEmpty ? '(no summary)' : displayShort, maxLines: 4, overflow: TextOverflow.ellipsis),
-                        onTap: () {
+                     final date = _formatTs(r['created_at']);
+                     
+                     final si = parseJsonMap(r['session_insights']) ?? const <String, dynamic>{};
+                     final fromInsights = pickSummaryFromSessionInsights(si, full: false).trim();
+                     final fromColumn = (r['short_summary'] ?? '').toString().trim();
+                     final displayShort = fromInsights.isNotEmpty ? fromInsights : fromColumn;
+                     final fullS = pickSummaryFromSessionInsights(si, full: true);
+ 
+                     return Card(
+                       child: ListTile(
+                         title: Text(date.isEmpty ? 'Session' : date),
+                         subtitle: Text(
+                           displayShort.isEmpty ? '(no summary)' : displayShort,
+                           maxLines: 4,
+                           overflow: TextOverflow.ellipsis,
+                         ),
+                        onTap: () async {
                           final sessionKey = (r['conversation_id'] ?? '').toString().trim();
-                          Navigator.of(context).push(
-                            MaterialPageRoute(
-                              builder: (_) => EndSessionReviewScreen(
-                                memorySummaryId: id,
-                                sessionKey: sessionKey.isEmpty ? id : sessionKey,
-                                dateLabel: date,
-                                fallbackTitle: 'Session',
-                                fallbackBody: displayShort,
-                                shortSummary: displayShort,
-                                fullSummary: fullS,
-                                sessionInsights: si,
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-                    );
+                          final changed = await Navigator.of(context).push<bool>(
+                             MaterialPageRoute(
+                               builder: (_) => EndSessionReviewScreen(
+                                 memorySummaryId: id,
+                                 sessionKey: sessionKey.isEmpty ? id : sessionKey,
+                                 dateLabel: date,
+                                 fallbackTitle: 'Session',
+                                 fallbackBody: displayShort,
+                                 shortSummary: displayShort,
+                                 fullSummary: fullS,
+                                 sessionInsights: si,
+                               ),
+                             ),
+                           );
+                          if (changed == true) {
+                            await _load();
+                          }
+                         },
+                       ),
+                     );
                   },
                 ),
     );
@@ -2050,9 +2227,65 @@ class _TranscriptScreenState extends State<TranscriptScreen> {
     _load();
   }
 
-  void _showSnack(String msg) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+   void _showSnack(String msg) {
+     if (!mounted) return;
+     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+   }
+ 
+  Future<void> _rebuildSessions() async {
+    final user = _client.auth.currentUser;
+    if (user == null) {
+      _showSnack('You must be logged in.');
+      return;
+    }
+
+    setState(() {
+      _loading = true;
+      _error = '';
+    });
+
+    try {
+      final rows = List<Map<String, dynamic>>.from(_rows);
+      if (rows.isEmpty) {
+        _showSnack('No sessions to rebuild.');
+        setState(() {
+          _loading = false;
+        });
+        return;
+      }
+
+      int ok = 0;
+      int fail = 0;
+      for (final row in rows) {
+        final convId = (row['conversation_id'] as String? ?? '').trim();
+        if (convId.isEmpty) continue;
+        try {
+          await _client.functions.invoke(
+            'ai-brain',
+            body: {
+              'op': 'rebuild_conversation_artifacts',
+              'conversation_id': convId,
+              'end_session': true,
+              'message_text': '__END_SESSION__',
+            },
+          );
+          ok++;
+        } catch (_) {
+          fail++;
+        }
+      }
+
+      if (!mounted) return;
+      _showSnack('Rebuild complete. OK=$ok, failed=$fail. Refreshing…');
+      await _load();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = 'Rebuild failed: $e';
+      });
+      _showSnack('Rebuild failed.');
+    }
   }
 
   Future<void> _load() async {
@@ -2094,8 +2327,8 @@ class _TranscriptScreenState extends State<TranscriptScreen> {
             .eq('id', widget.rawIdSeed!.trim())
             .maybeSingle();
 
-        final conv = (seedRes is Map<String, dynamic>)
-            ? (seedRes['conversation_id'] as String? ?? '').trim()
+        final conv = (seedRes is Map)
+            ? ((seedRes?['conversation_id'] ?? '')).toString().trim()
             : '';
 
         if (conv.isNotEmpty) {
@@ -2111,7 +2344,7 @@ class _TranscriptScreenState extends State<TranscriptScreen> {
 
 
       final list = (res as List<dynamic>? ?? <dynamic>[])
-          .map((e) => e as Map<String, dynamic>)
+          .map((e) => Map<String, dynamic>.from(e as Map))
           .toList();
 
       setState(() {
@@ -2234,7 +2467,187 @@ class EndSessionReviewScreen extends StatefulWidget {
 class _EndSessionReviewScreenState extends State<EndSessionReviewScreen> {
   final SupabaseClient _client = Supabase.instance.client;
   Future<List<Map<String, dynamic>>>? _longitudinalFuture;
-  
+
+  // Facts UI behavior
+  static const int _factsPreviewLimit = 4;
+  bool _showAllFacts = false;
+
+  // Phase B facts (fact_candidates): fetch + realtime subscription + polling fallback
+  bool _loadingFactCandidates = false;
+  String? _factsError;
+  List<Map<String, dynamic>> _factCandidates = const <Map<String, dynamic>>[];
+
+   StreamSubscription<List<Map<String, dynamic>>>? _factsSub;
+   Timer? _factsPollTimer;
+ 
+  // Lock/value state is stored in user_facts_receipts, not in fact_candidates.
+  final Map<String, bool> _lockByFactKey = <String, bool>{};
+  final Map<String, dynamic> _valueByFactKey = <String, dynamic>{};
+
+   Future<void> _fetchFactCandidates({bool silent = false}) async {
+     final uid = _client.auth.currentUser?.id;
+     if (uid == null || uid.isEmpty) return;
+    final convId = _effectiveConversationId();
+    if (convId.isEmpty) return;
+
+    if (!silent) {
+      setState(() {
+        _loadingFactCandidates = true;
+        _factsError = null;
+      });
+    }
+
+    try {
+      final res = await _client
+          .from('fact_candidates')
+          .select('id, fact_key_guess, fact_key_canonical, value_json, confidence, status, extracted_at')
+          .eq('user_id', uid)
+          .eq('conversation_id', convId)
+          .inFilter('status', ['captured', 'active', 'conflict'])
+          .order('extracted_at', ascending: true);
+
+      final rows = (res is List)
+          ? res.whereType<Map>().map((m) => Map<String, dynamic>.from(m)).toList()
+          : <Map<String, dynamic>>[];
+
+       if (!mounted) return;
+       setState(() {
+         _factCandidates = rows;
+         _factsError = null;
+       });
+
+      // Refresh lock/value overlays for the fact keys we just loaded.
+      await _refreshReceiptsForFactKeys(
+        rows.map((r) => ((r['fact_key_canonical'] ?? '') as String?)?.trim().isNotEmpty == true
+            ? (r['fact_key_canonical'] as String).trim()
+            : (r['fact_key_guess'] ?? '').toString().trim()).where((k) => k.isNotEmpty).toList(),
+      );
+     } catch (e) {
+       if (!mounted) return;
+       setState(() {
+         _factsError = 'Failed to load extracted facts: $e';
+       });
+    } finally {
+      if (!mounted) return;
+      setState(() {
+        _loadingFactCandidates = false;
+      });
+    }
+  }
+
+  Future<void> _refreshReceiptsForFactKeys(List<String> keys) async {
+    final uid = _client.auth.currentUser?.id;
+    if (uid == null || uid.isEmpty) return;
+    if (keys.isEmpty) return;
+
+    // Supabase has practical limits on IN lists; keep it reasonable.
+    final unique = keys.toSet().toList();
+    if (unique.isEmpty) return;
+
+    try {
+      final res = await _client
+          .from('user_facts_receipts')
+          .select('fact_key,is_locked,value_json')
+          .eq('user_id', uid)
+          .inFilter('fact_key', unique);
+
+      final rows = (res is List)
+          ? res.whereType<Map>().map((m) => Map<String, dynamic>.from(m)).toList()
+          : <Map<String, dynamic>>[];
+
+      if (!mounted) return;
+      setState(() {
+        for (final r in rows) {
+          final k = (r['fact_key'] ?? '').toString().trim();
+          if (k.isEmpty) continue;
+          _lockByFactKey[k] = (r['is_locked'] == true);
+          // Keep the canonical value so edits/locks reflect instantly in UI.
+          if (r.containsKey('value_json')) {
+            _valueByFactKey[k] = r['value_json'];
+          }
+        }
+      });
+    } catch (_) {
+      // Non-fatal: UI can still render candidates; lock overlay just won’t show.
+    }
+  }
+
+  void _stopFactsPipeline() {
+    _factsSub?.cancel();
+    _factsSub = null;
+    _factsPollTimer?.cancel();
+    _factsPollTimer = null;
+  }
+
+void _startFactsRealtime(String conversationId) {
+  _factsSub?.cancel();
+  _factsSub = null;
+
+  final uid = _client.auth.currentUser?.id;
+  if (uid == null || uid.isEmpty) return;
+
+  _factsSub = _client
+      .from('fact_candidates')
+      .stream(primaryKey: ['id'])
+      .listen((rows) {
+        if (!mounted) return;
+
+        final filtered = rows
+            .where((row) =>
+                row['user_id'] == uid &&
+                row['conversation_id'] == conversationId &&
+                ['captured', 'active', 'conflict']
+                    .contains(row['status']))
+            .map((m) => Map<String, dynamic>.from(m))
+            .toList();
+
+        setState(() {
+          _factCandidates = filtered;
+        });
+
+        // When candidates change, refresh receipt overlays too (lock/value).
+        final keys = filtered.map((r) {
+          final canonical = (r['fact_key_canonical'] ?? '').toString().trim();
+          final guess = (r['fact_key_guess'] ?? '').toString().trim();
+          final factKey = canonical.isNotEmpty ? canonical : guess;
+          return factKey.trim();
+        }).where((k) => k.isNotEmpty).toList();
+        _refreshReceiptsForFactKeys(keys);
+      });
+}
+
+  void _startFactsPollingFallback() {
+    _factsPollTimer?.cancel();
+    _factsPollTimer = null;
+
+    int ticks = 0;
+    _factsPollTimer = Timer.periodic(const Duration(seconds: 2), (t) async {
+      ticks++;
+      await _fetchFactCandidates(silent: true);
+      if (!mounted) {
+        t.cancel();
+        return;
+      }
+      if (_factCandidates.isNotEmpty || ticks >= 8) {
+        t.cancel();
+      }
+    });
+  }
+
+  void _initFactsPipeline() {
+    final convId = _effectiveConversationId();
+    if (convId.isEmpty) return;
+
+    _fetchFactCandidates();
+    _startFactsRealtime(convId);
+    _startFactsPollingFallback();
+  }
+
+   // Story recall rows associated with this session (lock/unlock + edits).
+   bool _loadingStoryRecall = false;
+   List<Map<String, dynamic>> _storyRecallRows = const <Map<String, dynamic>>[];
+   bool _didMutate = false;
+
   String get whatCapturedText {
     final ins = _effectiveInsights();
     final short = pickSummaryFromSessionInsights(ins, full: false).trim();
@@ -2244,7 +2657,7 @@ class _EndSessionReviewScreenState extends State<EndSessionReviewScreen> {
     if (candidate.isEmpty) return '—';
 
     // UI normalization only (do NOT compute alternative truth).
-    return normalizeSummaryVoice(candidate);
+    return _secondPersonifySummary(normalizeSummaryVoice(candidate));
   }
 
   /// Light UI-only normalization for summary text (presentation only).
@@ -2257,8 +2670,6 @@ class _EndSessionReviewScreenState extends State<EndSessionReviewScreen> {
     t = t.replaceAll(RegExp(r'^[\-•\u2022]+\s*'), '');
     return t;
   }
-
-
 
   Future<void> _editStoryText() async {
     // Ensure we have something to edit (prefer current displayed story text)
@@ -2332,6 +2743,52 @@ class _EndSessionReviewScreenState extends State<EndSessionReviewScreen> {
     }
   }
 
+  Future<void> _rebuildFromEdits() async {
+    final user = _client.auth.currentUser;
+    if (user == null) {
+      _showSnack('You must be logged in.');
+      return;
+    }
+
+    final convId = _effectiveConversationId();
+    if (convId.isEmpty) {
+      _showSnack('Missing conversation id for this session.');
+      return;
+    }
+
+    setState(() {
+      _loading = true;
+      _error = '';
+    });
+
+    try {
+      await _client.functions.invoke(
+        'ai-brain',
+        body: {
+          'op': 'rebuild_conversation_artifacts',
+          'conversation_id': convId,
+          'end_session': true,
+          'message_text': '__END_SESSION__',
+        },
+      );
+
+      if (!mounted) return;
+      _showSnack('Rebuild requested.');
+      _didMutate = true;
+      await _load();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = 'Failed to rebuild session summary: $e';
+      });
+    } finally {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+      });
+    }
+  }
+
   Future<void> _saveCuratedStory() async {
     final user = _client.auth.currentUser;
     if (user == null) return;
@@ -2353,15 +2810,21 @@ class _EndSessionReviewScreenState extends State<EndSessionReviewScreen> {
           : widget.shortSummary;
       final shortCandidate = trimmed.length <= 500 ? trimmed : existingShort;
 
-      // Canonical truth lives in session_insights (and curated lives in memory_curated).
-      // Do NOT touch memory_summary.full_summary here.
+       // Canonical truth lives in session_insights (and curated lives in memory_curated).
+       // Do NOT touch memory_summary.full_summary here.
+      final base = <String, dynamic>{..._effectiveInsights()};
+      // Preserve Session Review v1 fields if present (avoid clobbering backend).
       final mergedSI = <String, dynamic>{
-        ..._effectiveInsights(),
+        ...base,
         // Keep short_summary mirrored for list UIs.
         'short_summary': shortCandidate,
         // Store curated text in session_insights for easy downstream access.
         'curated_story': trimmed,
         'curated_at': DateTime.now().toUtc().toIso8601String(),
+        // Explicitly re-preserve if base contains them.
+        if (base.containsKey('common_thread')) 'common_thread': base['common_thread'],
+        if (base.containsKey('memory_candidates')) 'memory_candidates': base['memory_candidates'],
+        if (base.containsKey('version')) 'version': base['version'],
       };
 
       await _client
@@ -2410,6 +2873,551 @@ class _EndSessionReviewScreenState extends State<EndSessionReviewScreen> {
     }
   }
 
+   // ============================================================================
+   // FACTS REVIEW (End-of-session): display + edit + lock persisted user_facts_receipts
+   // ============================================================================
+ 
+    List<Map<String, dynamic>> _factsReviewItems() {
+     // Phase B (preferred): fact_candidates table scoped to THIS conversation.
+      if (_factCandidates.isNotEmpty) {
+        return _factCandidates.map((row) {
+          final canonical = (row['fact_key_canonical'] ?? '').toString().trim();
+          final guess = (row['fact_key_guess'] ?? '').toString().trim();
+          final factKey = canonical.isNotEmpty ? canonical : guess;
+  
+         final locked = _lockByFactKey[factKey] == true;
+         final canonicalValue = _valueByFactKey.containsKey(factKey) ? _valueByFactKey[factKey] : row['value_json'];
+
+          return <String, dynamic>{
+            'fact_key': factKey,
+            'fact_key_guess': guess,
+           'value_json': canonicalValue,
+            'confidence': row['confidence'],
+            'status': (row['status'] ?? '').toString().trim(),
+           'is_locked': locked,
+            'note': (canonical.isEmpty && guess.isNotEmpty) ? 'Uncanonicalized key (guess)' : '',
+          };
+        }).toList();
+      }
+
+    // Phase A (fallback): facts_review embedded in session_insights.
+    // WARNING: This may include non-session-scoped facts depending on server behavior.
+    final ins = _effectiveInsights();
+    final fr = ins['facts_review'];
+    if (fr is Map) {
+      final items = fr['items'];
+      if (items is List) {
+        final out = items.whereType<Map>().map((m) => Map<String, dynamic>.from(m)).toList();
+        if (out.isNotEmpty) return out;
+      }
+    }
+     return const <Map<String, dynamic>>[];
+   }
+
+  String _formatValueJson(dynamic v) {
+    if (v == null) return 'null';
+    if (v is String) return v;
+    try {
+      return jsonEncode(v);
+    } catch (_) {
+      return v.toString();
+    }
+  }
+
+  dynamic _parseValueJsonFromText(String raw) {
+    final t = raw.trim();
+    if (t.isEmpty) return '';
+    // Try JSON first (object/array/number/bool/null or quoted string).
+    try {
+      return jsonDecode(t);
+    } catch (_) {
+      // Fallback: treat as plain string.
+      return t;
+    }
+  }
+
+  Future<void> _persistUserFactEdit({
+    required String factKey,
+    required dynamic valueJson,
+    required bool isLocked,
+  }) async {
+    final user = _client.auth.currentUser;
+    if (user == null) return;
+
+    setState(() {
+      _loading = true;
+      _error = '';
+    });
+
+     try {
+      await _client.from('user_facts_receipts').upsert({
+        'user_id': user.id,
+        'fact_key': factKey,
+        'value_json': valueJson,
+        'is_locked': isLocked,
+        'updated_at': DateTime.now().toIso8601String(),
+      }, onConflict: 'user_id,fact_key');
+
+      // Update local overlays so Phase B-backed UI updates immediately.
+      _lockByFactKey[factKey] = isLocked;
+      _valueByFactKey[factKey] = valueJson;
+
+      // Update local session_insights facts_review so UI reflects immediately.
+      final current = _row;
+      if (current != null) {
+        final si = current['session_insights'];
+        if (si is Map) {
+          final fr = (si['facts_review'] is Map) ? (si['facts_review'] as Map) : null;
+          final items = (fr != null && fr['items'] is List) ? (fr['items'] as List) : null;
+          if (items != null) {
+            for (var i = 0; i < items.length; i++) {
+              final it = items[i];
+              if (it is Map && (it['fact_key'] ?? '').toString().trim() == factKey) {
+                it['value_json'] = valueJson;
+                it['is_locked'] = isLocked;
+              }
+            }
+          }
+        }
+      }
+
+      setState(() {});
+    } catch (e) {
+      setState(() {
+        _error = 'Failed to save fact edit: $e';
+      });
+    } finally {
+      setState(() {
+        _loading = false;
+      });
+     }
+   }
+ 
+  String _friendlyFactStatus(String raw) {
+    final s = raw.trim().toLowerCase();
+    if (s.isEmpty) return '';
+    if (s == 'conflict') return 'Needs review';
+    // Hide internal pipeline labels.
+    if (s == 'captured' || s == 'active' || s == 'canonicalized' || s == 'promoted') return '';
+    return '';
+  }
+
+  String _synthesisSentence(String summaryText) {
+    final t = summaryText.trim();
+    if (t.isEmpty) return '';
+    final items = _factsReviewItems();
+
+    bool hasKey(String needle) {
+      final n = needle.toLowerCase();
+      for (final m in items) {
+        final k = (m['fact_key'] ?? '').toString().toLowerCase();
+        if (k.contains(n)) return true;
+      }
+      return false;
+    }
+
+    // Bias toward the Legacy mission when we see relevant facts.
+    if (hasKey('legacy_app') || t.toLowerCase().contains('legacy app')) {
+      if (hasKey('ordinary_people') || t.toLowerCase().contains('ordinary people')) {
+        return 'This session reinforces your mission to preserve ordinary lives and help future generations stay connected to loved ones.';
+      }
+      return 'This session reinforces your mission to preserve stories and pass forward your values through a digital legacy.';
+    }
+
+    // Fallback: distill the first sentence into a single takeaway.
+    final idx = t.indexOf(RegExp(r'[.!?]'));
+    final first = (idx >= 0) ? t.substring(0, idx + 1).trim() : t;
+    if (first.isEmpty) return '';
+    return 'Takeaway: $first';
+  }
+
+  Future<void> _lockAllFacts() async {
+    final user = _client.auth.currentUser;
+    if (user == null) return;
+
+     final items = _factsReviewItems();
+     final now = DateTime.now().toIso8601String();
+ 
+    // De-dupe by fact_key so a single batch upsert does not include duplicate
+    // constrained values (user_id,fact_key), which Postgres rejects (code 21000).
+    final byKey = <String, Map<String, dynamic>>{};
+     for (final m in items) {
+       final key = (m['fact_key'] ?? '').toString().trim();
+       if (key.isEmpty) continue;
+ 
+       final status = (m['status'] ?? '').toString().trim().toLowerCase();
+       // Don't auto-lock items that still need review.
+       if (status == 'conflict') continue;
+ 
+       final valueJson = _valueByFactKey.containsKey(key)
+           ? _valueByFactKey[key]
+           : (m.containsKey('value_json') ? m['value_json'] : null);
+ 
+      // Last write wins for duplicates (same fact_key).
+      byKey[key] = {
+         'user_id': user.id,
+         'fact_key': key,
+         'value_json': valueJson,
+         'is_locked': true,
+         'updated_at': now,
+      };
+     }
+ 
+    final rows = byKey.values.toList();
+     if (rows.isEmpty) {
+       _showSnack('Nothing to lock.');
+       return;
+     }
+
+    setState(() {
+      _loading = true;
+      _error = '';
+    });
+
+    try {
+      await _client.from('user_facts_receipts').upsert(rows, onConflict: 'user_id,fact_key');
+
+      if (!mounted) return;
+      setState(() {
+        for (final r in rows) {
+          final k = (r['fact_key'] ?? '').toString();
+          _lockByFactKey[k] = true;
+          _valueByFactKey[k] = r['value_json'];
+        }
+      });
+
+      // Best-effort refresh session candidates so UI reflects "locked" state immediately.
+      await _fetchFactCandidates(silent: true);
+
+      if (!mounted) return;
+      _showSnack('Locked ${rows.length} facts.');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = 'Failed to lock facts: $e';
+      });
+    } finally {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+      });
+    }
+  }
+
+   Future<void> _editFactDialog(Map<String, dynamic> item) async {
+     final factKey = (item['fact_key'] ?? '').toString().trim();
+     if (factKey.isEmpty) return;
+
+    final currentValue = item.containsKey('value_json') ? item['value_json'] : null;
+    final controller = TextEditingController(text: _formatValueJson(currentValue));
+    bool lock = (item['is_locked'] == true);
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          title: const Text('Edit fact'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(factKey, style: Theme.of(ctx).textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600)),
+              const SizedBox(height: 10),
+              TextField(
+                controller: controller,
+                minLines: 1,
+                maxLines: 6,
+                decoration: const InputDecoration(
+                  labelText: 'Value (JSON or plain text)',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Checkbox(
+                    value: lock,
+                    onChanged: (v) {
+                      lock = (v == true);
+                      // Force rebuild of dialog.
+                      (ctx as Element).markNeedsBuild();
+                    },
+                  ),
+                  const Expanded(child: Text('Lock this fact (prevents future overwrites)')),
+                ],
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+            ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Save')),
+          ],
+        );
+      },
+    );
+
+    if (ok != true) return;
+    final parsed = _parseValueJsonFromText(controller.text);
+    await _persistUserFactEdit(factKey: factKey, valueJson: parsed, isLocked: lock);
+  }
+
+   Widget _buildFactsReviewSection(BuildContext context) {
+     final theme = Theme.of(context);
+     final items = _factsReviewItems();
+ 
+    bool _isBoilerplateKey(String k) {
+      final key = k.toLowerCase();
+      // Adjust this list as your canonical keys stabilize.
+      const blockedPrefixes = <String>[
+        'user.', 'profile.', 'personal.', 'identity.',
+        'name', 'full_name', 'first_name', 'last_name',
+        'age', 'birthday', 'birth_date',
+        'gender',
+        'location', 'country', 'city', 'timezone',
+        'language', 'preferred_locale', 'target_locale',
+        'job', 'employer', 'education',
+        'marital', 'relationship_status',
+      ];
+      for (final p in blockedPrefixes) {
+        if (key == p || key.startsWith('$p.') || key.contains(p)) return true;
+      }
+      return false;
+    }
+
+    double _signalScore(Map<String, dynamic> m) {
+      final conf = (m['confidence'] is num) ? (m['confidence'] as num).toDouble() : 0.0;
+      final locked = (m['is_locked'] == true);
+      final status = (m['status'] ?? '').toString().trim().toLowerCase();
+      final key = (m['fact_key'] ?? '').toString().trim();
+
+      // Start with confidence.
+      double s = conf;
+
+      // Prefer "this session produced something meaningful" (captured/active).
+      if (status == 'conflict') s -= 0.25;
+      if (status == 'captured' || status == 'active') s += 0.10;
+
+      // Locked facts are not "attention proof"—they’re already curated.
+      if (locked) s -= 0.35;
+
+      // Profile boilerplate doesn’t prove attention; it proves identity memory.
+      if (_isBoilerplateKey(key)) s -= 0.60;
+
+      return s;
+    }
+
+    // De-dupe by coarse key prefix to avoid showing 4 variants of the same thing.
+    String _bucketKey(String k) {
+      final key = k.toLowerCase();
+      final dot = key.indexOf('.');
+      if (dot > 0) return key.substring(0, dot);
+      return key;
+    }
+
+     // Defensive UI: do not present conflict candidates as "extracted facts".
+    final keptItemsAll = items.where((m) {
+       final s = (m['status'] ?? '').toString().trim().toLowerCase();
+       return s != 'conflict';
+     }).toList();
+     final conflictItems = items.where((m) {
+       final s = (m['status'] ?? '').toString().trim().toLowerCase();
+       return s == 'conflict';
+     }).toList();
+ 
+    // Compute "signal" set: highest score first, then bucket-dedupe.
+    final scored = [...keptItemsAll];
+    scored.sort((a, b) => _signalScore(b).compareTo(_signalScore(a)));
+
+    final seenBuckets = <String>{};
+    final signal = <Map<String, dynamic>>[];
+    for (final m in scored) {
+      final key = (m['fact_key'] ?? '').toString().trim();
+      if (key.isEmpty) continue;
+      final bucket = _bucketKey(key);
+      if (seenBuckets.contains(bucket)) continue;
+      // Skip truly low-signal items.
+      if (_signalScore(m) < 0.20) continue;
+      seenBuckets.add(bucket);
+      signal.add(m);
+      if (signal.length >= _factsPreviewLimit) break;
+    }
+
+    final keptItems = _showAllFacts ? keptItemsAll : signal;
+ 
+     return Column(
+       crossAxisAlignment: CrossAxisAlignment.start,
+       children: [
+         Text('Facts extracted', style: theme.textTheme.titleSmall),
+         const SizedBox(height: 6),
+         Text(
+          'A few highlights that show the app was paying attention. You can edit and lock anything important.',
+           style: theme.textTheme.bodySmall?.copyWith(color: Colors.black54),
+         ),
+         const SizedBox(height: 10),
+        if (_factsError != null && _factsError!.trim().isNotEmpty) ...[
+          Text(_factsError!, style: theme.textTheme.bodySmall?.copyWith(color: Colors.red)),
+          const SizedBox(height: 10),
+        ],
+        if (_loadingFactCandidates && keptItems.isEmpty && conflictItems.isEmpty) ...[
+          Row(
+            children: [
+              const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+              const SizedBox(width: 10),
+              Expanded(child: Text('Extracting facts…', style: theme.textTheme.bodySmall?.copyWith(color: Colors.black54))),
+            ],
+          ),
+          const SizedBox(height: 10),
+        ],
+         if (keptItems.isEmpty)
+           const Text(
+             'No new long-term facts were extracted from this session. (That can be normal when the conversation is mostly reflective or exploratory.)',
+           )
+         else
+         if (keptItemsAll.length > _factsPreviewLimit) ...[
+           Row(
+             children: [
+               TextButton(
+                 onPressed: () {
+                   setState(() {
+                     _showAllFacts = !_showAllFacts;
+                   });
+                 },
+                 child: Text(
+                   _showAllFacts ? 'Show fewer highlights' : 'Show all (${keptItemsAll.length})',
+                 ),
+               ),
+               const Spacer(),
+               OutlinedButton.icon(
+                 onPressed: _loading ? null : () => _lockAllFacts(),
+                 icon: const Icon(Icons.lock, size: 18),
+                 label: const Text('Lock all'),
+               ),
+             ],
+           ),
+             const SizedBox(height: 6),
+           ],
+           ...keptItems.map((m) {
+             final key = (m['fact_key'] ?? '').toString().trim();
+             final v = m.containsKey('value_json') ? m['value_json'] : null;
+             final locked = (m['is_locked'] == true);
+             final statusRaw = (m['status'] ?? '').toString().trim();
+             final status = _friendlyFactStatus(statusRaw);
+             final note = (m['note'] ?? '').toString().trim();
+ 
+             return Container(
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.black12),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          key.isEmpty ? '(missing fact_key)' : key,
+                          style: theme.textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600),
+                        ),
+                      ),
+                      if (locked)
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: Colors.black12,
+                            borderRadius: BorderRadius.circular(999),
+                          ),
+                          child: Text('Locked', style: theme.textTheme.bodySmall),
+                        ),
+                    ],
+                   ),
+                   const SizedBox(height: 6),
+                   Text(_formatValueJson(v), style: theme.textTheme.bodySmall),
+                   const SizedBox(height: 6),
+                  if (status.isNotEmpty) ...[
+                    Text(status, style: theme.textTheme.bodySmall?.copyWith(color: Colors.black54)),
+                    const SizedBox(height: 6),
+                  ],
+                   if (note.isNotEmpty) ...[
+                     const SizedBox(height: 4),
+                     Text(note, style: theme.textTheme.bodySmall?.copyWith(color: Colors.black54)),
+                   ],
+                   const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 10,
+                    runSpacing: 8,
+                    children: [
+                      OutlinedButton.icon(
+                        onPressed: _loading ? null : () => _editFactDialog(m),
+                        icon: const Icon(Icons.edit, size: 18),
+                        label: const Text('Edit'),
+                      ),
+                      OutlinedButton.icon(
+                        onPressed: _loading
+                            ? null
+                            : () => _persistUserFactEdit(
+                                  factKey: key,
+                                  valueJson: v,
+                                  isLocked: !locked,
+                                ),
+                        icon: const Icon(Icons.lock, size: 18),
+                        label: Text(locked ? 'Unlock' : 'Lock'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            );
+          }),
+
+        if (conflictItems.isNotEmpty) ...[
+          const SizedBox(height: 16),
+          Text('Conflicts detected', style: theme.textTheme.titleSmall),
+          const SizedBox(height: 6),
+          Text(
+            'These items conflicted with an existing saved fact, so they were NOT accepted.',
+            style: theme.textTheme.bodySmall?.copyWith(color: Colors.black54),
+          ),
+          const SizedBox(height: 10),
+           ...conflictItems.map((m) {
+            final key = (m['fact_key'] ?? m['fact_key_guess'] ?? '').toString().trim();
+            final v = m.containsKey('value_json') ? m['value_json'] : null;
+            final status = (m['status'] ?? '').toString().trim();
+            final note = (m['note'] ?? '').toString().trim();
+
+            return Container(
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.black12),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    key.isEmpty ? '(missing fact_key)' : key,
+                    style: theme.textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(_formatValueJson(v), style: theme.textTheme.bodySmall),
+                  const SizedBox(height: 6),
+                  if (status.isNotEmpty)
+                    Text(status, style: theme.textTheme.bodySmall?.copyWith(color: Colors.black54)),
+                  if (note.isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(note, style: theme.textTheme.bodySmall?.copyWith(color: Colors.black54)),
+                  ],
+                ],
+              ),
+            );
+          }),
+        ],
+      ],
+    );
+  }
 
   bool _loading = false;
   String _error = '';
@@ -2419,8 +3427,158 @@ class _EndSessionReviewScreenState extends State<EndSessionReviewScreen> {
   @override
   void initState() {
     super.initState();
-    _longitudinalFuture = _fetchLongitudinalInsights();
-    _load();
+    _load().whenComplete(() {
+      if (!mounted) return;
+      _initFactsPipeline();
+    });
+   }
+ 
+  @override
+  void dispose() {
+    _stopFactsPipeline();
+    super.dispose();
+  }
+
+  String _effectiveConversationId() {
+    final fromDb = (_row?['conversation_id'] ?? '').toString().trim();
+    if (fromDb.isNotEmpty) return fromDb;
+    return widget.sessionKey.trim();
+  }
+
+  Future<void> _loadStoryRecallForSession() async {
+    final uid = _client.auth.currentUser?.id;
+    if (uid == null || uid.isEmpty) return;
+    final convId = _effectiveConversationId();
+    if (convId.isEmpty) return;
+
+    setState(() {
+      _loadingStoryRecall = true;
+    });
+
+    try {
+      final res = await _client
+          .from('story_recall')
+          .select('id, title, synopsis, story_seed_id, updated_at, is_locked, conversation_id')
+          .eq('user_id', uid)
+          .eq('conversation_id', convId)
+          .order('updated_at', ascending: false);
+
+      final rows = (res is List)
+          ? res.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList()
+          : <Map<String, dynamic>>[];
+
+      if (!mounted) return;
+      setState(() {
+        _storyRecallRows = rows;
+      });
+    } catch (e) {
+      // Non-fatal: the screen should still work even if story_recall isn't available.
+      if (!mounted) return;
+      setState(() {
+        _error = (_error.isNotEmpty ? '$_error\n' : '') + 'Failed to load session stories: $e';
+      });
+    } finally {
+      if (!mounted) return;
+      setState(() {
+        _loadingStoryRecall = false;
+      });
+    }
+  }
+
+  void _showSnack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Future<void> _toggleStoryRecallLock(String id, bool isLocked) async {
+    final uid = _client.auth.currentUser?.id;
+    if (uid == null || uid.isEmpty) return;
+    setState(() {
+      _loading = true;
+      _error = '';
+    });
+
+    try {
+      await _client
+          .from('story_recall')
+          .update({'is_locked': !isLocked, 'updated_at': DateTime.now().toUtc().toIso8601String()})
+          .eq('id', id)
+          .eq('user_id', uid);
+
+      // Refresh local list.
+      await _loadStoryRecallForSession();
+    } catch (e) {
+      setState(() {
+        _error = 'Failed to update story lock: $e';
+      });
+    } finally {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _editStoryRecallTitle(Map<String, dynamic> row) async {
+    final uid = _client.auth.currentUser?.id;
+    if (uid == null || uid.isEmpty) return;
+
+    final id = (row['id'] ?? '').toString().trim();
+    if (id.isEmpty) return;
+    final locked = (row['is_locked'] == true);
+    if (locked) {
+      _showSnack('This story is locked. Unlock it to edit the title.');
+      return;
+    }
+
+    final current = (row['title'] ?? '').toString();
+    final controller = TextEditingController(text: current);
+
+    final nextTitle = await showDialog<String>(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          title: const Text('Rename story'),
+          content: TextField(
+            controller: controller,
+            decoration: const InputDecoration(
+              labelText: 'Title',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, null), child: const Text('Cancel')),
+            ElevatedButton(onPressed: () => Navigator.pop(ctx, controller.text), child: const Text('Rename')),
+          ],
+        );
+      },
+    );
+
+    final trimmed = (nextTitle ?? '').trim();
+    if (trimmed.isEmpty || trimmed == current.trim()) return;
+
+    setState(() {
+      _loading = true;
+      _error = '';
+    });
+
+    try {
+      await _client
+          .from('story_recall')
+          .update({'title': trimmed, 'updated_at': DateTime.now().toUtc().toIso8601String()})
+          .eq('id', id)
+          .eq('user_id', uid);
+      await _loadStoryRecallForSession();
+    } catch (e) {
+      setState(() {
+        _error = 'Failed to update story title: $e';
+      });
+    } finally {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+      });
+    }
   }
 
   Future<void> _load() async {
@@ -2445,19 +3603,53 @@ class _EndSessionReviewScreenState extends State<EndSessionReviewScreen> {
 
       if (res is List && res.isNotEmpty) {
         _row = Map<String, dynamic>.from(res.first as Map);
-      } else {
-        _error = 'Session summary not found yet.';
-      }
+
+        // --- Critical fix for rebuild-from-edits ---
+        // If memory_summary.conversation_id is missing, fall back to memory_raw.conversation_id via raw_id.
+        // Otherwise, callers will (incorrectly) use the memory_summary UUID as the conversation_id,
+        // which causes rebuild-summaries-v2 to summarize the wrong session and keep placeholders.
+        final existingConv = (_row?['conversation_id'] ?? '').toString().trim();
+        final rawId = (_row?['raw_id'] ?? '').toString().trim();
+        final uid = _client.auth.currentUser?.id ?? '';
+        if (existingConv.isEmpty && rawId.isNotEmpty && uid.isNotEmpty) {
+          try {
+            final rawRes = await _client
+                .from('memory_raw')
+                .select('conversation_id')
+                .eq('user_id', uid)
+                .eq('id', rawId)
+                .maybeSingle();
+
+            final rawMap = rawRes as Map<String, dynamic>?;
+            final conv = (rawMap?['conversation_id'] ?? '').toString().trim();
+
+            if (conv.isNotEmpty) {
+              _row = { ...?_row, 'conversation_id': conv };
+              // Best-effort persist so future loads/rebuilds are stable.
+              try {
+                await _client
+                    .from('memory_summary')
+                    .update({'conversation_id': conv})
+                    .eq('id', id);
+              } catch (_) {}
+            }
+          } catch (_) {}
+        }
+
+        // Load story_recall rows for this session (lock/unlock + quick edits).
+        // (BURNED DOWN) Session stories are no longer loaded for end-session review.
+       } else {
+         _error = 'Session summary not found yet.';
+       }
     } catch (e) {
       _error = 'Failed to load session review: $e';
-    } finally {
-      if (!mounted) return;
-      setState(() {
-      _loading = false;
-      _longitudinalFuture = _fetchLongitudinalInsights();
-    });
-}
-  }
+     } finally {
+       if (!mounted) return;
+       setState(() {
+        _loading = false;
+      });
+     }
+   }
 
   Future<List<Map<String, dynamic>>> _fetchLongitudinalInsights() async {
     final uid = _client.auth.currentUser?.id;
@@ -2475,14 +3667,14 @@ class _EndSessionReviewScreenState extends State<EndSessionReviewScreen> {
     return <Map<String, dynamic>>[];
   }
 
-
-
-  Map<String, dynamic> _effectiveInsights() {
-    final fromDb = _row?['session_insights'];
-    if (fromDb is Map) return Map<String, dynamic>.from(fromDb as Map);
-    return widget.sessionInsights;
-  }
-
+   Map<String, dynamic> _effectiveInsights() {
+     final fromDb = _row?['session_insights'];
+     if (fromDb is Map) return Map<String, dynamic>.from(fromDb as Map);
+    // Supabase can return json/jsonb as String; parse it if so.
+    final parsed = parseJsonMap(fromDb);
+    if (parsed != null) return parsed;
+     return widget.sessionInsights;
+   }
   
   String _effectiveShortSummary() {
     final ins = _effectiveInsights();
@@ -2838,149 +4030,80 @@ Map<String, dynamic>? _reframed() {
   }
 
 
-  @override
-  Widget build(BuildContext context) {
-    final reframed = _reframed();
-    final shortSummary = _effectiveShortSummary();
-    final fullSummary = _effectiveFullSummary();
+   @override
+   Widget build(BuildContext context) {
+     final shortSummary = _effectiveShortSummary();
+     final fullSummary = _effectiveFullSummary();
+  
+    final String summaryText = (shortSummary.trim().isNotEmpty)
+        ? shortSummary
+        : (fullSummary.trim().isNotEmpty)
+            ? fullSummary
+            : '';
+  
+     return WillPopScope(
+       onWillPop: () async {
+         Navigator.of(context).pop(_didMutate);
+         return false;
+       },
+       child: Scaffold(
+         appBar: AppBar(
+           title: const Text('End of session'),
+           actions: [
+             IconButton(
+               tooltip: 'Refresh',
+               icon: const Icon(Icons.refresh),
+               onPressed: _loading ? null : _load,
+             ),
+              IconButton(
+                tooltip: 'Rebuild summary',
+                icon: const Icon(Icons.auto_fix_high),
+                onPressed: _loading ? null : _rebuildFromEdits,
+              ),
+           ],
+         ),
 
-    final reflections = _stringList(reframed?['reflections']);
-    final rare = _stringList(reframed?['rare_insights']);
-
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('End of session'),
-        actions: [
-          IconButton(
-            tooltip: 'Refresh',
-            icon: const Icon(Icons.refresh),
-            onPressed: _loading ? null : _load,
-          ),
-        ],
-      ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : SingleChildScrollView(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
+        body: _loading
+           ? const Center(child: CircularProgressIndicator())
+           : SingleChildScrollView(
+               padding: const EdgeInsets.all(16),
+               child: Column(
+                 crossAxisAlignment: CrossAxisAlignment.stretch,
+                 children: [
                   if (_error.isNotEmpty)
                     Padding(
                       padding: const EdgeInsets.only(bottom: 12),
                       child: Text(_error, style: const TextStyle(color: Colors.red)),
                     ),
 
-                  // Session Review header
-                  Text('Session Review', style: Theme.of(context).textTheme.titleMedium),
-                  const SizedBox(height: 8),
-
-                  // What you captured
-                  Text('Your story for this session', style: Theme.of(context).textTheme.titleSmall),
-                  const SizedBox(height: 8),
-                  Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      border: Border.all(color: Colors.black12),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Text(whatCapturedText),
-                  ),
-                  const SizedBox(height: 10),
-                  Wrap(
-                    spacing: 10,
-                    runSpacing: 8,
-                    children: [
-                      OutlinedButton.icon(
-                        onPressed: _loading ? null : _editStoryText,
-                        icon: const Icon(Icons.edit),
-                        label: const Text('Edit'),
+                   // Session Review header
+                   Text('Session Review', style: Theme.of(context).textTheme.titleMedium),
+                   const SizedBox(height: 8),
+ 
+                  // Clean, fast-to-scan summary (reframed/short/full; whichever exists)
+                  Text('Session summary', style: Theme.of(context).textTheme.titleSmall),
+                   const SizedBox(height: 8),
+                   Container(
+                     padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        border: Border.all(color: Colors.black12),
+                        borderRadius: BorderRadius.circular(8),
                       ),
-                      ElevatedButton.icon(
-                        onPressed: _loading ? null : _saveCuratedStory,
-                        icon: const Icon(Icons.save),
-                        label: const Text('Save curated story'),
-                      ),
-                    ],
+                    child: Text(summaryText),
                   ),
-                  const SizedBox(height: 16),
-                  Align(
-                    alignment: Alignment.centerLeft,
-                    child: OutlinedButton.icon(
-                      onPressed: () {
-                        final convId = (_row?['conversation_id'] ?? '').toString().trim();
-                        final effectiveSessionKey = convId.isNotEmpty ? convId : widget.sessionKey;
-                        final rawIdSeed = (_row?['raw_id'] ?? '').toString().trim();
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            builder: (_) => TranscriptScreen(
-                              sessionKey: effectiveSessionKey,
-                              dateLabel: widget.dateLabel,
-                              rawIdSeed: rawIdSeed,
-                            ),
-                          ),
-                        );
-                      },
-                      icon: const Icon(Icons.subject),
-                      label: const Text('Transcript'),
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-
-                  _buildLongitudinalSnapshotSection(context),
-                  const SizedBox(height: 16),
-
-                  // Reframed insights (only show sections that exist; avoid forcing)
-                  if (reflections.isNotEmpty) ...[
-                  Text('Reflections', style: Theme.of(context).textTheme.titleSmall),
-                  const SizedBox(height: 8),
-                  _bulletList(reflections),
-                  const SizedBox(height: 16),
-                ],
-                if (rare.isNotEmpty) ...[
-                  Text('Rare insights', style: Theme.of(context).textTheme.titleSmall),
-                  const SizedBox(height: 8),
-                  _bulletList(rare),
-                  const SizedBox(height: 16),
-                ],
-
-                FutureBuilder<List<Map<String, dynamic>>>(
-                  future: _longitudinalFuture,
-                  builder: (context, snap) {
-                    final items = (snap.data ?? const <Map<String, dynamic>>[]);
-                    if (items.isEmpty) return const SizedBox.shrink();
-                    return Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('Longitudinal insights', style: Theme.of(context).textTheme.titleSmall),
-                        const SizedBox(height: 8),
-                        ...items.map((m) {
-                          final title = (m['short_title'] ?? '').toString().trim();
-                          final text = (m['insight_text'] ?? '').toString().trim();
-                          return Padding(
-                            padding: const EdgeInsets.only(bottom: 10),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                if (title.isNotEmpty)
-                                  Text(title, style: Theme.of(context).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600)),
-                                if (text.isNotEmpty) Text(text),
-                              ],
-                            ),
-                          );
-                        }),
-                        const SizedBox(height: 8),
-                      ],
-                    );
-                  },
-                ),
-
-
-
+                 const SizedBox(height: 10),
+                 if (_synthesisSentence(summaryText).isNotEmpty)
+                   Text(
+                     _synthesisSentence(summaryText),
+                     style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.black54),
+                   ),
+                 const SizedBox(height: 16),
+ 
+                   _buildFactsReviewSection(context),
                 ],
               ),
-            ),
+          ),
+      ),
     );
   }
 }

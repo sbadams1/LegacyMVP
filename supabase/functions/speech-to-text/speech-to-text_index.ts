@@ -22,18 +22,29 @@
 // REQUIREMENTS:
 //   - Set GOOGLE_SPEECH_API_KEY in your Supabase project env vars.
 //   - Turn verify_jwt OFF for this function if you don't need auth checking.
+//
+// NOTE (JWT mode):
+//   When the app uses real Supabase Auth, do NOT accept user_id from the client.
+//   Derive user_id from the Bearer JWT and (optionally) 403 on mismatch if a body
+//   user_id was provided.
 
-import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
+ import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
+ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const GOOGLE_SPEECH_API_KEY = Deno.env.get("GOOGLE_SPEECH_API_KEY");
+ const GOOGLE_SPEECH_API_KEY = Deno.env.get("GOOGLE_SPEECH_API_KEY");
+ const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
+ const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY");
 
-if (!GOOGLE_SPEECH_API_KEY) {
-  console.error("⚠️ Missing GOOGLE_SPEECH_API_KEY env var");
-}
+ if (!GOOGLE_SPEECH_API_KEY) {
+   console.error("⚠️ Missing GOOGLE_SPEECH_API_KEY env var");
+ }
+ if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+   console.error("⚠️ Missing SUPABASE_URL or SUPABASE_ANON_KEY env var");
+ }
 
-function jsonResponse(body: unknown, status: number = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
+ function jsonResponse(body: unknown, status: number = 200): Response {
+   return new Response(JSON.stringify(body), {
+     status,
     headers: { "Content-Type": "application/json" },
   });
 }
@@ -82,11 +93,45 @@ serve(async (req: Request): Promise<Response> => {
     payload = await req.json();
   } catch {
     return jsonResponse({ error: "Invalid JSON body" }, 400);
+   }
+ 
+   // AUTH: prefer Bearer JWT (Supabase Auth). If missing, fall back to client-provided user_id.
+   const authHeader = req.headers.get("Authorization") ?? "";
+   const body_user_id = payload?.user_id as string | undefined;
+ 
+   let user_id: string | null = null;
+
+  if (authHeader.toLowerCase().startsWith("bearer ")) {
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+      return jsonResponse({ error: "Server missing SUPABASE_URL/SUPABASE_ANON_KEY" }, 500);
+    }
+    const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      global: { headers: { Authorization: authHeader } },
+    });
+    const { data: userData, error: userErr } = await supabase.auth.getUser();
+    const authedUserId = userData?.user?.id ?? null;
+    if (userErr || !authedUserId) {
+      return jsonResponse({ error: "Unauthorized" }, 401);
+    }
+    if (body_user_id && body_user_id !== authedUserId) {
+      return jsonResponse({ error: "user_id mismatch", authed_user_id: authedUserId, body_user_id }, 403);
+    }
+    user_id = authedUserId;
+  } else {
+    // Back-compat for non-auth callers (e.g., during migration): require explicit user_id.
+    if (!body_user_id || String(body_user_id).trim().length === 0) {
+      return jsonResponse({ error: "user_id is required" }, 400);
+    }
+    user_id = String(body_user_id).trim();
   }
 
-  const user_id = payload.user_id as string | undefined;
-  const audio_base64 = payload.audio_base64 as string | undefined;
-  const mime_type = payload.mime_type as string | undefined;
+  if (!user_id) {
+    return jsonResponse({ error: "user_id is required" }, 400);
+  }
+ 
+   const audio_base64 = payload.audio_base64 as string | undefined;
+   const mime_type = payload.mime_type as string | undefined;
+
   const gcs_object_name = payload.gcs_object_name as string | undefined;
   const bucket = payload.bucket as string | undefined;
 
@@ -94,15 +139,11 @@ serve(async (req: Request): Promise<Response> => {
   const language_code = payload.language_code as string | undefined;
 
   // Additional languages (for auto-detection).
-  const alt_language_codes_raw = payload.alt_language_codes;
+   const alt_language_codes_raw = payload.alt_language_codes;
 
-  if (!user_id) {
-    return jsonResponse({ error: "user_id is required" }, 400);
-  }
-
-  if (!GOOGLE_SPEECH_API_KEY) {
-    return jsonResponse({ error: "Server is missing GOOGLE_SPEECH_API_KEY" }, 500);
-  }
+   if (!GOOGLE_SPEECH_API_KEY) {
+     return jsonResponse({ error: "Server is missing GOOGLE_SPEECH_API_KEY" }, 500);
+   }
 
   // Language-agnostic:
   // 1) prefer explicit language_code
@@ -113,7 +154,22 @@ serve(async (req: Request): Promise<Response> => {
   const fallbackLocale = normalizeSttLang(device_locale, "en-US");
   const languageCode = normalizeSttLang(language_code, fallbackLocale);
 
-  const altLanguageCodes: string[] = []; // force single-language recognition
+  // Additional languages (for auto-detection) – e.g. when the user may speak in
+  // either L1 or L2 without toggling. If client doesn't send any, we keep it
+  // single-language.
+  let altLanguageCodes: string[] = normalizeAltLangs(alt_language_codes_raw);
+
+  // Remove duplicates and the primary language code if it slipped in.
+  altLanguageCodes = Array.from(
+    new Set(
+      altLanguageCodes
+        .map((s) => String(s || "").trim())
+        .filter((s) => s.length > 0 && s !== languageCode),
+    ),
+  );
+
+  // Keep Google STT configs sane; too many alts can reduce accuracy and cost.
+  if (altLanguageCodes.length > 3) altLanguageCodes = altLanguageCodes.slice(0, 3);
 
   console.log(
     "🧩 STT languageCode=",
@@ -139,6 +195,9 @@ serve(async (req: Request): Promise<Response> => {
     // Let Google infer encoding from the file (MP4, MOV, etc).
     config = {
       languageCode,
+      model: "latest_short",
+      // When provided, STT will attempt to auto-detect among these options.
+      ...(altLanguageCodes.length > 0 ? { alternativeLanguageCodes: altLanguageCodes } : {}),
       enableAutomaticPunctuation: true,
     };
 
@@ -149,6 +208,8 @@ serve(async (req: Request): Promise<Response> => {
     // THE MP3 LIE: we always say MP3 so AAC wrapped from FlutterSound is accepted.
     config = {
       languageCode,
+      model: "latest_short",
+      ...(altLanguageCodes.length > 0 ? { alternativeLanguageCodes: altLanguageCodes } : {}),
       enableAutomaticPunctuation: true,
       encoding: "MP3",
     };
@@ -218,8 +279,12 @@ serve(async (req: Request): Promise<Response> => {
       return jsonResponse({ error: "No transcript from Google STT", google_raw: googleJson }, 200);
     }
 
-    // 🔒 Single-language mode: we always report the requested languageCode.
-    const detectedLanguageCode = languageCode;
+    // The v1 recognize endpoint does not reliably return detected language.
+    // We provide a best-effort guess for UI purposes.
+    const hasThai = /[\u0E00-\u0E7F]/.test(transcript);
+    const detectedLanguageCode = hasThai
+      ? "th-TH"
+      : languageCode;
 
     console.log(
       "✅ STT success for user " +
@@ -233,6 +298,8 @@ serve(async (req: Request): Promise<Response> => {
     return jsonResponse({
       transcript,
       detected_language_code: detectedLanguageCode,
+      requested_language_code: languageCode,
+      requested_alternative_language_codes: altLanguageCodes,
     });
   } catch (err) {
     console.error("❌ STT function exception", err);

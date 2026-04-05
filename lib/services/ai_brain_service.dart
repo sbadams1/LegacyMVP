@@ -24,10 +24,11 @@
 //   pronunciation_score_line: string | null
 // }
 
-import 'dart:ui' show PlatformDispatcher;
-import 'package:supabase_flutter/supabase_flutter.dart';
-
-class AIBrainService {
+ import 'dart:ui' show PlatformDispatcher;
+ import 'dart:convert' show jsonDecode;
+ import 'package:supabase_flutter/supabase_flutter.dart';
+ 
+ class AIBrainService {
   AIBrainService._internal();
 
   static final AIBrainService instance = AIBrainService._internal();
@@ -38,7 +39,7 @@ class AIBrainService {
   ///
   /// Required:
   /// - [message] The user message for the turn (can be empty only when [endSession] is true)
-  /// - [mode] "legacy" | "language_learning" | (future: avatar_*)
+  /// - [mode] "legacy" | "avatar"
   ///
   /// Optional:
   /// - [preferredLocale] L1 locale (e.g., "en-US")
@@ -69,61 +70,111 @@ class AIBrainService {
     final resolved = await _resolveLocales(
       userId: user.id,
       preferredLocale: preferredLocale,
-      targetLocale: targetLocale,
-    );
+       targetLocale: targetLocale,
+     );
+ 
+     final String normalizedMode =
+        (mode.toLowerCase().trim() == 'language_learning') ? 'legacy' : mode;
 
-    final body = <String, dynamic>{
-      'user_id': user.id,
-      'message_text': message,
-      'mode': mode,
-      'preferred_locale': resolved.preferredLocale,
-      'target_locale': resolved.targetLocale,
-      'learning_level': learningLevel,
-      'conversation_id': conversationId,
-      'state_json': stateJson,
-      'end_session': endSession,
-    }..removeWhere((key, value) => value == null);
+      final body = <String, dynamic>{
+       'user_id': user.id,
+       'message_text': message,
+       'mode': normalizedMode,
+       'preferred_locale': resolved.preferredLocale,
+       'target_locale': resolved.targetLocale,
+       'learning_level': learningLevel,
+       'conversation_id': conversationId,
+       'state_json': stateJson,
+       'end_session': endSession,
+     }..removeWhere((key, value) => value == null);
 
     try {
       final response = await _client.functions.invoke(
         'ai-brain',
-        body: body,
-      );
+         body: body,
+       );
+ 
+      // Supabase Functions may return a Map, a JSON string, a plain string, or null.
+      Map<String, dynamic> data = <String, dynamic>{};
+      final raw = response.data;
+      if (raw is Map<String, dynamic>) {
+        data = raw;
+      } else if (raw is String) {
+        final s = raw.trim();
+        if (s.isNotEmpty && s.startsWith('{') && s.endsWith('}')) {
+          try {
+            final decoded = jsonDecode(s);
+            if (decoded is Map<String, dynamic>) data = decoded;
+          } catch (_) {
+            // fall through: treat as plain text below
+          }
+        }
+        // If it's not JSON, treat it as a plain-text reply.
+        if (data.isEmpty && s.isNotEmpty) {
+          return <String, dynamic>{
+            'reply_text': s,
+            'end_session': endSession,
+            'mode': normalizedMode,
+            'preferred_locale': resolved.preferredLocale,
+            'target_locale': resolved.targetLocale,
+          };
+        }
+      }
+ 
+       // Normalize reply text field name variations just in case.
+       final text = (data['reply_text'] ??
+               data['text'] ??
+               data['message'] ??
+               data['response'])
+           as String?;
+ 
+      // If server returned nothing usable, surface diagnostics instead of silently returning nulls.
+      if ((text ?? '').trim().isEmpty && data.isEmpty) {
+        final rawType = raw == null ? 'null' : raw.runtimeType.toString();
+        final preview = raw == null ? '' : raw.toString().trim();
+        return <String, dynamic>{
+          'reply_text': '⚠️ Empty/non-JSON response from ai-brain. '
+              'rawType=$rawType preview=${preview.length > 400 ? preview.substring(0, 400) : preview}',
+          'end_session': endSession,
+          'mode': normalizedMode,
+          'preferred_locale': resolved.preferredLocale,
+          'target_locale': resolved.targetLocale,
+        };
+      }
 
-      final data = (response.data is Map<String, dynamic>)
-          ? (response.data as Map<String, dynamic>)
-          : <String, dynamic>{};
+      final out = <String, dynamic>{
+         'reply_text': text,
+         'state_json': data['state_json'],
+         'end_session': data['end_session'] == true,
+         'end_session_summary': data['end_session_summary'],
+         'insight_moment': data['insight_moment'],
+         'pronunciation_score': data['pronunciation_score'],
+         'pronunciation_score_line': data['pronunciation_score_line'],
+ 
+         // pass-through metadata (useful for logging / UI)
+         'mode': data['mode'],
+         'preferred_locale': data['preferred_locale'] ?? resolved.preferredLocale,
+         'target_locale': data['target_locale'] ?? resolved.targetLocale,
+         'learning_level': data['learning_level'],
+         'conversation_id': data['conversation_id'],
+         'input_locale': data['input_locale'],
+         'input_locale_confidence': data['input_locale_confidence'],
+       };
 
-      // Normalize reply text field name variations just in case.
-      final text = (data['reply_text'] ??
-              data['text'] ??
-              data['message'] ??
-              data['response'])
-          as String?;
+      // language_learning mode is deprecated; strip any leftover learning-specific fields.
+      out.remove('learning_level');
+      out.remove('input_locale');
+      out.remove('input_locale_confidence');
+      out.remove('pronunciation_score');
+      out.remove('pronunciation_score_line');
 
-      return <String, dynamic>{
-        'reply_text': text,
-        'state_json': data['state_json'],
-        'end_session': data['end_session'] == true,
-        'end_session_summary': data['end_session_summary'],
-        'insight_moment': data['insight_moment'],
-        'pronunciation_score': data['pronunciation_score'],
-        'pronunciation_score_line': data['pronunciation_score_line'],
-
-        // pass-through metadata (useful for logging / UI)
-        'mode': data['mode'],
-        'preferred_locale': data['preferred_locale'] ?? resolved.preferredLocale,
-        'target_locale': data['target_locale'] ?? resolved.targetLocale,
-        'learning_level': data['learning_level'],
-        'conversation_id': data['conversation_id'],
-        'input_locale': data['input_locale'],
-        'input_locale_confidence': data['input_locale_confidence'],
-      };
-    } catch (e) {
-      // ignore: avoid_print
-      print('⚠️ ai-brain error: $e');
-      rethrow;
-    }
+      out.removeWhere((key, value) => value == null);
+      return out;
+     } catch (e) {
+       // ignore: avoid_print
+       print('⚠️ ai-brain error: $e');
+       rethrow;
+     }
   }
 
   /// Internal: resolve locales without hard-coding any language values.

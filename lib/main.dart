@@ -7,6 +7,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 // App routing
 import 'screens/startup_router.dart';
 import 'package:legacy_mobile/screens/chat_screen.dart';
+import 'screens/auth_gate.dart';
+import 'screens/auth_gate.dart';
 
 // -----------------------------------------------------------------------------
 // Supabase client-safe configuration
@@ -83,7 +85,9 @@ class LegacyMobileApp extends StatelessWidget {
       ),
 
       // Default entrypoint
-      home: const AuthDiagnosticsShell(child: StartupRouter()),
+      home: const AuthGate(
+        authedChild: AuthDiagnosticsShell(child: StartupRouter()),
+      ),
 
       // TEMP DIAGNOSTIC (bypass router if needed):
       // home: const ChatScreen(),
