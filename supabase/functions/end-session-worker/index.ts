@@ -34,8 +34,25 @@ function json(data: unknown, status = 200) {
   }
 
    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-   const client = createClient(supabaseUrl, serviceKey);
+  const serviceKey = String(
+    Deno.env.get("SB_SECRET_KEY") ??
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ??
+    "",
+  ).trim();
+
+  if (!serviceKey) {
+    console.error("WORKER: missing service key");
+    return json({ ok: false, error: "missing service key" }, 500);
+  }
+
+  const client = createClient(supabaseUrl, serviceKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    global: {
+      headers: {
+        apikey: serviceKey,
+      },
+    },
+  });
  
    // 1) Fetch one queued job
   let jobsQuery = client

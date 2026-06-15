@@ -16,16 +16,19 @@ GOAL:
 - Respond naturally and conversationally in ${locale}.
 - Be helpful, specific, and grounded in the provided context/evidence.
 
-HARD RULES:
-- Do NOT invent personal facts. If something isn't in the provided context, say you’re not sure.
-- If the user asks about their own saved memories, use only the supplied context.
-- Ask 1 clarifying question when it would materially improve accuracy.
-
-STYLE:
-- First-person voice as the user's Avatar when appropriate.
-- No markdown fences, no stage directions, no roleplay brackets.
-`.trim();
-}
+ HARD RULES:
+ - Do NOT invent personal facts. If something isn't in the provided context, say you’re not sure.
+ - If the user asks about their own saved memories, use only the supplied context.
+ - If you do not have evidence for a memory, do NOT speculate about death, dying, the afterlife, or whether something happened before or after the user's death.
+ - Do NOT ask questions like "Did that happen after your death?" or "Is that something you acquired after your death?"
+ - Ask 1 clarifying question when it would materially improve accuracy.
+ 
+ STYLE:
+ - First-person voice as the user's Avatar when appropriate.
+ - No markdown fences, no stage directions, no roleplay brackets.
+ - If memory evidence is missing, be plain and neutral.
+ `.trim();
+ }
 
 /**
  * BURN-DOWN INVENTORY (turn_core.ts) — annotate + delete aggressively.
@@ -535,12 +538,204 @@ continue;
       }
      } catch (e) {
        console.warn("VIP lane: promotion step failed (non-fatal):", e);
-     }
+      }
+    }
+  }
+
+async function sha256HexLocal(input: string): Promise<string> {
+  const bytes = new TextEncoder().encode(String(input ?? ""));
+  const hash = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+type DeterministicSessionFact = {
+  fact_key: string;
+  value_json: any;
+  source_quote: string;
+  context: string;
+};
+
+function normalizeFactKeyPart(input: string): string {
+  return String(input ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 48) || "fact";
+}
+
+function cleanDeterministicFactText(input: string): string {
+  return String(input ?? "")
+    .replace(/^\s*(?:USER|AI)\s*:\s*/i, "")
+    .replace(/^\s*Remember this:\s*/i, "")
+    .replace(/^\s*Also:\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractDeterministicSessionFacts(transcript: LegacyTranscriptTurn[]): DeterministicSessionFact[] {
+  const facts: DeterministicSessionFact[] = [];
+  const seen = new Set<string>();
+  const addFact = (fact_key: string, value_json: any, source_quote: string, context: string) => {
+    const key = `${fact_key}\n${JSON.stringify(value_json)}\n${source_quote}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    facts.push({ fact_key, value_json, source_quote, context });
+  };
+
+  for (const turn of transcript ?? []) {
+    if (String((turn as any)?.role ?? "").toLowerCase() === "assistant") continue;
+    const text = cleanDeterministicFactText((turn as any)?.text ?? "");
+    if (!text) continue;
+
+    const storageMatches = text.matchAll(
+      /\b(?:my|our)\s+([a-z0-9][a-z0-9\s'_-]{1,80}?)\s+(?:is|are)\s+(?:kept|stored|saved|located)\s+(?:in|inside|at)\s+(?:an?|the)?\s+([^.;\n,]+?)(?=\s*,?\s+and\s+inside\s+(?:it|there)\b|[.;\n]|$)(?:\s*,?\s+and\s+inside\s+(?:it|there)\s+(?:i|we)\s+(?:keep|store|have)\s+(?:an?|the)?\s+([^.;\n]+))?/gi,
+    );
+
+    for (const m of storageMatches) {
+      const subject = cleanDeterministicFactText(m[1]);
+      const location = cleanDeterministicFactText(m[2]);
+      const contained = cleanDeterministicFactText(m[3] ?? "");
+      if (!subject || !location) continue;
+      const subjectKey = normalizeFactKeyPart(subject);
+      addFact(
+        `storage.${subjectKey}.location`,
+        location,
+        m[0].trim(),
+        `${subject} location/storage container.`,
+      );
+      if (contained) {
+        addFact(
+          `storage.${subjectKey}.contains`,
+          contained,
+          m[0].trim(),
+          `${subject} contained item.`,
+        );
+      }
+    }
+
+    const keepMatches = text.matchAll(
+      /\b(?:i|we)\s+(?:keep|store|save)\s+(?:my|our|the|a|an)?\s*([^.;\n,]+?)\s+(?:in|inside|at)\s+(?:my|our|the|a|an)?\s*([^.;\n]+)(?=[.;\n]|$)/gi,
+    );
+
+    for (const m of keepMatches) {
+      const item = cleanDeterministicFactText(m[1]);
+      const location = cleanDeterministicFactText(m[2]);
+      if (!item || !location) continue;
+      const itemKey = normalizeFactKeyPart(item);
+      addFact(
+        `storage.${itemKey}.location`,
+        location,
+        m[0].trim(),
+        `${item} location/storage container.`,
+      );
+    }
+  }
+
+  return facts.slice(0, 20);
+}
+
+async function persistDeterministicSessionFactsBestEffort(args: {
+  client: SupabaseClient;
+  user_id: string;
+  conversation_id: string;
+  raw_id_this_turn?: string | null;
+  transcript: LegacyTranscriptTurn[];
+  created_at_iso: string;
+}): Promise<void> {
+  const { client, user_id, conversation_id, raw_id_this_turn, transcript, created_at_iso } = args;
+  const facts = extractDeterministicSessionFacts(transcript);
+  if (!facts.length) return;
+
+  let turnRef = "";
+
+  const rawIdCandidate = String(raw_id_this_turn ?? "").trim();
+  if (rawIdCandidate) {
+    const { data: currentRaw, error: currentRawErr } = await client
+       .from("memory_raw")
+      .select("id, role")
+       .eq("user_id", user_id)
+       .eq("conversation_id", conversation_id)
+      .eq("id", rawIdCandidate)
+      .maybeSingle();
+
+    const currentRole = String(currentRaw?.role ?? "").toLowerCase();
+    if (!currentRawErr && currentRaw?.id && (currentRole === "user" || currentRole === "legacy_user")) {
+      turnRef = String(currentRaw.id);
+    }
+  }
+
+  if (!turnRef) {
+    const { data: lastUserRaw, error: lastUserRawErr } = await client
+      .from("memory_raw")
+      .select("id, role")
+      .eq("user_id", user_id)
+      .eq("conversation_id", conversation_id)
+      .in("role", ["user", "legacy_user"])
+       .order("created_at", { ascending: false })
+       .order("id", { ascending: false })
+       .limit(1)
+       .maybeSingle();
+    if (!lastUserRawErr && lastUserRaw?.id) turnRef = String(lastUserRaw.id);
    }
- }
- 
- // ---------------------------------------------------------------------------
- // Legacy + Avatar companion role contract (narrative momentum)
+
+  let written = 0;
+  for (const fact of facts) {
+    const hash = await sha256HexLocal(`${fact.fact_key}\n${JSON.stringify(fact.value_json)}\n${fact.source_quote}`);
+    const stableKey = `${fact.fact_key}.${hash.slice(0, 12)}`;
+
+    try {
+      if (turnRef) {
+        const { error: fcErr } = await client.from("fact_candidates").insert({
+          user_id,
+          conversation_id,
+          turn_ref: turnRef,
+          fact_key_guess: stableKey,
+          fact_key_canonical: stableKey,
+          value_json: fact.value_json,
+          source_quote: fact.source_quote,
+          source_meta: {
+            source: "deterministic_session_facts_v1",
+            conversation_id,
+            context: fact.context,
+          },
+          status: "captured",
+          extractor_version: "deterministic_session_facts_v1",
+          confidence: 0.92,
+        });
+        if (fcErr) console.warn("deterministic_session_facts: fact_candidates insert failed (non-fatal):", fcErr);
+      }
+
+      const { error: feErr } = await client.from(USER_FACTS_TABLE).upsert({
+        user_id,
+        fact_key: stableKey,
+        canonical_key: stableKey,
+        value_json: fact.value_json,
+        context: fact.context,
+        confidence: 0.92,
+        stability: "stable",
+        updated_at: created_at_iso,
+        receipt_ids: turnRef ? [turnRef] : [],
+        receipt_quotes: [fact.source_quote],
+        is_locked: false,
+      }, { onConflict: "user_id,fact_key" });
+
+      if (feErr) {
+        console.warn("deterministic_session_facts: facts_effective upsert failed (non-fatal):", feErr);
+      } else {
+        written += 1;
+      }
+    } catch (e) {
+      console.warn("deterministic_session_facts: write failed (non-fatal):", e);
+    }
+  }
+
+  if (written > 0 && DEBUG_AI_BRAIN_LOGS) {
+     console.log("deterministic_session_facts: persisted", { conversation_id, written });
+   }
+}
+  
+  // ---------------------------------------------------------------------------
+  // Legacy + Avatar companion role contract (narrative momentum)
  // ---------------------------------------------------------------------------
 
 const LEGACY_COMPANION_ROLE_CONTRACT = [
@@ -595,12 +790,13 @@ const LEGACY_COMPANION_ROLE_CONTRACT = [
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.48.0";
-import {
-   chooseExpansionForConcept,
-   getConceptWithExpansion,
- } from "../../../_shared/vocabulary.ts"; 
- import { runEndSessionPipeline } from "../end_session.ts";
- import { countWordsApprox } from "../../../_shared/text_utils.ts";
+ import {
+    chooseExpansionForConcept,
+    getConceptWithExpansion,
+  } from "../../../_shared/vocabulary.ts"; 
+  import { runEndSessionPipeline } from "../end_session.ts";
+  import { extractUserFactsWithGeminiShared } from "../shared_facts_extractor.ts";
+  import { countWordsApprox } from "../../../_shared/text_utils.ts";
 
 // ============================================================================
 // ENV VARS & MODEL
@@ -841,345 +1037,31 @@ ${full}
   }
 }
 
+ async function extractUserFactsWithGemini(args: {
+   // New calling shape (from end_session.ts)
+   transcriptText?: string;
+   receipt_id?: string;
+   preferred_locale?: string;
 
-async function extractUserFactsWithGemini(args: {
-  // New calling shape (from end_session.ts)
-  transcriptText?: string;
-  receipt_id?: string;
-  preferred_locale?: string;
+   // Legacy calling shape (kept for backward compatibility)
+   transcript?: Array<{ role: string; content: string; id?: string }>;
+   anchorRawId?: string;
+   userId?: string;
+ }): Promise<any> {
 
-  // Legacy calling shape (kept for backward compatibility)
-  transcript?: Array<{ role: string; content: string; id?: string }>;
-  anchorRawId?: string;
-  userId?: string;
-}): Promise<any> {
-  try {
-const SYSTEM = [
-  "You extract durable user facts stated explicitly by the USER in THIS session.",
-  "Do NOT guess or infer. If it's not explicitly stated, omit it.",
-  "Return ONLY valid JSON (no markdown fences, no prose, no commentary).",
-  "Return MINIFIED JSON on a single line (no newlines, no indentation).",
-
-  "Top-level JSON must be exactly: { \"fact_candidates\": [ ... ] }",
-  "Return at most 16 fact_candidates total.",
-  "Each candidate must include exactly these fields: subject, attribute_path, value_json, value_type, stability, change_policy, confidence, evidence, context.",
-  "Do not include any additional top-level keys or candidate fields.",
-
-  "subject must be an object: { \"type\": \"user|person\", \"name\": \"<optional>\" }.",
-  "Use subject.type=\"user\" for the USER.",
-  "Use subject.type=\"person\" for any other person mentioned (daughter/son/spouse/partner/parent/sibling/friend/colleague).",
-  "If subject.type=\"person\", include subject.name when explicitly stated (e.g., \"Alicia\"). Otherwise omit name.",
-
-  "attribute_path must be a short lowercase dot-path using these namespaces only: identity.*, location.*, health.*, preferences.*, work.*, projects.*, relationships.*, beliefs.*, views.*",
-  "Subject rule: identity.*, location.*, health.*, preferences.*, work.*, projects.* MUST be used only when subject.type=\"user\".",
-  "If the statement is about another person, use relationships.* (and subject.type=\"person\").",
-  "Do NOT store someone else's education, job, or health under the user namespaces. Example: a daughter's doctorate goes under relationships.education.*, not health.*.",
-  "health.* is only for the USER's health/fitness/medical/metrics.",
-
-  "attribute_path must describe a durable fact (not a momentary feeling, not a question, not a one-off plan unless it's committed/ongoing).",
-  "IMPORTANT: If the USER explicitly says they are building/creating/developing an app or working on an ongoing project, treat that as committed/ongoing and extract it under projects.*.",
-  "If an app/project name is explicitly stated, store it as projects.current_app_name (string).",
-  "If the USER explicitly states the purpose/reason, store it as projects.current_app_purpose (string).",
-  "If projects.* is explicitly present in the session, include at least ONE projects.* fact even if you must omit lower-value details (e.g., job grade).",
-  "Use views.* for durable stances/opinions/values about ANY topic (including politics).",
-  "A strongly stated view the user affirms as deeply held is NOT a momentary feeling; treat it as durable.",
-  "External-world facts (e.g., court outcomes) MUST NOT be stored as objective truth. If the user references a public fact, store only that the USER referenced it under beliefs.public_fact_refs.* with receipts.",
-  "If the user explicitly distinguishes 'my view' vs 'a public fact I referenced', you may store BOTH (views.* and beliefs.public_fact_refs.*).",
-  "If a fact is redundant (e.g., age implied by date_of_birth), keep the more durable one and omit duplicates unless both are explicitly stated.",
-  
-  "value_json must be valid JSON and must not be empty (no empty string, {}, or []).",
-  "value_type must be exactly one of: string | number | boolean | array | object, and must match value_json.",
-  "Prefer simple scalar values when possible (string/number/boolean). Use object only when it materially adds structure.",
-
-  "stability must be exactly one of: sticky | semi_sticky | mutable.",
-  "change_policy must be exactly one of: overwrite_if_explicit_or_newer | overwrite_if_explicit | append_only | never_overwrite.",
-
-  "evidence must be an array with exactly 1 item: { receipt_id, quote }.",
-  "If SESSION_USER_TEXT includes markers like [RID:<id>], set evidence[0].receipt_id to the RID of the exact line you quoted.",
-  "If no [RID:...] marker is present for your quote, use RECEIPT_ID_FOR_EVIDENCE as evidence[0].receipt_id.",
-  "evidence.quote must be a direct short quote from SESSION_USER_TEXT, max 120 characters, no ellipses.",
-  "context must be read-aloud safe and neutral, max 80 characters (1 short sentence).",
-
-  "confidence must be a number from 0 to 1.",
-  "Use 0.90+ only for clear explicit statements with unambiguous wording.",
-  "If any required field cannot be filled from explicit text, omit that candidate entirely.",
-
-  "If there are no valid facts, return: {\"fact_candidates\":[]}"
-].join(" ");
-
-    // Defense-in-depth: if callers pass labeled transcripts (e.g., "AI: ..."),
-    // strip AI lines and remove "USER:" prefixes so only user text remains.
-    const sanitizeFactsTranscriptText = (raw: string): string => {
-      const lines = String(raw ?? "").split(/\r?\n/);
-      const kept: string[] = [];
-      for (const line of lines) {
-        const s = String(line ?? "").trim();
-        if (!s) continue;
-        const lower = s.toLowerCase();
-        if (lower.startsWith("ai:")) continue;
-        if (lower.startsWith("assistant:")) continue;
-        if (lower.startsWith("legacy_ai:")) continue;
-        if (lower.startsWith("user:")) {
-          kept.push(s.slice(5).trim());
-          continue;
-        }
-        if (lower.startsWith("legacy_user:")) {
-          kept.push(s.slice("legacy_user:".length).trim());
-          continue;
-        }
-        kept.push(s);
-      }
-      return kept.join("\n").trim();
-    };
-
-     const userText =
-       typeof args.transcriptText === "string" && args.transcriptText.trim().length > 0
-        ? sanitizeFactsTranscriptText(args.transcriptText)
-         : (args.transcript || [])
-             .filter((t) => {
-               const r = String((t as any)?.role ?? "");
-               return r === "user" || r === "legacy_user";
-             })
-             .map((t) => t?.content ?? "")
-             .join("\n");
-
-    const receiptId =
-      (typeof args.receipt_id === "string" && args.receipt_id.trim()) ||
-      (typeof args.anchorRawId === "string" && args.anchorRawId.trim()) ||
-      "unknown_receipt";
-
-    const preferredLocale =
-      (typeof args.preferred_locale === "string" && args.preferred_locale.trim()) || "en";
-
-    const USER = [
-      "SESSION_USER_TEXT:",
-      userText,
-      "",
-      "RECEIPT_ID_FOR_EVIDENCE (use only if no [RID:...] marker is available):",
-      receiptId,
-      "",
-      "preferred_locale:",
-      preferredLocale,
-      "",
-      "Return only JSON.",
-    ].join("\n");
-
-    const factsDebug =
-      (Deno.env.get("FACTS_DEBUG") ?? "false").toLowerCase() === "true" ||
-      (Deno.env.get("DEBUG_FACTS") ?? "false").toLowerCase() === "true";
-
-    const raw = await callGemini({
-      system: SYSTEM,
-      user: USER,
-      temperature: 0.2,
-      maxOutputTokens: 4096,
-    });
-
-    // Loose JSON parser (handles fences anywhere + trailing commas)
-    const tryParseJsonLoose = (text: string): any | null => {
-      if (!text) return null;
-
-      const sanitize = (s: string): string => {
-        let out = String(s ?? "");
-
-        // If there's a fenced json block anywhere, prefer the first one.
-        const fenceMatch = out.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-        if (fenceMatch && fenceMatch[1]) out = fenceMatch[1];
-
-        // Trim and remove stray BOM
-        out = out.replace(/^\uFEFF/, "").trim();
-
-        // Tolerate trailing commas before } or ]
-        out = out.replace(/,\s*([}\]])/g, "$1");
-
-        return out;
-      };
-
-      // 1) Try raw
-      try {
-        return JSON.parse(text);
-      } catch {
-        // fall through
-      }
-
-      const cleaned = sanitize(text);
-
-      // 2) Try cleaned
-      try {
-        return JSON.parse(cleaned);
-      } catch {
-        // fall through
-      }
-
-      // 3) Slice between first "{" and last "}" from cleaned text
-      const start = cleaned.indexOf("{");
-      const end = cleaned.lastIndexOf("}");
-      if (start >= 0 && end > start) {
-        const slice = sanitize(cleaned.slice(start, end + 1));
-        try {
-          return JSON.parse(slice);
-        } catch {
-          return null;
-        }
-      }
-
-      return null;
-    };
-
-    const rawStr = String(raw ?? "");
-    if (factsDebug) {
-      console.log("FACTS_DEBUG: raw Gemini output (first 2000 chars):", rawStr.slice(0, 2000));
-    }
-
-    console.log("FACTS_DEBUG: raw length:", rawStr.length);
-    console.log("FACTS_DEBUG: raw tail:", rawStr.slice(-200));
-    console.log("FACTS_DEBUG: endsWithFence:", rawStr.trimEnd().endsWith("```"));
-
-    const parsed: any = tryParseJsonLoose(rawStr) ?? {};
-    const candidatesRaw: any[] = Array.isArray(parsed?.fact_candidates)
-      ? parsed.fact_candidates
-      : (Array.isArray(parsed?.facts) ? parsed.facts : []); // tolerate older shape
-
-    // Post-process / validate candidates (story-like determinism)
-    const normKey = (k: string): string =>
-      String(k ?? "")
-        .trim()
-        .toLowerCase()
-        .replace(/[^a-z0-9._-]+/g, "_")
-        .replace(/_{2,}/g, "_")
-        .replace(/^_+|_+$/g, "");
-
-    const detectType = (v: any): "string" | "number" | "boolean" | "array" | "object" => {
-      if (Array.isArray(v)) return "array";
-      if (v === null) return "object"; // treat null as object-ish; we'll reject as empty
-      switch (typeof v) {
-        case "string":
-          return "string";
-        case "number":
-          return "number";
-        case "boolean":
-          return "boolean";
-        default:
-          return "object";
-      }
-    };
-
-    const isEmptyValue = (v: any): boolean => {
-      if (v === null || v === undefined) return true;
-      if (typeof v === "string") return v.trim().length === 0;
-      if (Array.isArray(v)) return v.length === 0;
-      if (typeof v === "object") return Object.keys(v).length === 0;
-      return false;
-    };
-
-    const out: any[] = [];
-    const seen = new Set<string>();
-
-    const normPath = (p: string): string =>
-      String(p ?? "")
-        .trim()
-        .toLowerCase()
-        .replace(/[^a-z0-9._-]+/g, "_")
-        .replace(/_{2,}/g, "_")
-        .replace(/^_+|_+$/g, "");
-
-    const normalizeSubject = (s: any): { type: "user" | "person"; name?: string } | null => {
-      if (!s || typeof s !== "object") return null;
-      const t = String((s as any)?.type ?? "").trim().toLowerCase();
-      const type = t === "person" ? "person" : (t === "user" ? "user" : "");
-      if (!type) return null;
-      const nameRaw = String((s as any)?.name ?? "").trim();
-      const name = nameRaw ? nameRaw.slice(0, 80) : "";
-      return name ? { type: type as any, name } : { type: type as any };
-    };
-
-    for (const c of candidatesRaw) {
-      const fact_key_raw = typeof c?.fact_key === "string" ? normKey(c.fact_key) : "";
-      const subject = normalizeSubject(c?.subject);
-      const attribute_path = normPath(c?.attribute_path ?? c?.attributePath ?? c?.path);
-
-      // Accept either:
-      //  A) explicit fact_key (legacy), or
-      //  B) { subject, attribute_path } (preferred)
-      if (!fact_key_raw && (!subject || !attribute_path)) continue;
-
-      const dedupeKey = fact_key_raw || `${subject?.type ?? ""}:${subject?.name ?? ""}:${attribute_path}`;
-      if (!dedupeKey || seen.has(dedupeKey)) continue;
-
-      const value_json = c?.value_json;
-      if (isEmptyValue(value_json)) continue;
-
-      const value_type = (String(c?.value_type || detectType(value_json)).toLowerCase() as any) || "object";
-
-      const stabilityRaw = String(c?.stability ?? "").toLowerCase();
-      const stability =
-        stabilityRaw === "sticky" || stabilityRaw === "mutable" || stabilityRaw === "semi_sticky"
-          ? stabilityRaw
-          : "semi_sticky";
-
-      const policyRaw = String(c?.change_policy ?? "").toLowerCase();
-      const change_policy =
-        policyRaw === "overwrite_if_explicit_or_newer" ||
-        policyRaw === "overwrite_if_explicit" ||
-        policyRaw === "append_only" ||
-        policyRaw === "never_overwrite"
-          ? policyRaw
-          : "overwrite_if_explicit_or_newer";
-
-      const confidenceNum = Number(c?.confidence);
-      const confidence = Number.isFinite(confidenceNum) ? Math.max(0, Math.min(1, confidenceNum)) : 0.75;
-
-      const context = String(c?.context ?? "").trim();
-
-      // evidence: allow either evidence[] or receipt_id/receipt_quote.
-      // Contract wants exactly 1 evidence item; enforce that deterministically.
-      let evidence: any[] = Array.isArray(c?.evidence) ? c.evidence : [];
-      if (evidence.length === 0) {
-        const quote = String(c?.receipt_quote ?? c?.quote ?? "").trim();
-        evidence = [{ receipt_id: receiptId, quote }];
-      }
-      evidence = evidence
-        .map((e) => ({
-          receipt_id: String(e?.receipt_id ?? receiptId).trim() || receiptId,
-          quote: String(e?.quote ?? "").trim(),
-        }))
-        .filter((e) => e.receipt_id && e.quote)
-        .slice(0, 1);
-
-       if (evidence.length === 0) continue;
- 
-      const fact_key = fact_key_raw || undefined;
-
-       out.push({
-        ...(fact_key ? { fact_key } : {}),
-        ...(subject ? { subject } : {}),
-        ...(attribute_path ? { attribute_path } : {}),
-         value_json,
-         value_type,
-         stability,
-         change_policy,
-         confidence,
-         evidence,
-         context,
-       });
- 
-      seen.add(dedupeKey);
-       if (out.length >= 15) break;
-     }
-
-    if (factsDebug) {
-      console.log("FACTS_DEBUG: parsed candidatesRaw:", candidatesRaw.length, "kept:", out.length);
-      if (out.length === 0) console.log("FACTS_DEBUG: parsed object keys:", Object.keys(parsed || {}));
-    }
-
-    // Return new shape; keep 'facts' alias for older callers if any.
-    return { fact_candidates: out, facts: out, raw_text: rawStr };
-  } catch (e) {
-    console.error("extractUserFactsWithGemini: unexpected error", e);
-    return { fact_candidates: [], facts: [], raw_text: "" };
-  }
+  return await extractUserFactsWithGeminiShared({
+    ...args,
+    invokeModel: async ({ system, user, temperature, maxOutputTokens }) => {
+      const raw = await callGemini({
+        system,
+        user,
+        temperature,
+        maxOutputTokens,
+      });
+      return String(raw ?? "");
+    },
+  });
 }
-
 
 function looksLikeNewSbSecret(token: string | null | undefined): boolean {
   return !!token && token.startsWith("sb_secret_");
@@ -1216,23 +1098,32 @@ const supabase = SUPABASE_URL && SERVICE_ROLE_KEY
     })
   : null;
 
-const GEMINI_API_KEY =
-  Deno.env.get("GEMINI_API_KEY") ?? Deno.env.get("GEMINI_API_KEY_EDGE");
+ const GEMINI_API_KEY =
+   Deno.env.get("GEMINI_API_KEY") ?? Deno.env.get("GEMINI_API_KEY_EDGE");
+ 
+// Default quiet. Set AI_BRAIN_DEBUG_LOGS=true only when actively debugging.
+const DEBUG_AI_BRAIN_LOGS = (Deno.env.get("AI_BRAIN_DEBUG_LOGS") ?? "false").toLowerCase() === "true";
 
-const GEMINI_MODEL = Deno.env.get("GEMINI_MODEL");
-if (!GEMINI_MODEL) {
-  throw new Error("Missing required edge secret: GEMINI_MODEL");
-}
+  const GEMINI_MODEL = Deno.env.get("GEMINI_MODEL");
+  if (!GEMINI_MODEL) {
+     throw new Error("Missing required edge secret: GEMINI_MODEL");
+   }
+  
+ if (DEBUG_AI_BRAIN_LOGS) console.log("GEMINI_MODEL DEBUG:", GEMINI_MODEL);
+ 
+ const GEMINI_MODEL_PATH = GEMINI_MODEL.startsWith("models/")
+   ? GEMINI_MODEL
+  : `models/${GEMINI_MODEL}`;
 
 if (!GEMINI_API_KEY) {
   console.error("❌ GEMINI_API_KEY is NOT set in Supabase environment.");
 }
 
-// Diagnostics build stamp — bump this string each deploy while debugging GUI vs server drift
-const DIAG_BUILD_STAMP = "diag-fix-2026-02-04-02";
+ // Diagnostics build stamp — bump this string each deploy while debugging GUI vs server drift
+  const DIAG_BUILD_STAMP = "diag-fix-2026-02-04-02";
 
-async function runDiagnostics({ supabase, userId: userIdParam, authHeader }: { supabase: any; userId?: string | null; authHeader?: string | null }) {
-  const results: any[] = [];
+  async function runDiagnostics({ supabase, userId: userIdParam, authHeader }: { supabase: any; userId?: string | null; authHeader?: string | null }) {
+   const results: any[] = [];
 
   // Resolve userId for DB FK-safe diagnostics.
   let userId: string | null | undefined = userIdParam ?? null;
@@ -1525,12 +1416,69 @@ type SummarizerContext = {
   conversation_id?: string | null;
 };
 
-function tryExtractJsonObject(rawText: string): any | null {
-  if (!rawText) return null;
+ function tryExtractJsonObject(rawText: string): any | null {
+   if (!rawText) return null;
+ 
+   let text = String(rawText).trim();
+  text = text.replace(/^\uFEFF/, "");
 
-  let text = String(rawText).trim();
+  const escapeNewlinesInsideJsonStrings = (input: string): string => {
+    const s = String(input ?? "");
+    let out = "";
+    let inString = false;
+    let escape = false;
 
-  // 1) Remove common Gemini wrappers / code fences:
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (escape) {
+        out += ch;
+        escape = false;
+        continue;
+      }
+      if (ch === "\\") {
+        out += ch;
+        escape = true;
+        continue;
+      }
+      if (ch === "\"") {
+        out += ch;
+        inString = !inString;
+        continue;
+      }
+      if (inString && (ch === "\n" || ch === "\r")) {
+        out += "\\n";
+        continue;
+      }
+      out += ch;
+    }
+
+    return out;
+  };
+
+  const sanitizeJsonText = (input: string): string =>
+    escapeNewlinesInsideJsonStrings(String(input ?? ""))
+      .replace(/^\uFEFF/, "")
+      .replace(/,\s*([}\]])/g, "$1")
+      .trim();
+
+  const parseCandidate = (input: string): any | null => {
+    const candidate = sanitizeJsonText(input);
+    if (!candidate) return null;
+    try {
+      const parsed = JSON.parse(candidate);
+      if (typeof parsed === "string") {
+        const inner = parsed.trim();
+        if (inner.startsWith("{") && inner.endsWith("}")) {
+          return parseCandidate(inner);
+        }
+      }
+      return parsed;
+    } catch {
+      return null;
+    }
+  };
+ 
+   // 1) Remove common Gemini wrappers / code fences:
   //    ```json { ... } ```
   //    ``` { ... } ```
   //    (Sometimes there is leading prose; we still try to grab the first {...} block.)
@@ -1546,24 +1494,20 @@ function tryExtractJsonObject(rawText: string): any | null {
     }
   }
 
-  // 2) Try direct parse.
-  try {
-    return JSON.parse(text);
-  } catch {
-    // 3) Fallback: extract the first JSON object substring.
-    const first = text.indexOf("{");
-    const last = text.lastIndexOf("}");
-    if (first !== -1 && last !== -1 && last > first) {
-      const candidate = text.slice(first, last + 1);
-      try {
-        return JSON.parse(candidate);
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  }
-}
+  // 2) Try direct/sanitized parse.
+  const direct = parseCandidate(text);
+  if (direct && typeof direct === "object" && !Array.isArray(direct)) return direct;
+
+  // 3) Fallback: extract the first JSON object substring.
+  const first = text.indexOf("{");
+  const last = text.lastIndexOf("}");
+  if (first !== -1 && last !== -1 && last > first) {
+    const sliced = parseCandidate(text.slice(first, last + 1));
+    if (sliced && typeof sliced === "object" && !Array.isArray(sliced)) return sliced;
+   }
+
+  return null;
+ }
 
 function stripSummaryMarkup(input: string): string {
   let s = String(input ?? "").trim();
@@ -1795,7 +1739,8 @@ FORMAT (STRICT):
 
   try {
     const resp = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+
+ `https://generativelanguage.googleapis.com/v1beta/${GEMINI_MODEL_PATH}:generateContent?key=${GEMINI_API_KEY}`,
       {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1818,11 +1763,37 @@ FORMAT (STRICT):
       json?.candidates?.[0]?.content?.parts?.[0]?.rawText ??
       "";
 
-    const parsed = tryExtractJsonObject(text);
-    if (!parsed) {
-      console.error("summarizeLegacySessionWithGemini: failed to parse JSON");
-      return null;
-    }
+
+     const parsed = tryExtractJsonObject(text);
+     if (!parsed) {
+      const realUserTurns = trimmedTurns
+        .filter((t) => isUserLikeRole((t as any)?.role))
+        .map((t) => String((t as any)?.text ?? "").trim())
+        .filter((t) => t && !isJunkUserLine(t));
+
+      const fallbackBody = realUserTurns
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      const short_summary = stripSummaryMarkup(
+        fallbackBody
+          ? `You discussed ${fallbackBody.slice(0, 220)}${fallbackBody.length > 220 ? "…" : ""}`
+          : "You recorded a session, but automated summarization returned an unreadable response."
+      );
+      const full_summary = stripSummaryMarkup(
+        fallbackBody
+          ? `You captured this session for later recall. The main details recorded were: ${fallbackBody.slice(0, 700)}${fallbackBody.length > 700 ? "…" : ""}`
+          : "You captured a session, but the automated summarizer returned an unreadable response. The raw memory remains available for recall."
+      );
+
+      return {
+        short_summary,
+        full_summary,
+        observations: null,
+        session_insights: { summary_fallback: "gemini_json_parse_failed" },
+      };
+     }
 
     const short_summary_raw = typeof parsed.short_summary === "string" ? parsed.short_summary.trim() : "";
     const full_summary_raw = typeof parsed.full_summary === "string" ? parsed.full_summary.trim() : "";
@@ -2539,7 +2510,7 @@ async function extractStoriesFromTranscript(
 
   try {
     const resp = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/${GEMINI_MODEL_PATH}:generateContent?key=${GEMINI_API_KEY}`,
       {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -2547,10 +2518,35 @@ async function extractStoriesFromTranscript(
       },
     );
 
-    if (!resp.ok) {
-      console.error("extractStoriesFromTranscript Gemini error", resp.status, await resp.text());
-      return [];
-    }
+if (!resp.ok) {
+  const errorBody = await resp.text();
+
+  console.error(
+    "summarizeLegacySessionWithGemini: non-OK response",
+    {
+      status: resp.status,
+      model: GEMINI_MODEL,
+      body: errorBody,
+    },
+  );
+
+  return null;
+}
+
+if (!resp.ok) {
+  const errorBody = await resp.text();
+
+  console.warn(
+    "FACTS: Gemini extractor non-OK response",
+    {
+      status: resp.status,
+      model: GEMINI_MODEL,
+      body: errorBody,
+    },
+  );
+
+  return [];
+}
 
     const json = await resp.json();
      const text =
@@ -5067,8 +5063,15 @@ function detectRecallIntent(userText: string): boolean {
   // - "tell me my address"
   // These should hydrate user_facts recall even without "earlier/last time".
   if (
-    /\b(what(?:'s| is)|who(?:'s| is)|tell me|remind me|show me|give me)\b/.test(t) &&
-    /\bmy\b/.test(t)
+    (
+      /\b(what(?:'s| is)|who(?:'s| is)|tell me|remind me|show me|give me)\b/.test(t) ||
+      /\bwhat\s+[a-z0-9\s]{1,80}\s+(?:is|are|was|were)\s+(?:my\s+)?[a-z0-9\s]{1,80}\b/.test(t) ||
+      /\bwhat\s+do\s+i\s+(?:keep|store|put|have)\s+in\s+(?:my\s+)?[a-z0-9\s]{1,80}\b/.test(t)
+    ) &&
+    (
+      /\bmy\b/.test(t) ||
+      /\b(passport|folder|travel documents|documents)\b/.test(t)
+    )
   ) {
     return true;
   }
@@ -5346,13 +5349,21 @@ for (const row of _picked) {
         .limit(8);
 
       for (const row of raws || []) {
-        evidences.push({
-          kind: "memory_raw",
-          id: row.id,
-          created_at: row.created_at,
-          excerpt: _safeStr(row.content, 420),
-        });
-      }
+        const rawContent = String((row as any)?.content ?? "").trim();
+        const rawLow = rawContent.toLowerCase();
+        const promptLow = String(userMessageForPrompt ?? "").trim().toLowerCase();
+        const isRequestOnly =
+          rawLow === promptLow ||
+          /^tell me (?:the |a |my )?story\b/i.test(rawContent) ||
+          /^retell\b/i.test(rawContent);
+        if (isRequestOnly) continue;
+         evidences.push({
+           kind: "memory_raw",
+           id: row.id,
+           created_at: row.created_at,
+          excerpt: _safeStr(rawContent, 420),
+         });
+       }
     }
 
     // If this is a story-retell request and we already have story evidence,
@@ -5610,11 +5621,11 @@ async function tryLoadStoryRetellBlockFromFacts(
 }
 
  async function recall_v2(
-   client: SupabaseClient,
-   userId: string,
-   userText: string,
-   limit = 14,
- ): Promise<{ addon: string; context: string } | null> {
+    client: SupabaseClient,
+    userId: string,
+    userText: string,
+    limit = 14,
+ ): Promise<{ addon: string; context: string; directReply?: string | null } | null> {
 
   const _rawIn = (userText ?? "").toString().trim();
 
@@ -5634,41 +5645,426 @@ async function tryLoadStoryRetellBlockFromFacts(
       break;
     }
     return out;
-  };
+   };
+ 
+    const rawQ = stripHarnessMarkers(_rawIn);
+    if (!rawQ) return null;
+   const q = rawQ.toLowerCase();
 
-   const rawQ = stripHarnessMarkers(_rawIn);
-   if (!rawQ) return null;
+   const explicitRecall =
+     /\b(remember|recall|what do you remember|tell me what you remember)\b/i.test(rawQ) ||
+     isRecordedRequest(rawQ);
 
-   // Single source of truth (read model): user_knowledge
-   // If present, use it directly for both legacy and avatar recall to avoid multi-table drift.
-   try {
+   const isQuestionLike =
+     /[?]/.test(rawQ) ||
+     /^(what|where|when|who|why|how|tell me|show me|give me|list|summarize|recap|remind me)\b/i.test(
+       rawQ.trim(),
+     );
+
+   const prefixes: string[] = [];
+   const addPrefix = (p: string) => {
+     const v = String(p ?? "").trim();
+     if (!v) return;
+     if (!prefixes.includes(v)) prefixes.push(v);
+   };
+ 
+    // Single source of truth (read model): user_knowledge
+    // If present, use it directly for both legacy and avatar recall to avoid multi-table drift.
+    try {
     const { data: uk } = await client
       .from("user_knowledge")
       .select("core, facts, updated_at")
       .eq("user_id", userId)
       .maybeSingle();
 
-    try {
-      if (uk && (uk as any).core) {
-        const coreObj = (uk as any).core;
-        const factsObj = (uk as any).facts;
+     try {
+       if (
+         uk &&
+         (
+           ((uk as any).core && typeof (uk as any).core === "object") ||
+           ((uk as any).facts && typeof (uk as any).facts === "object")
+         )
+       ) {
+         const coreObj =
+           ((uk as any).core && typeof (uk as any).core === "object")
+             ? (uk as any).core
+             : {};
+         const factsObj =
+           ((uk as any).facts && typeof (uk as any).facts === "object")
+             ? (uk as any).facts
+             : {};
+  
+          const coreLines = _renderFactLines(Object.entries(coreObj) as any, 700);
+          const relItems = _pickRelevantFactsFromMap(factsObj, rawQ, 18);
+          const storyBlock = await tryLoadStoryRetellBlockFromFacts(factsObj, rawQ);
+        const broadAskFromUk =
+          /(what do you know|tell me what you know|what do you remember|tell me what you remember|about me|my interests|my hobbies|my activities|summarize|summary|recap)/i.test(
+            rawQ,
+          );
+ 
+         const scoreUkEntryLoose = ([k, v]: [string, any]): number => {
+           const keyText = String(k ?? "").toLowerCase();
+           let valueText = "";
+           try {
+             valueText = typeof v === "string" ? v.toLowerCase() : JSON.stringify(v ?? "").toLowerCase();
+           } catch {
+             valueText = String(v ?? "").toLowerCase();
+           }
+           const hay = `${keyText} ${valueText}`;
+           let s = 0;
+           if (hay.includes(q)) s += 8;
 
-        const coreLines = _renderFactLines(Object.entries(coreObj) as any, 700);
-        const relItems = _pickRelevantFactsFromMap(factsObj, rawQ, 18);
-        const relLines = relItems.length ? _renderFactLines(relItems, 900) : "";
+          const words = q
+             .replace(/[^a-z0-9\s]/g, " ")
+             .split(/\s+/g)
+             .map((t) => t.trim())
+            .filter((t) => t.length >= 3);
 
-        const addon =
-          "AUTHORITATIVE_USER_KNOWLEDGE:\n" +
-          "CORE:\n" + (coreLines || "(none)") + "\n\n" +
-          "RELEVANT:\n" + (relLines || "(none)");
+          const phrases: string[] = [];
+          for (let i = 0; i < words.length - 1 && phrases.length < 8; i++) {
+            const a = words[i];
+            const b = words[i + 1];
+            if (!a || !b) continue;
+            phrases.push(`${a} ${b}`);
+          }
 
-        const storyBlock = await tryLoadStoryRetellBlockFromFacts(factsObj, rawQ);
-        const merged = storyBlock ? `${addon}\n\n${storyBlock}` : addon;
-        return { addon: merged, context: merged };
+          for (const ph of phrases) {
+            if (hay.includes(ph)) s += 3;
+          }
+
+           for (const p of words) {
+             if (hay.includes(p)) s += 1;
+          }
+
+          const specificTokens = hay.match(/\b[a-z0-9]*\d[a-z0-9]*\b/gi) ?? [];
+          if (specificTokens.length) s += Math.min(6, specificTokens.length * 2);
+
+            return s;
+          };
+ 
+        const scoredUkItems =
+           !factsObj || typeof factsObj !== "object"
+              ? []
+              : (Object.entries(factsObj) as Array<[string, any]>)
+                  .map((entry) => ({ entry, score: scoreUkEntryLoose(entry) }))
+                 .filter((x) => x.score > 0);
+  
+         const finalRelItems = (() => {
+          const relKeys = new Set(relItems.map(([k]) => String(k ?? "")));
+          const ranked = [
+            ...relItems.map((entry) => ({
+              entry,
+              score: Math.max(scoreUkEntryLoose(entry), 1),
+            })),
+            ...scoredUkItems,
+          ]
+            .map((x) => ({
+              ...x,
+              score: x.score + (relKeys.has(String(x.entry?.[0] ?? "")) ? 0.5 : 0),
+            }))
+            .sort((a, b) => b.score - a.score);
+
+           const out: Array<[string, any]> = [];
+           const seen = new Set<string>();
+          for (const { entry } of ranked) {
+             const k = String(entry?.[0] ?? "");
+             if (!k || seen.has(k)) continue;
+             seen.add(k);
+             out.push(entry);
+             if (out.length >= 18) break;
+           }
+           return out;
+        })();
+
+         const relLines = finalRelItems.length ? _renderFactLines(finalRelItems, 900) : "";
+         const composeDirectRecallReply = (
+           items: Array<[string, any]>,
+           _question: string,
+          ): string | null => {
+            if (!Array.isArray(items) || items.length === 0) return null;
+ 
+           const valueToReplyText = (v: any): string => {
+              if (v === null || v === undefined) return "";
+              if (typeof v === "string") return _cleanRecallValueText(v);
+              if (typeof v === "number" || typeof v === "boolean") return String(v);
+              if (Array.isArray(v)) {
+                return v
+                  .map((x) => valueToReplyText(x))
+                  .filter(Boolean)
+                  .join(", ")
+                  .trim();
+              }
+              if (typeof v === "object") {
+               const questionTokens = String(_question ?? "")
+                 .toLowerCase()
+                 .replace(/[^a-z0-9\s]/g, " ")
+                 .split(/\s+/g)
+                 .map((t) => t.trim())
+                 .filter((t) => t.length >= 3);
+
+               const rawCandidates: string[] = [];
+               const collectPrimitiveText = (x: any, depth = 0): void => {
+                 if (x === null || x === undefined || depth > 4) return;
+                 if (typeof x === "string" || typeof x === "number" || typeof x === "boolean") {
+                   const one = _cleanRecallValueText(x);
+                   if (one) rawCandidates.push(one);
+                   return;
+                 }
+                 if (Array.isArray(x)) {
+                   for (const item of x) collectPrimitiveText(item, depth + 1);
+                   return;
+                 }
+                 if (typeof x === "object") {
+                   for (const val of Object.values(x as any)) collectPrimitiveText(val, depth + 1);
+                 }
+               };
+
+               collectPrimitiveText(v);
+
+               const scored = Array.from(new Set(rawCandidates))
+                 .map((text) => {
+                   const lower = text.toLowerCase();
+                   const hits = questionTokens.filter((t) => lower.includes(t)).length;
+                   const hasSpecificToken = /\b[a-z0-9]*\d[a-z0-9]*\b/i.test(text);
+                   return {
+                     text,
+                     score:
+                       hits * 20 +
+                       (hasSpecificToken ? 8 : 0) +
+                       Math.min(text.length, 240) / 24,
+                   };
+                 })
+                 .sort((a, b) => b.score - a.score || b.text.length - a.text.length);
+
+               if (scored.length) {
+                 return _cleanRecallValueText(scored.slice(0, 3).map((x) => x.text).join("; "));
+               }
+
+               const parts = Object.entries(v as any)
+                  .map(([field, val]) => {
+                    const one = valueToReplyText(val);
+                    if (!one) return "";
+                   const label = String(field ?? "")
+                     .replace(/[._]+/g, " ")
+                     .replace(/\s+/g, " ")
+                     .trim();
+                   return label ? `${label}: ${one}` : one;
+                 })
+                 .filter(Boolean);
+               return _cleanRecallValueText(parts.join("; "));
+             }
+             return "";
+           };
+
+            const parts = items
+              .map(([k, v]) => {
+                const keyText = String(k ?? "")
+                 .replace(/^stories\./i, "")
+                 .replace(/[._]+/g, " ")
+                 .replace(/\s+/g, " ")
+                 .trim();
+               const valueText = valueToReplyText(v);
+               if (!valueText) return "";
+               const isBundleKey = /(^|[._-])(memory|extracted|facts|transcript|bundle)([._-]|$)/i.test(String(k ?? ""));
+               if (isBundleKey) return valueText;
+               return keyText ? `${keyText}: ${valueText}` : valueText;
+
+             })
+             .filter(Boolean);
+
+             const scoreReplyPart = (part: string): number => {
+               const hay = String(part ?? "").toLowerCase();
+               const qTokens = String(_question ?? "")
+                 .toLowerCase()
+                 .replace(/[^a-z0-9\s]/g, " ")
+                 .split(/\s+/g)
+                 .map((t) => t.trim())
+                 .filter((t) => t.length >= 3);
+               const hits = qTokens.filter((t) => hay.includes(t)).length;
+               const specificTokens = (String(part ?? "").match(/\b[a-z0-9]*\d[a-z0-9]*\b/gi) ?? []).length;
+               return hits * 20 + specificTokens * 8 + Math.min(String(part ?? "").length, 400) / 40;
+             };
+
+             const unique = Array.from(new Set(parts.filter(Boolean)))
+               .sort((a, b) => scoreReplyPart(b) - scoreReplyPart(a))
+               .slice(0, 4);
+           if (unique.length === 0) return null;
+           if (unique.length === 1) return unique[0];
+           return `${unique.join("; ")}.`;
+         };
+
+          const exactBundleDirectReply = (() => {
+            const bundleEntries =
+              factsObj && typeof factsObj === "object"
+                ? (Object.entries(factsObj) as Array<[string, any]>)
+                    .filter(([k, v]) => {
+                      const key = String(k ?? "");
+                      const val = (() => {
+                        try {
+                          return typeof v === "string" ? v : JSON.stringify(v ?? "");
+                        } catch {
+                          return String(v ?? "");
+                        }
+                      })();
+                      return (
+                        /(^|[._-])(memory|extracted|facts|transcript|bundle)([._-]|$)/i.test(key) ||
+                        /\bRemember this\b/i.test(val)
+                      );
+                    })
+                : [];
+
+            if (!bundleEntries.length) return null;
+
+            const qTokens = String(rawQ ?? "")
+              .toLowerCase()
+              .replace(/[^a-z0-9\s]/g, " ")
+              .split(/\s+/g)
+              .map((t) => t.trim())
+              .filter((t) =>
+                t.length >= 3 &&
+                ![
+                  "what", "which", "where", "when", "tell", "show", "give",
+                  "remember", "recall", "recorded", "have", "does", "inside",
+                  "your", "mine", "with", "about", "use", "special",
+                ].includes(t)
+              );
+
+            const fragments: string[] = [];
+            for (const [, v] of bundleEntries) {
+              const text = _cleanRecallValueText(v);
+              if (!text) continue;
+              for (const fragment of text.split(/(?:\r?\n|[.!?]\s+|;\s+)/g)) {
+                const one = _cleanRecallValueText(fragment);
+                if (one.length >= 8) fragments.push(one);
+              }
+            }
+
+            const ranked = Array.from(new Set(fragments))
+              .map((text) => {
+                const lower = text.toLowerCase();
+                const hits = qTokens.filter((t) => lower.includes(t)).length;
+
+                 const specificTokens = (text.match(/\b[a-z0-9]*\d[a-z0-9]*\b/gi) ?? []).length;
+                 return {
+                   text,
+                  hits,
+                  specificTokens,
+                   score: hits * 30 + specificTokens * 40 + Math.min(text.length, 300) / 30,
+                 };
+               })
+              .filter((x) => x.hits > 0 || x.specificTokens > 0)
+               .sort((a, b) => b.score - a.score || b.text.length - a.text.length);
+ 
+            const picked: string[] = [];
+            for (const item of ranked) {
+              if (!item?.text) continue;
+              const alreadyCovered = picked.some((existing) =>
+                existing.toLowerCase().includes(item.text.toLowerCase()) ||
+                item.text.toLowerCase().includes(existing.toLowerCase())
+              );
+              if (alreadyCovered) continue;
+              picked.push(item.text);
+              if (picked.length >= 1) break;
+            }
+
+            return picked.length ? picked.join("; ") : null;
+           })();
+
+          const rawReceiptDirectReply = await (async (): Promise<string | null> => {
+            const qTokens = String(rawQ ?? "")
+              .toLowerCase()
+              .replace(/[^a-z0-9\s]/g, " ")
+              .split(/\s+/g)
+              .map((t) => t.trim())
+              .filter((t) =>
+                t.length >= 3 &&
+                ![
+                  "what", "which", "where", "when", "tell", "show", "give",
+                  "remember", "recall", "recorded", "have", "does", "inside",
+                  "your", "mine", "with", "about", "use", "special",
+                ].includes(t)
+              );
+
+            if (!qTokens.length) return null;
+
+            const { data, error } = await client
+              .from("memory_raw")
+              .select("content, role, created_at")
+              .eq("user_id", userId)
+              .order("created_at", { ascending: false })
+              .limit(120);
+
+            if (error || !Array.isArray(data) || data.length === 0) return null;
+
+            const candidates: Array<{ text: string; score: number }> = [];
+            for (const row of data as any[]) {
+              const role = String(row?.role ?? "").toLowerCase();
+              if (role === "assistant" || role === "system") continue;
+
+              const content = String(row?.content ?? "").trim();
+              if (!content || content === rawQ) continue;
+
+              const fragments = content
+                .split(/(?:\r?\n|[.!?]\s+|;\s+)/g)
+                .map((fragment) =>
+                  _cleanRecallValueText(fragment)
+                    .replace(/^Remember this:\s*/i, "")
+                    .replace(/^Also:\s*/i, "")
+                    .trim()
+                )
+                .filter((fragment) => fragment.length >= 8);
+
+              for (const fragment of fragments) {
+                const lower = fragment.toLowerCase();
+                const hits = qTokens.filter((t) => lower.includes(t)).length;
+                if (hits === 0) continue;
+
+                const specificTokens = (fragment.match(/\b[a-z0-9]*\d[a-z0-9]*\b/gi) ?? []).length;
+                const score = hits * 30 + specificTokens * 45 + Math.min(fragment.length, 500) / 50;
+                candidates.push({ text: fragment, score });
+              }
+            }
+
+            const picked: string[] = [];
+            for (const item of candidates.sort((a, b) => b.score - a.score || b.text.length - a.text.length)) {
+              const text = item.text.trim();
+              if (!text) continue;
+              const alreadyCovered = picked.some((existing) =>
+                existing.toLowerCase().includes(text.toLowerCase()) ||
+                text.toLowerCase().includes(existing.toLowerCase())
+              );
+              if (alreadyCovered) continue;
+              picked.push(text);
+              if (picked.length >= 1) break;
+            }
+
+            return picked.length ? picked.join("; ") : null;
+          })();
+
+          let ukDirectReply: string | null =
+            rawReceiptDirectReply ?? exactBundleDirectReply ?? composeDirectRecallReply(finalRelItems, rawQ);
+          // Deterministic FACT/USER_KNOWLEDGE recall:
+          // If user_knowledge has relevant facts for this question, return them now.
+          // Do NOT wait for a model denial; at this point replyText may not exist yet.
+         if ((finalRelItems.length > 0 || rawReceiptDirectReply) && ukDirectReply) {
+           const addon =
+             "AUTHORITATIVE_USER_KNOWLEDGE:\n" +
+             "CORE:\n" + (coreLines || "(none)") + "\n\n" +
+             "RELEVANT:\n" + (relLines || "(none)");
+
+           const merged = storyBlock ? `${addon}\n\n${storyBlock}` : addon;
+           const directBlock = `DIRECT_GROUNDED_REPLY:\n${ukDirectReply}`;
+
+           return {
+             addon: `${directBlock}\n\n${merged}`,
+             context: `${directBlock}\n\n${merged}`,
+             directReply: ukDirectReply,
+           };
+         }
+        }
+       } catch (_e) {
+        // best-effort: fall through
       }
-     } catch (_e) {
-       // best-effort: fall through
-     }
 
    } catch (_e) {
      // best-effort: fall through to non-user_knowledge recall
@@ -5902,64 +6298,159 @@ async function tryLoadStoryRetellBlockFromFacts(
   }
   }
 
+  function _cleanRecallValueText(v: any): string {
+    const raw = (() => {
+      try {
+        return typeof v === "string" ? v : _safeJsonStringify(v);
+      } catch {
+        return String(v ?? "");
+      }
+    })();
+
+   return String(raw ?? "")
+     .replace(/memory extracted facts [a-f0-9]+:/gi, "")
+     .replace(/\[RID:[^\]]+\]/gi, "")
+     .replace(/\buser:\s*/gi, "")
+     .replace(/\bRemember this:\s*/gi, "")
+     .replace(/\bAlso:\s*/gi, "")
+     .replace(/\s+/g, " ")
+     .trim();
+  }
+
   function _pickRelevantFactsFromMap(facts: any, question: string, maxItems = 18): Array<[string, any]> {
+
   if (!facts || typeof facts !== "object") return [];
   const q = String(question ?? "").toLowerCase();
 
   const prefixes: string[] = [];
   if (/(food|eat|diet|fruit|snack|grocery|restaurant|buffet|peach|apple)/i.test(q)) {
-    prefixes.push("preferences.", "diet.", "food.");
-   } else if (/(work|job|career|employ|ssa|social security|office)/i.test(q)) {
-     prefixes.push("work.", "education.");
-   } else if (/(wife|husband|partner|relationship|married|single|kids|children|daughter|son|family)/i.test(q)) {
-     prefixes.push("relationships.");
-   } else if (/(story|stories|tell me .* story|retell|murder crab|murder crabs|suckling pig)/i.test(q)) {
-    prefixes.push("stories.");
-   } else if (/(live|living|where|location|country|city|timezone)/i.test(q)) {
-     prefixes.push("location.");
-   } else if (/(value|principle|belief|what matters|purpose)/i.test(q)) {
-     prefixes.push("values.");
+     prefixes.push("preferences.", "diet.", "food.");
+    } else if (/(work|job|career|employ|ssa|social security|office)/i.test(q)) {
+      prefixes.push("work.", "education.");
+    } else if (/(wife|husband|partner|relationship|married|single|kids|children|daughter|son|family)/i.test(q)) {
+       prefixes.push("work.", "education.");
+     } else if (/(wife|husband|partner|relationship|married|single|kids|children|daughter|son|family)/i.test(q)) {
+       prefixes.push("relationships.");
+     } else if (/(passport|folder|travel papers?|travel documents?|travel paperwork|folio|visa card|reservations?|backup cards?|emergency contact)/i.test(q)) {
+      prefixes.push("travel.", "documents.", "organization.");
+ 
+     } else if (/(story|stories|tell me .* story|retell|murder crab|murder crabs|suckling pig)/i.test(q)) {
+     prefixes.push("stories.");
+    } else if (/(live|living|where|location|country|city|timezone)/i.test(q)) {
+      prefixes.push("location.");
+      } else if (/(value|principle|belief|what matters|purpose)/i.test(q)) {
+
+      prefixes.push("values.");
+    }
+ 
+   const entries = Object.entries(facts) as Array<[string, any]>;
+  if (prefixes.length) {
+    const picked: Array<[string, any]> = [];
+    const seen = new Set<string>();
+    for (const [k, v] of entries) {
+      if (picked.length >= maxItems) break;
+       if (seen.has(k)) continue;
+       if (!prefixes.some((p) => k.startsWith(p))) continue;
+       const hay = `${String(k ?? "").toLowerCase()} ${typeof v === "string" ? v.toLowerCase() : JSON.stringify(v ?? "").toLowerCase()}`;
+      if (/(passport|folder|travel papers?|travel documents?|travel paperwork|folio|visa card)/i.test(q)) {
+        const hasTravelDocumentHit =
+           hay.includes("passport") ||
+           hay.includes("folder") ||
+           hay.includes("travel paper") ||
+           hay.includes("travel document") ||
+           hay.includes("travel paperwork") ||
+           hay.includes("folio") ||
+           hay.includes("visa card") ||
+           hay.includes("backup card") ||
+           hay.includes("burnt orange");
+        if (!hasTravelDocumentHit) continue;
+       }
+        seen.add(k);
+        picked.push([k, v]);
+    }
+    if (picked.length > 0) return picked;
+  }
+
+  const stop = new Set([
+    "a", "an", "the", "and", "or", "but", "if", "then", "else", "so", "to", "of", "in", "on", "for", "with", "at", "by", "from", "as",
+    "is", "are", "was", "were", "be", "been", "being", "i", "me", "my", "mine", "you", "your", "yours", "what", "tell", "show",
+    "remember", "recall", "about", "please",
+  ]);
+
+  const tokens = q
+     .replace(/[^a-z0-9\s]/g, " ")
+     .split(/\s+/g)
+     .map((t) => t.trim())
+     .filter((t) => t.length >= 3 && !stop.has(t))
+     .slice(0, 12);
+
+  const words = q
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/g)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 3 && !stop.has(t));
+
+  const phrases: string[] = [];
+  for (let i = 0; i < words.length - 1 && phrases.length < 8; i++) {
+    const a = words[i];
+    const b = words[i + 1];
+    if (!a || !b) continue;
+    phrases.push(`${a} ${b}`);
+  }
+
+  if (!tokens.length) return [];
+
+  return entries
+    .map(([k, v]) => {
+      let valueText = "";
+      try {
+        valueText = typeof v === "string" ? v.toLowerCase() : JSON.stringify(v ?? "").toLowerCase();
+      } catch {
+        valueText = String(v ?? "").toLowerCase();
+      }
+      const hay = `${String(k ?? "").toLowerCase()} ${valueText}`;
+      let score = 0;
+      for (const ph of phrases) {
+        if (hay.includes(ph)) score += 3;
+      }
+       for (const t of tokens) {
+         if (hay.includes(t)) score += 1;
+       }
+       return { k, v, score };
+     })
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, maxItems)
+    .map((x) => [x.k, x.v] as [string, any]);
    }
 
-  if (!prefixes.length) return [];
-  const entries = Object.entries(facts) as Array<[string, any]>;
-  const picked: Array<[string, any]> = [];
-  const seen = new Set<string>();
-  for (const [k, v] of entries) {
-    if (picked.length >= maxItems) break;
-    if (seen.has(k)) continue;
-    if (!prefixes.some((p) => k.startsWith(p))) continue;
-    seen.add(k);
-    picked.push([k, v]);
-  }
-  return picked;
-  }
-
-  function _renderFactLines(items: Array<[string, any]>, maxChars = 900): string {
-  if (!items.length) return "";
-  const lines: string[] = [];
-  let total = 0;
-  for (const [k, v] of items) {
-    const line = `- ${k}: ${typeof v === "string" ? v : _safeJsonStringify(v)}`;
-    if (total + line.length + 1 > maxChars) break;
-    lines.push(line);
-    total += line.length + 1;
-  }
-  return lines.join("\\n");
-  }   
+   function _renderFactLines(items: Array<[string, any]>, maxChars = 900): string {
+   if (!items.length) return "";
+   const lines: string[] = [];
+   let total = 0;
+   for (const [k, v] of items) {
+    const cleanedValue = _cleanRecallValueText(v);
+    if (!cleanedValue) continue;
+    const line = `- ${k}: ${cleanedValue}`;
+     if (total + line.length + 1 > maxChars) break;
+     lines.push(line);
+     total += line.length + 1;
+   }
+   return lines.join("\\n");
+   }    
 
   // IMPORTANT:
   // For explicit recall lookups (e.g., "When did I earn my MBA?"), do not inject an unrelated
   // USER_FACTS working set. If we have no lexical/prefix match at all, return null so the caller
   // can enable SESSION-LOCAL RECALL (RECENT TURNS FROM THIS SESSION).
-  if (explicitRecall && isQuestionLike && !broadAsk && tokens.length) {
+  if (isQuestionLike && !broadAsk && tokens.length) {
     const best = scored[0];
     const bestMatched = Number((best as any)?.matchedTokens ?? 0);
     const bestPrefixHit = Boolean((best as any)?.prefixHit ?? false);
     if (bestMatched <= 0 && !bestPrefixHit) return null;
   }
 
-   const top = scored.slice(0, Math.max(limit, 10));
+   const top = scored.slice(0, Math.max(limit, 30));
 
   // Build conflict hints: same canonical_key with multiple distinct values at decent confidence.
   const byCk = new Map<string, { v: string; conf: number }[]>();
@@ -5983,18 +6474,33 @@ async function tryLoadStoryRetellBlockFromFacts(
   // If we have a strong top match, return a direct answer string for runTurnPipeline to short-circuit Gemini.
   let directReply: string | null = null;
 
-  const tokenMatchCount = (candidateKey: string): number => {
-    let n = 0;
-    for (const t of tokens) {
-      if (!t) continue;
-      if (candidateKey.includes(t)) n += 1;
-    }
-    return n;
+  const tokenMatchCount = (candidateText: string): number => {
+     let n = 0;
+     for (const t of tokens) {
+       if (!t) continue;
+      if (candidateText.includes(t)) n += 1;
+     }
+     return n;
+   };
+ 
+  const tokenMatchCountForRow = (row: any): number => {
+  const fk = norm(row?.fact_key || "");
+  const ck = norm(row?.canonical_key || "");
+  const cx = String(row?.context ?? "").toLowerCase();
+
+  let vj = "";
+  try {
+    vj = JSON.stringify(row?.value_json ?? "").toLowerCase();
+  } catch {
+    vj = String(row?.value_json ?? "").toLowerCase();
+  }
+
+  return tokenMatchCount(`${fk} ${ck} ${cx} ${vj}`);
   };
 
-  const coerceOneLineValue = (v: any): string => {
+   const coerceOneLineValue = (v: any): string => {
     if (v === null || v === undefined) return "";
-    if (typeof v === "string") return v.trim();
+    if (typeof v === "string") return _cleanRecallValueText(v);
     if (typeof v === "number" || typeof v === "boolean") return String(v);
     if (Array.isArray(v)) {
       const parts = v
@@ -6051,18 +6557,42 @@ async function tryLoadStoryRetellBlockFromFacts(
       .trim();
   };
 
-  if (explicitRecall && isQuestionLike && !broadAsk && tokens.length) {
-    // Pick the best candidate by token-match quality (not by lock/recency),
-    // then tie-break by score.
+  const weakRecallWords = new Set([
+    "what", "which", "where", "when", "does", "have", "that",
+    "your", "mine", "recorded", "record", "records", "information", "info",
+    "color", "contents", "content", "inside", "keep", "store", "put",
+  ]);
+
+  const subjectTokens = tokens.filter((t) => !weakRecallWords.has(t));
+
+  const subjectMatchCountForRow = (row: any): number => {
+    const hay = [
+      String(row?.fact_key ?? ""),
+      String(row?.canonical_key ?? ""),
+      String(row?.context ?? ""),
+      JSON.stringify(row?.value_json ?? ""),
+    ].join(" ").toLowerCase();
+
+    return subjectTokens.filter((t) => hay.includes(t)).length;
+  };
+
+  if (isQuestionLike && !broadAsk && tokens.length) {
     const minMatch = tokens.length >= 2 ? 2 : 1;
+
     const ranked = top
       .map((s) => {
         const r = s?.r;
-        const k = norm(r?.canonical_key || r?.fact_key);
-        return { s, r, k, m: tokenMatchCount(k) };
+        return {
+          s,
+          r,
+          m: tokenMatchCountForRow(r),
+          sm: subjectMatchCountForRow(r),
+        };
       })
       .filter((x) => x.r && x.m >= minMatch)
+      .filter((x) => subjectTokens.length === 0 || x.sm > 0)
       .sort((a, b) => {
+        if (b.sm !== a.sm) return b.sm - a.sm;
         if (b.m !== a.m) return b.m - a.m;
         return (b.s?.score ?? 0) - (a.s?.score ?? 0);
       });
@@ -6075,64 +6605,60 @@ async function tryLoadStoryRetellBlockFromFacts(
         ? best.receipt_quotes.some((q: any) => String(q ?? "").trim().length > 0)
         : String(best.receipt_quotes ?? "").trim().length > 0;
 
-      // Universal “safe enough” gating:
-      // - If tokens are specific (>=2), token match is the primary safety signal.
-      // - If tokens are vague (only 1), require stronger provenance.
-      const bestKey = norm(best.canonical_key || best.fact_key);
-      const matchCount = tokenMatchCount(bestKey);
+      const matchCount = tokenMatchCountForRow(best);
+      const subjectMatchCount = subjectMatchCountForRow(best);
+
       const strong =
-        matchCount >= 2 ||
-        (matchCount >= 1 && (is_locked || hasReceipt || conf >= 0.75));
+        subjectMatchCount > 0 &&
+        (
+          matchCount >= 2 ||
+          (matchCount >= 1 && (is_locked || hasReceipt || conf >= 0.75))
+        );
 
-        if (strong) {
-          const slot = extractMySlot(rawQ);
-         let valueText = coerceOneLineValue(best.value_json);
+      if (strong) {
+        const slot = extractMySlot(rawQ);
+        let valueText = coerceOneLineValue(best.value_json);
 
-         // If the user asks for an ordinal child (oldest/middle/youngest) and the stored
-         // value is a list, pick ONE element deterministically instead of joining the array.
-         const slotLower = String(slot || "").toLowerCase();
-         const qLower = String(rawQ || "").toLowerCase();
-         const asksOrdinal =
-           /\b(oldest|middle|youngest)\b/.test(slotLower) ||
-           /\b(oldest|middle|youngest)\b/.test(qLower);
-
-         if (asksOrdinal) {
-           const ord =
-             /\boldest\b/.test(slotLower) || /\boldest\b/.test(qLower)
-               ? "oldest"
-               : /\byoungest\b/.test(slotLower) || /\byoungest\b/.test(qLower)
-                 ? "youngest"
-                 : /\bmiddle\b/.test(slotLower) || /\bmiddle\b/.test(qLower)
-                   ? "middle"
-                   : null;
-
-           if (ord) {
-             let arr: any[] | null = null;
-             if (Array.isArray(best.value_json)) arr = best.value_json as any[];
-             else if (best.value_json && typeof best.value_json === "object") {
-               const o: any = best.value_json;
-               if (Array.isArray(o.names)) arr = o.names;
-               else if (Array.isArray(o.children)) arr = o.children;
-               else if (Array.isArray(o.daughters)) arr = o.daughters;
-               else if (Array.isArray(o.sons)) arr = o.sons;
-             }
-
-             if (arr && arr.length) {
-               const idx =
-                 ord === "oldest" ? 0 : ord === "youngest" ? (arr.length - 1) : Math.floor(arr.length / 2);
-               const one = coerceOneLineValue(arr[idx]);
-               if (one) valueText = one;
-             }
-           }
-         }
-
-         if (valueText) {
-           directReply = slot ? `Your ${slot} is ${valueText}.` : valueText;
-         }
+        if (valueText) {
+          directReply = slot ? `Your ${slot} is ${valueText}.` : valueText;
         }
       }
     }
-  
+  }
+
+  const fallbackDirectReplyFromLines = (() => {
+    if (directReply) return directReply;
+
+    const ranked = top
+      .map((s: any) => ({
+        row: s.r,
+        matches: tokenMatchCountForRow(s.r),
+        subjectMatches: subjectMatchCountForRow(s.r),
+        score: Number(s.score ?? 0),
+      }))
+.filter((x: any) => x.matches > 0)
+.filter((x: any) => {
+  const key = String(x.row?.canonical_key ?? x.row?.fact_key ?? "").toLowerCase();
+  return subjectTokens.length === 0 || subjectTokens.some((t) => key.includes(t));
+})
+.sort((a: any, b: any) => {
+  if (b.matches !== a.matches) return b.matches - a.matches;
+  return b.score - a.score;
+});
+
+    const best = ranked[0]?.row;
+    if (!best) return null;
+
+    const key = String(best.canonical_key ?? best.fact_key ?? "").trim();
+    const value = coerceOneLineValue(best.value_json);
+
+    return key && value ? `Here’s what I have recorded: ${key}: ${value}` : null;
+  })();
+
+  if (fallbackDirectReplyFromLines) {
+    directReply = fallbackDirectReplyFromLines;
+  }
+
   // Addon text: authorize using facts (receipts optional) + forbid "not recorded" when present.
   const addonLines: string[] = [];
   addonLines.push("USER_FACTS_WORKING_SET (authoritative memory; use to answer directly):");
@@ -6162,11 +6688,12 @@ async function tryLoadStoryRetellBlockFromFacts(
     const locked = r.is_locked ? " LOCKED" : "";
     const value = fmtValue(r.value_json);
     addonLines.push(`- ${key}: ${value} (conf=${conf.toFixed(2)}${locked})`);
-    if (r.receipt_quotes) {
-      const rq = Array.isArray(r.receipt_quotes) ? r.receipt_quotes.join(" | ") : String(r.receipt_quotes);
-      const clipped = rq.length > 240 ? rq.slice(0, 237) + "..." : rq;
-      addonLines.push(`  receipts: ${clipped}`);
-    }
+     if (r.receipt_quotes) {
+       const rq = Array.isArray(r.receipt_quotes) ? r.receipt_quotes.join(" | ") : String(r.receipt_quotes);
+       const cleanRq = _cleanRecallValueText(rq);
+       const clipped = cleanRq.length > 240 ? cleanRq.slice(0, 237) + "..." : cleanRq;
+       addonLines.push(`  receipts: ${clipped}`);
+     }
   }
 
   const contextLines: string[] = [];
@@ -6190,11 +6717,11 @@ async function tryLoadStoryRetellBlockFromFacts(
  }
 
 async function hydrateUserFactsEvidence(
-    client: SupabaseClient,
-    userId: string,
-    userText: string,
-    limit = 12,
- ): Promise<{ addon: string; context: string } | null> {
+     client: SupabaseClient,
+     userId: string,
+     userText: string,
+     limit = 12,
+ ): Promise<{ addon: string; context: string; directReply?: string | null } | null> {
 
   const rawQ = (userText ?? "").trim();
   const q = rawQ.toLowerCase();
@@ -6327,32 +6854,32 @@ async function hydrateUserFactsEvidence(
               ? r.source_meta.context
               : "",
           receipt_quotes: r.source_quote ? [String(r.source_quote)] : [],
-          is_locked: false,
-        };
-      });
-      console.log("FACT_RECALL_DEBUG: using fact_candidates fallback", {
-        candidateLimit: fcLimit,
-        rowCount: rows.length,
-      });
-    }
-  }
-
-  console.log("FACT_RECALL_DEBUG: user_facts query ok", {
-    candidateLimit,
-    rowCount: rows.length,
-    tokenCount: tokens.length,
+           is_locked: false,
+         };
+       });
+      if (DEBUG_AI_BRAIN_LOGS) console.log("FACT_RECALL_DEBUG: using fact_candidates fallback", {
+         candidateLimit: fcLimit,
+         rowCount: rows.length,
+       });
+     }
+   }
+ 
+  if (DEBUG_AI_BRAIN_LOGS) console.log("FACT_RECALL_DEBUG: user_facts query ok", {
+     candidateLimit,
+     rowCount: rows.length,
+     tokenCount: tokens.length,
     tokens,
   });
   if (rows.length) {
-    console.log(
-      "FACT_RECALL_DEBUG: sample fact_keys (pre-filter)",
-      rows.slice(0, 12).map((r) => r?.fact_key),
-    );
-  } else {
-    console.log("FACT_RECALL_DEBUG: no user_facts rows returned (pre-filter)");
-     return null;
-   }
- 
+    if (DEBUG_AI_BRAIN_LOGS) console.log(
+       "FACT_RECALL_DEBUG: sample fact_keys (pre-filter)",
+        rows.slice(0, 12).map((r) => r?.fact_key),
+      );
+   } else {
+    if (DEBUG_AI_BRAIN_LOGS) console.log("FACT_RECALL_DEBUG: no user_facts rows returned (pre-filter)");
+      return null;
+    }
+   
    const isSelfQuery = /\b(i|me|my|mine)\b/.test(q);
    const isOtherPersonQuery = /\b(daughter|daughters|son|sons|child|children|kid|kids|wife|husband|mom|mother|dad|father|parent|parents)\b/.test(q);
 
@@ -6441,8 +6968,8 @@ async function hydrateUserFactsEvidence(
 
 const pickFrom = nameFiltered.length ? nameFiltered : scored;
 
-const sorted = pickFrom.slice(0, limit).map((s) => s.r);
-if (!sorted.length) return null;
+const sorted = pickFrom.slice(0, Math.max(limit, 30)).map((s) => s.r);
+ if (!sorted.length) return null;
 
   console.log("FACT_RECALL: user_facts rows", rows.length, { selected: sorted.length, tokens, bestScore });
   console.log(
@@ -6453,18 +6980,36 @@ if (!sorted.length) return null;
   // Universal deterministic answer for strong lexical matches (prevents model parroting).
   let directReply: string | null = null;
 
-  const tokenMatchCount = (candidateKey: string): number => {
+  const tokenMatchCount = (candidateText: string): number => {
     let n = 0;
+    const hay = String(candidateText ?? "").toLowerCase();
+
     for (const t of tokens) {
       if (!t) continue;
-      if (candidateKey.includes(String(t).toLowerCase())) n += 1;
+      if (hay.includes(String(t).toLowerCase())) n += 1;
     }
+
     return n;
   };
 
-  const coerceOneLineValue = (v: any): string => {
-    if (v === null || v === undefined) return "";
-    if (typeof v === "string") return v.trim();
+  const tokenMatchCountForRow = (row: any): number => {
+    const fk = String(row?.fact_key ?? "").toLowerCase();
+    const ck = String(row?.canonical_key ?? "").toLowerCase();
+    const cx = String(row?.context ?? "").toLowerCase();
+
+    let vj = "";
+    try {
+      vj = JSON.stringify(row?.value_json ?? "").toLowerCase();
+    } catch {
+      vj = String(row?.value_json ?? "").toLowerCase();
+    }
+
+    return tokenMatchCount(`${fk} ${ck} ${cx} ${vj}`);
+  };
+ 
+   const coerceOneLineValue = (v: any): string => {
+     if (v === null || v === undefined) return "";
+     if (typeof v === "string") return v.trim();
     if (typeof v === "number" || typeof v === "boolean") return String(v);
     if (Array.isArray(v)) {
       const parts = v
@@ -6517,15 +7062,12 @@ if (!sorted.length) return null;
   if (tokens.length) {
     // Select best by token-match quality within the already-sorted list.
     const minMatch = tokens.length >= 2 ? 2 : 1;
-    const ranked = sorted
-      .map((r: any) => {
-        const fk = String(r?.fact_key ?? "").toLowerCase();
-        const ck = String(r?.canonical_key ?? "").toLowerCase();
-        const k = ck || fk;
-        return { r, k, m: tokenMatchCount(k) };
-      })
-      .filter((x) => x.r && x.m >= minMatch)
-      .sort((a, b) => b.m - a.m);
+     const ranked = sorted
+       .map((r: any) => {
+        return { r, m: tokenMatchCountForRow(r) };
+       })
+       .filter((x) => x.r && x.m >= minMatch)
+       .sort((a, b) => b.m - a.m);
 
     const best = ranked[0]?.r;
     if (best) {
@@ -6539,10 +7081,10 @@ if (!sorted.length) return null;
         ? best.receipt_quotes.some((q: any) => String(q ?? "").trim().length > 0)
         : String(best.receipt_quotes ?? "").trim().length > 0;
 
-      const matchCount = tokenMatchCount(k);
+      const matchCount = tokenMatchCountForRow(best);
       const strong =
-        matchCount >= 2 ||
-        (matchCount >= 1 && (is_locked || hasReceipt || conf >= 0.75));
+         matchCount >= 2 ||
+         (matchCount >= 1 && (is_locked || hasReceipt || conf >= 0.75));
 
       if (strong) {
         const slot = extractMySlot(rawQ);
@@ -6654,19 +7196,19 @@ if (!sorted.length) return null;
 
   const receipt = receipts.length ? receipts[0] : "";
 
-  linesOut.push(
-   `- ${fact_key}${is_locked ? " [LOCKED]" : ""} (conf: ${conf.toFixed(2)}) = ${JSON.stringify(value_json)}${
-    receipt ? `\n  receipt: "${receipt}"` : ""
-   }`,
+ linesOut.push(
+   `- ${fact_key}: ${typeof value_json === "object"
+     ? JSON.stringify(value_json)
+     : String(value_json)}`
   );
-}
-
-  console.log("FACT_RECALL_DEBUG: linesOut.length", linesOut.length);
-  if (linesOut.length) {
-    console.log("FACT_RECALL_DEBUG: first linesOut items", linesOut.slice(0, 3));
-  }
-
-  const addon =
+ }
+ 
+  if (DEBUG_AI_BRAIN_LOGS) console.log("FACT_RECALL_DEBUG: linesOut.length", linesOut.length);
+   if (linesOut.length) {
+    if (DEBUG_AI_BRAIN_LOGS) console.log("FACT_RECALL_DEBUG: first linesOut items", linesOut.slice(0, 3));
+   }
+ 
+   const addon =
     "FACT_RECALL_EVIDENCE:\n" +
      "Answer policy (LOOKUP vs SYNTHESIS vs INFERENCE):\n" +
     "A) First classify the user question intent:\n" +
@@ -6682,18 +7224,18 @@ if (!sorted.length) return null;
     "1) LOOKUP: If facts clearly answer, answer directly. If not, say: \"I do not have that recorded yet.\" Then ask at most ONE short follow-up question.\n" +
     "2) SYNTHESIS: Do not refuse just because there is no single matching fact key. Provide two short sections: (a) What I have recorded, (b) What I do not have recorded yet. Do not guess missing details.\n" +
     "3) INFERENCE: You may offer a qualified best inference only when the user is asking for advice/implications. Label it explicitly as inference, cite the fact(s) used, and do not present the inference as a stored fact.\n\n" +
-    "D) Name focus rule: If the user question names a person/entity (e.g., Amir), answer ONLY using facts that mention that same name.\n\n" +
-    linesOut.join("\n");
-
-  console.log("FACT_RECALL_DEBUG: addon has evidence", {
-    hasHeader: addon.includes("FACT_RECALL_EVIDENCE:"),
-    hasAnyBullets: addon.includes("\n- "),
-    addonLen: addon.length,
-  });
-  console.log("FACT_RECALL_DEBUG: addon preview", addon.slice(0, 800));
-
-  const ctx =
-    "RECALL_EVIDENCE_FROM_USER_FACTS:\n" +
+     "D) Name focus rule: If the user question names a person/entity (e.g., Amir), answer ONLY using facts that mention that same name.\n\n" +
+     linesOut.join("\n");
+ 
+  if (DEBUG_AI_BRAIN_LOGS) console.log("FACT_RECALL_DEBUG: addon has evidence", {
+     hasHeader: addon.includes("FACT_RECALL_EVIDENCE:"),
+     hasAnyBullets: addon.includes("\n- "),
+     addonLen: addon.length,
+   });
+  if (DEBUG_AI_BRAIN_LOGS) console.log("FACT_RECALL_DEBUG: addon preview", addon.slice(0, 800));
+ 
+   const ctx =
+     "RECALL_EVIDENCE_FROM_USER_FACTS:\n" +
     linesOut.join("\n\n");
 
   return { addon, context: ctx, directReply };
@@ -6709,12 +7251,35 @@ function buildSessionLocalRecallFallbackAddon(): string {
      "- After answering, you MAY ask: \"Would you like me to save that?\"",
      "- If the relevant details are NOT present, say you don't have enough details yet and ask the user to remind you briefly.",
      "- Do NOT guess or invent details.",
-   ].join("\n");
- }
+    ].join("\n");
+  }
+ 
+function buildNoEvidenceRecallReply(): string {
+  return "I do not have that recorded yet. Could you remind me briefly?";
+}
 
-// Strip unsupported "memory claims" when we do NOT have canonical evidence.
-// This is intentionally conservative and fail-closed.
-function stripUnsupportedRecallClaims(replyText: string): string {
+function stripPosthumousAvatarDrift(replyText: string): string {
+  const t = (replyText || "").trim();
+  if (!t) return t;
+
+  const hasPosthumousDrift =
+    /\b(after my death|after your death|before my death|before your death|since my death|since your death)\b/i.test(t) ||
+    /\b(acquired|bought|got|owned|had)\b[\s\S]{0,40}\b(after|before|since)\b[\s\S]{0,20}\bdeath\b/i.test(t) ||
+    /\b(did i|did you|is that something i|is that something you)\b[\s\S]{0,50}\bdeath\b/i.test(t);
+
+  if (!hasPosthumousDrift) return t;
+
+  const firstSentence = t.match(/^.*?[.!?](?:\s|$)/)?.[0]?.trim() ?? "";
+  if (/^i\s+(do\s+not|don't)\s+have\b/i.test(firstSentence)) {
+    return `${firstSentence} Could you remind me briefly?`;
+  }
+
+  return buildNoEvidenceRecallReply();
+}
+
+ // Strip unsupported "memory claims" when we do NOT have canonical evidence.
+ // This is intentionally conservative and fail-closed.
+ function stripUnsupportedRecallClaims(replyText: string): string {
   const t = (replyText || "").trim();
   if (!t) return t;
 
@@ -6800,13 +7365,13 @@ export async function runTurnPipeline(req: Request): Promise<Response> {
       let body: AiBrainPayload;
       // Track mode flags before we start downstream routing.
       let _isAvatar = false;
-      let _isEndSession = false;
-       try {
-         const raw = await req.json();
-         console.log("🧠 ai-brain incoming:", raw);
-         body = raw as AiBrainPayload;
-
-       if (body?.diagnostic === true) {
+       let _isEndSession = false;
+        try {
+          const raw = await req.json();
+          if (DEBUG_AI_BRAIN_LOGS) console.log("🧠 ai-brain incoming:", raw);
+          body = raw as AiBrainPayload;
+ 
+        if (body?.diagnostic === true) {
          return await runDiagnostics({ supabase, userId: body?.user_id ?? null, authHeader: req.headers.get("Authorization") });
        }
 
@@ -6906,21 +7471,21 @@ export async function runTurnPipeline(req: Request): Promise<Response> {
       }
 
       // -----------------------------------------------------------------------
-      // AVATAR MODE: proxy to dedicated avatar edge function
-      // -----------------------------------------------------------------------
-      // NOTE: we proxy *after* resolving user_id so avatar can rely on it.
-      if (_isAvatar && !_isEndSession) {
-        console.log("AVATAR_PROXY", { mode: (body as any)?.mode ?? (body as any)?.conversation_mode ?? "avatar" });
-        return await proxyToAvatarFunction(req, body);
-      }
+       // AVATAR MODE: proxy to dedicated avatar edge function
+       // -----------------------------------------------------------------------
+       // NOTE: we proxy *after* resolving user_id so avatar can rely on it.
+      if (_isAvatar && !_isEndSession && !_op && !_action) {
+         console.log("AVATAR_PROXY", { mode: (body as any)?.mode ?? (body as any)?.conversation_mode ?? "avatar" });
+         return await proxyToAvatarFunction(req, body);
+       }
 
       //
       // IMPORTANT: some clients incorrectly set end_session=true on ordinary turns.
       // For avatar mode we always proxy to /avatar to obtain a real reply_text, and
       // (if end_session is also requested) we continue below to run end-session writes.
-      if (_isAvatar) {
-        console.log("AVATAR_PROXY", { mode: (body as any)?.mode ?? (body as any)?.conversation_mode ?? "avatar" });
-        const proxied = await proxyToAvatarFunction(req, body);
+      if (_isAvatar && !_op && !_action) {
+         console.log("AVATAR_PROXY", { mode: (body as any)?.mode ?? (body as any)?.conversation_mode ?? "avatar" });
+         const proxied = await proxyToAvatarFunction(req, body);
         if (!_isEndSession) {
           return proxied;
          }
@@ -7050,20 +7615,22 @@ export async function runTurnPipeline(req: Request): Promise<Response> {
         bodyAny?.end_session === true ||
         bodyAny?.endSession === true ||
         bodyAny?.action === "end_session" ||
-        receivedMessageText.trim() === "__END_SESSION__" ||
-        receivedMessageText.trim() === "[END_SESSION]";
+         receivedMessageText.trim() === "__END_SESSION__" ||
+         receivedMessageText.trim() === "[END_SESSION]";
+ 
+      if (DEBUG_AI_BRAIN_LOGS) {
+        console.log("AI_BRAIN_RECEIPT", {
+          conversation_id: receivedConversationId,
+          end_session: receivedEndSession,
+          has_message_text: receivedMessageText.trim().length > 0,
+          keys: Object.keys(bodyAny ?? {}),
+        });
 
-      console.log("AI_BRAIN_RECEIPT", {
-        conversation_id: receivedConversationId,
-        end_session: receivedEndSession,
-        has_message_text: receivedMessageText.trim().length > 0,
-        keys: Object.keys(bodyAny ?? {}),
-      });
-
-      console.log("TURN_CORE_VERSION", "turn_core_4859_learning_persist_v1_2025-12-30_avatar_reply_fix8_2026-01-21");
-
-      // -----------------------------------------------------------------------
-      // 1) Resolve mode, persona, locales, conversation id
+        console.log("TURN_CORE_VERSION", "turn_core_4859_learning_persist_v1_2025-12-30_avatar_reply_fix8_2026-01-21");
+      }
+ 
+       // -----------------------------------------------------------------------
+       // 1) Resolve mode, persona, locales, conversation id
       // -----------------------------------------------------------------------
       const requestedMode = (body.mode ?? "legacy") as ConversationMode;
       const conversationMode: ConversationMode =
@@ -7127,18 +7694,18 @@ export async function runTurnPipeline(req: Request): Promise<Response> {
           target_locale: targetLocale,
             ...(opts.metadata ?? {}),
         },
-      };
-      const { error } = await supabase.from("avatar_turns").insert(row);
-      if (error) {
-        console.info("AVATAR_TURN_PERSIST_ERR", JSON.stringify({ role: opts.role, msg: String(error?.message ?? error) }));
-      } else {
-        console.info("AVATAR_TURN_PERSIST_OK", JSON.stringify({ role: opts.role, len: (opts.content ?? "").length }));
-      }
-    } catch (e) {
-      console.info("AVATAR_TURN_PERSIST_ERR", JSON.stringify({ role: opts.role, msg: String(e) }));
-    }
-  }
-  // --- end avatar transcript persistence ---
+       };
+       const { error } = await supabase.from("avatar_turns").insert(row);
+       if (error) {
+        if (DEBUG_AI_BRAIN_LOGS) console.info("AVATAR_TURN_PERSIST_ERR", JSON.stringify({ role: opts.role, msg: String(error?.message ?? error) }));
+       } else {
+        if (DEBUG_AI_BRAIN_LOGS) console.info("AVATAR_TURN_PERSIST_OK", JSON.stringify({ role: opts.role, len: (opts.content ?? "").length }));
+       }
+     } catch (e) {
+      if (DEBUG_AI_BRAIN_LOGS) console.info("AVATAR_TURN_PERSIST_ERR", JSON.stringify({ role: opts.role, msg: String(e) }));
+     }
+   }
+   // --- end avatar transcript persistence ---
 
       const incomingStateJson = body.state_json ?? null;
        // Minimal per-conversation turn state (latched task + turn counter).
@@ -7390,8 +7957,11 @@ if (!isEndSession && conversationMode === "legacy" && supabase && replyMode === 
       "- Keep it to 4–8 sentences. If you ask a question, ask only ONE and make it directly about the pattern.\n";
   } catch (e) {
     console.log("LONGITUDINAL_REFLECTION: snapshot inject failed (non-fatal)", String(e));
-  }
-}
+   }
+ }
+ 
+let injectedRecallEvidenceThisTurn = false;
+let injectedRecallDirectReply: string | null = null;
 
 if (replyMode !== "LONGITUDINAL_REFLECTION" && !isEndSession && supabase) {
     const _askedRecorded = isRecordedRequest(userMessageForPrompt);
@@ -7399,24 +7969,34 @@ if (replyMode !== "LONGITUDINAL_REFLECTION" && !isEndSession && supabase) {
       _askedRecorded &&
       requestsLocalOnlyMemory(userMessageForPrompt) &&
       !requestsCrossSessionMemory(userMessageForPrompt);
-
-  if (!_localOnly) {
-    try {
-      const factEvidence = await recall_v2(
-        supabase as SupabaseClient,
-        user_id,
-        userMessageForPrompt,
-        12,
-      );
-      if (factEvidence) {
-        systemPrompt = `${systemPrompt}\n\n${factEvidence.addon}`;
-        contextBlock = `${(contextBlock ?? "").trim()}\n\n${factEvidence.context}`.trim();
-        console.log("FACT_RECALL: injected_user_facts", { n: 12 });
-      }
-    } catch (e) {
-      console.log("FACT_RECALL: inject failed (non-fatal)", String(e));
-    }
-  } else {
+  
+    if (!_localOnly) {
+      try {
+       const factEvidence = await recall_v2(
+         supabase as SupabaseClient,
+         user_id,
+         userMessageForPrompt,
+         12,
+       );
+       if (factEvidence) {
+         systemPrompt = `${systemPrompt}\n\n${factEvidence.addon}`;
+         contextBlock = `${(contextBlock ?? "").trim()}\n\n${factEvidence.context}`.trim();
+        injectedRecallEvidenceThisTurn = true;
+         const _direct = String((factEvidence as any)?.directReply ?? "").trim();
+         if (_direct) {
+            injectedRecallDirectReply = _direct;
+          }
+ 
+          if (DEBUG_AI_BRAIN_LOGS) console.log("FACT_RECALL: injected_user_facts", {
+             requested_limit: 12,
+             has_direct: Boolean(_direct),
+             direct_preview: _direct.slice(0, 160),
+          });
+        }
+     } catch (e) {
+       console.log("FACT_RECALL: inject failed (non-fatal)", String(e));
+     }
+   } else {
     console.log("FACT_RECALL: skipped (local-only recorded request)");
   }
 }
@@ -7461,13 +8041,15 @@ CONNECTION_RULE:
         recallTestForThisTurn ||
         detectRecallIntent(userMessageForPrompt) ||
         /\b(do you remember my|remember my|what(?:'s| is) my|tell me my|remind me my|who am i)\b/.test(recallText) ||
-        storyQ.length > 0 ||
-        /\b(tell me (?:the )?story|retell|recap (?:the )?story|my .* story|story about)\b/.test(recallText);
-        
-      if (conversationMode === "avatar") {
-        console.log("AVATAR_INPUT_DIAG", {
-          raw_len: (rawUserMessageForPrompt ?? "").length,
-          received_len: (receivedMessageText ?? "").length,
+        /\bwhat\s+[a-z0-9\s]{1,60}\s+(?:is|are|was|were)\s+my\b/.test(recallText) ||
+        /\bwhat\s+do\s+i\s+(?:keep|store|put|have)\s+in\s+my\b/.test(recallText) ||        
+         storyQ.length > 0 ||
+         /\b(tell me (?:the )?story|retell|recap (?:the )?story|my .* story|story about)\b/.test(recallText);
+         
+      if (DEBUG_AI_BRAIN_LOGS && conversationMode === "avatar") {
+         console.log("AVATAR_INPUT_DIAG", {
+           raw_len: (rawUserMessageForPrompt ?? "").length,
+           received_len: (receivedMessageText ?? "").length,
           normalized_len: _normalizedIncomingText.length,
           raw_preview: (rawUserMessageForPrompt ?? "").slice(0, 80),
           received_preview: (receivedMessageText ?? "").slice(0, 80),
@@ -7483,11 +8065,16 @@ CONNECTION_RULE:
       const _trimmedUserMessageForPrompt = (userMessageForPrompt ?? "").trim();
 
       // Safety: the client normally does not send empty STT to the server, but guard anyway.
-      if (!_trimmedUserMessageForPrompt) {
-        return jsonResponse({
-        reply_text: (conversationMode === "avatar")
-          ? "I’m here. (Avatar v0.5) I didn’t catch any usable text to respond to—try typing a short message like ‘hello’."
-          : null,
+    if (!_trimmedUserMessageForPrompt) {
+      const emptyTextReply = (conversationMode === "avatar")
+        ? "I’m here. (Avatar v0.5) I didn’t catch any usable text to respond to—try typing a short message like ‘hello’."
+        : null;
+
+return jsonResponse({
+  reply_text: emptyTextReply,
+  text: emptyTextReply,
+  reply: { text: emptyTextReply },
+  message: emptyTextReply,
           learning_artifacts: null,
           legacy_artifacts: null,
           mode: conversationMode,
@@ -7512,6 +8099,7 @@ CONNECTION_RULE:
       if (_isLegacyGreeting) {
         return jsonResponse({
           reply_text: "Yep — I'm here. What would you like to talk about?",
+          text: "Yep — I'm here. What would you like to talk about?",
           learning_artifacts: null,
           legacy_artifacts: null,
           mode: conversationMode,
@@ -7541,117 +8129,324 @@ const _legacyToneConstraint =
 // Recall hydration (Legacy): never pretend to remember a story unless we have canonical evidence.
 // If the user asks for a retell/recall and we can't find evidence, we reply safely (no Gemini call).
 // -----------------------------------------------------------------------
-let forcedLegacyReply: string | null = null;
-let hadCanonicalEvidenceThisTurn = false;
-let hadSessionLocalEvidenceThisTurn = false;
-let retellFallbackText: string | null = null;
-if (!isEndSession && (conversationMode === "legacy" || conversationMode === "avatar")) {
-  const recallTest = recallTestForThisTurn;
-  const wantsRecall = wantsRecallForThisTurn;
+ let forcedLegacyReply: string | null = null;
+ let hadCanonicalEvidenceThisTurn = false;
+ let hadSessionLocalEvidenceThisTurn = false;
+ let retellFallbackText: string | null = null;
+if (injectedRecallEvidenceThisTurn) {
+  hadCanonicalEvidenceThisTurn = true;
+  if (!forcedLegacyReply && injectedRecallDirectReply) {
+    forcedLegacyReply = injectedRecallDirectReply;
+  }
+}
+
+ if (!isEndSession && (conversationMode === "legacy" || conversationMode === "avatar")) {
+   const recallTest = recallTestForThisTurn;
+   const wantsRecall = wantsRecallForThisTurn;
   let storyQuery = wantsRecall ? extractStoryRecallQuery(userMessageForPrompt) : "";
 
     // If the user is continuing a recall request with pronouns (“tell me about it/that”)
     // and we didn't extract a concrete query, try to infer it from the last user turn
     // in this conversation (cheap: one small DB read, only on recall turns).
-    if (wantsRecall && !storyQuery && !recallTest && supabase && effectiveConversationId && looksLikeRecallContinuation(userMessageForPrompt)) {
-      try {
-        storyQuery = await inferRecallQueryFromRecentTurns(
-          supabase as SupabaseClient,
-          user_id,
-          effectiveConversationId,
-        );
-      } catch (_) {
-        // ignore
-      }
+
+     if (wantsRecall && !storyQuery && !recallTest && supabase && effectiveConversationId && looksLikeRecallContinuation(userMessageForPrompt)) {
+       try {
+         storyQuery = await inferRecallQueryFromRecentTurns(
+           supabase as SupabaseClient,
+           user_id,
+           effectiveConversationId,
+         );
+       } catch (_) {
+         // ignore
+       }
+     }
+
+    // Only route to story recall when the user is explicitly asking for a story/episode.
+    // Direct fact lookups like "what color is my..." must stay on the fact path.
+    const explicitStoryRetellIntent =
+      /\b(story|retell|episode|what happened|tell me about the time|tell me the story|that story)\b/i.test(
+        userMessageForPrompt,
+      );
+
+    if (!explicitStoryRetellIntent) {
+      storyQuery = "";
     }
-  if (wantsRecall) {
-    if (supabase) {
-      const evidences = recallTest && !storyQuery
-        ? await hydrateRecallBrowseEvidence(
+ 
+    if (wantsRecall || wantsRecallForThisTurn) {
+
+     if (supabase) {
+      // FACTS-FIRST for non-story recall turns.
+      // If the user is asking for recall but this did not resolve to a story query,
+      // prefer direct fact recall before browse/story evidence so story-like artifacts
+      // do not preempt factual lookup.
+      let factEvidence = !storyQuery
+        ? await recall_v2(
             supabase as SupabaseClient,
             user_id,
+            userMessageForPrompt,
+            12,
           )
-        : storyQuery
-          ? await hydrateRecallEvidence(
-              supabase as SupabaseClient,
-              user_id,
-              userMessageForPrompt,
-              storyQuery,
-            )
-          : null;
+        : null;
 
-      if (!evidences || evidences.length === 0) {
-        // Safety rule: no speculation, no "memory limits" discussion.
-        // No canonical evidence from curated stories; try user_facts as a secondary evidence source.
-        const factEvidence = await recall_v2(
+      if (
+        !storyQuery &&
+        (!factEvidence || !String((factEvidence as any)?.directReply ?? "").trim())
+      ) {
+        const hydratedEvidence = await hydrateUserFactsEvidence(
           supabase as SupabaseClient,
           user_id,
           userMessageForPrompt,
           12,
         );
-        if (factEvidence) {
-          hadCanonicalEvidenceThisTurn = true;
-          systemPrompt = `${systemPrompt}\n\n${factEvidence.addon}`;
-          contextBlock = `${contextBlock}\n\n${factEvidence.context}`.trim();
-          const _direct = (factEvidence as any)?.directReply;
-          if (!forcedLegacyReply && typeof _direct === "string" && _direct.trim()) {
-            forcedLegacyReply = _direct.trim();
-          }
-        } else {
+
+        if (hydratedEvidence && String((hydratedEvidence as any)?.directReply ?? "").trim()) {
+          factEvidence = hydratedEvidence;
+        }
+      }
+
+       if (factEvidence) {
+         hadCanonicalEvidenceThisTurn = true;
+         systemPrompt = `${systemPrompt}\n\n${factEvidence.addon}`;
+         contextBlock = `${contextBlock}\n\n${factEvidence.context}`.trim();
+
+         const _direct = String((factEvidence as any)?.directReply ?? "").trim();
+
+         const _factText = [
+           String(factEvidence.context ?? ""),
+           String(factEvidence.addon ?? ""),
+         ].filter((s) => s.trim().length > 0).join("\n");
+
+         const _factMatch =
+           _factText.match(/DIRECT_GROUNDED_REPLY:\s*\n([\s\S]*?)(?:\n\s*\n|$)/i) ??
+           _factText.match(/RECALL_EVIDENCE_FROM_USER_FACTS:\s*\n\s*-\s*([^\n]+)/i) ??
+           _factText.match(/FACT_RECALL_EVIDENCE:[\s\S]*?\n\s*-\s*([^\n]+)/i);
+
+         const _queryTokens = String(userMessageForPrompt ?? "")
+           .toLowerCase()
+           .replace(/[^a-z0-9\s]/g, " ")
+           .split(/\s+/)
+           .map((t) => t.trim())
+           .filter((t) => t.length >= 4 && ![
+             "what", "which", "where", "when", "tell", "show", "give",
+             "remember", "recall", "recorded", "have", "does", "inside",
+             "contents", "color", "your", "mine", "with", "about",
+           ].includes(t));
+
+         const _contextEvidenceLine = _factText
+           .split(/\r?\n/)
+           .map((line) => line.trim())
+           .filter((line) => line.length > 0)
+           .filter((line) => !/^(USER_FACTS:|USER_FACTS_WORKING_SET|AUTHORITATIVE_USER_KNOWLEDGE|CORE:|RELEVANT:|\(none\))/i.test(line))
+           .filter((line) => !/^(?:[-•]\s*)?(use these facts|receipts\/quotes|do not say|if facts conflict)/i.test(line))
+           .find((line) => {
+             const low = line.toLowerCase();
+             return _queryTokens.some((t) => low.includes(t));
+           });
+
+           const _fallbackDirect = (
+             String(_factMatch?.[1] ?? "").trim() ||
+             String(_contextEvidenceLine ?? "").replace(/^\s*[-•]\s*/, "").trim()
+           )
+           .replace(/^\s*[-•]\s*/, "")
+           .replace(/\s*\(conf:\s*[0-9.]+\)\s*/i, " ")
+           .replace(/\s*receipt:\s*["“][\s\S]*$/i, "")
+           .replace(/\s+/g, " ")
+           .trim();
+ 
+          const _scoreSpecificAnswer = (s: string): number => {
+            const hay = String(s ?? "").toLowerCase();
+            const qTokens = String(userMessageForPrompt ?? "")
+              .toLowerCase()
+              .replace(/[^a-z0-9\s]/g, " ")
+              .split(/\s+/g)
+              .map((t) => t.trim())
+              .filter((t) => t.length >= 3 && ![
+                "what", "which", "where", "when", "tell", "show", "give",
+                "remember", "recall", "recorded", "have", "does", "inside",
+                "your", "mine", "with", "about", "use",
+              ].includes(t));
+            const hits = qTokens.filter((t) => hay.includes(t)).length;
+            const specificTokens = (String(s ?? "").match(/\b[a-z0-9]*\d[a-z0-9]*\b/gi) ?? []).length;
+            return hits * 20 + specificTokens * 25 + Math.min(String(s ?? "").length, 500) / 50;
+          };
+
+          const _bestSpecificEvidence = _factText
+            .split(/\r?\n|;\s+/g)
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0)
+            .filter((line) => !/^(DIRECT_GROUNDED_REPLY|AUTHORITATIVE_USER_KNOWLEDGE|CORE:|RELEVANT:|\(none\))/i.test(line))
+            .map((line) => line.replace(/^\s*[-•]\s*/, "").trim())
+            .filter(Boolean)
+            .sort((a, b) => _scoreSpecificAnswer(b) - _scoreSpecificAnswer(a))[0] ?? "";
+
+          const _bestDirect =
+            _bestSpecificEvidence && _scoreSpecificAnswer(_bestSpecificEvidence) > _scoreSpecificAnswer(_direct)
+              ? _bestSpecificEvidence
+              : _direct;
+
+          const _directScore = _scoreSpecificAnswer(_direct);
+          const _fallbackScore = _scoreSpecificAnswer(_fallbackDirect);
+          const _bestEvidenceScore = _scoreSpecificAnswer(_bestSpecificEvidence);
+
+          const _chosenFactReply =
+            _fallbackDirect && _fallbackScore >= _directScore
+              ? _fallbackDirect
+              : _bestSpecificEvidence && _bestEvidenceScore > _directScore
+                ? _bestSpecificEvidence
+                : _direct;
+
+          forcedLegacyReply = _chosenFactReply || forcedLegacyReply;
+           const _deterministicFactReply = String(forcedLegacyReply ?? "").trim();
+ 
+           if (!isEndSession && (wantsRecall || wantsRecallForThisTurn) && _deterministicFactReply) {
+            if (DEBUG_AI_BRAIN_LOGS) console.log("FACT_RECALL: hard_return_direct_fact_reply_diag", {
+             direct_preview: _direct.slice(0, 160),
+             fallback_preview: _fallbackDirect.slice(0, 160),
+             deterministic_preview: _deterministicFactReply.slice(0, 160),
+             fact_text_has_exact_marker: /\b[a-z0-9]*\d[a-z0-9]*\b/i.test(_factText),
+           });
+ 
+          if (DEBUG_AI_BRAIN_LOGS) console.log("FACT_RECALL: hard_return_direct_fact_reply", {
+              has_direct: Boolean(_direct),
+              has_fallback: Boolean(_fallbackDirect),
+              reply_preview: _deterministicFactReply.slice(0, 160),
+           });
+
+return jsonResponse({
+  reply_text: _deterministicFactReply,
+  text: _deterministicFactReply,
+  reply: { text: _deterministicFactReply },
+  message: _deterministicFactReply,
+            learning_artifacts: null,
+             legacy_artifacts: null,
+             mode: conversationMode,
+             preferred_locale: preferredLocale,
+             target_locale: hasTarget ? targetLocale : null,
+             conversation_id: effectiveConversationId,
+             state_json: "{}",
+             end_session: false,
+             end_session_summary: null,
+           });
+         }
+
+         contextBlock = `${contextBlock}
+
+FACT_LOOKUP_MODE:
+- This turn is a direct factual recall request, not a story retell.
+- Grounded fact evidence is available in this turn.
+- Answer with the grounded fact evidence.
+- Do not say the fact is missing or unrecorded.
+- Do not ask a follow-up question.
+- Do not ask whether the user wants to save or record it.`.trim();
+       } else {
+        const evidences = recallTest && !storyQuery
+          ? await hydrateRecallBrowseEvidence(
+              supabase as SupabaseClient,
+              user_id,
+            )
+          : storyQuery
+            ? await hydrateRecallEvidence(
+                supabase as SupabaseClient,
+                user_id,
+                userMessageForPrompt,
+                storyQuery,
+              )
+            : null;
+
+        if (!evidences || evidences.length === 0) {
           // Allow a normal Gemini reply, but constrain it to session-local turns only.
           hadSessionLocalEvidenceThisTurn = true;
           systemPrompt = `${systemPrompt}\n\n${buildSessionLocalRecallFallbackAddon()}`;
-        }
-      } else {
-        // Provide evidence to the model and enforce honesty.
-        hadCanonicalEvidenceThisTurn = true;
-        systemPrompt = `${systemPrompt}\n\n${recallTest && !storyQuery ? buildRecallBrowseAddon(evidences) : buildRecallEvidenceAddon(evidences)}`;
-        const evidenceText = evidences
-          .map((e, idx) => {
-            const t = (e.title ? `Story ${idx + 1}: ${e.title}\n` : `Story ${idx + 1}:\n`);
-            return `${t}${e.excerpt}`.trim();
-          })
-          .join("\n\n---\n\n");
-        contextBlock = `${contextBlock}\n\nCANONICAL_EVIDENCE:\n${evidenceText}`.trim();
-      
-        // Story retell hard-enforcement: prevents meta "records/entries" replies and permission stalling.
-        const _storyQ_for_retell = (storyQuery || (extractStoryRecallQuery(userMessageForPrompt) ?? "")).trim();
-        if (_storyQ_for_retell.length > 0) {
-         // Capture a deterministic retell fallback from the best available narrative evidence.
-         // Priority: story_seed (seed_text) > story_recall (synopsis) > capsule.
-         // Pick the longest non-empty excerpt within the highest-priority group available.
-          const pickBest = (kinds: string[]): string => {
-            const candidates = evidences
-              .filter((e) => kinds.includes(e.kind) && (e.excerpt || "").trim().length > 0)
-              .sort((a, b) => ((b.excerpt || "").length - (a.excerpt || "").length));
-            return (candidates[0]?.excerpt || "").trim();
-          };
-          const pickAny = (): string => {
-            const candidates = evidences
-              .filter((e) => (e.excerpt || "").trim().length > 0)
-              .sort((a, b) => ((b.excerpt || "").length - (a.excerpt || "").length));
-            return (candidates[0]?.excerpt || "").trim();
-          };
-          const best =
-            pickBest(["memory_raw"]) ||
-            pickBest(["story_seed"]) ||
-            pickBest(["story_recall"]) ||
-            pickBest(["capsule"]) ||
-            pickAny();
+         } else {
+           // Provide evidence to the model and enforce honesty.
+           hadCanonicalEvidenceThisTurn = true;
+          const recallAddonHeader = recallTest && !storyQuery
+            ? "RECALL_BROWSE_EVIDENCE:"
+            : "STORY_RECALL_EVIDENCE:";
+          const recallAddonLines = evidences.map((e, idx) => {
+            const title = String((e as any)?.title ?? "").trim();
+            const kind = String((e as any)?.kind ?? "evidence").trim();
+            const excerpt = _safeStr(String((e as any)?.excerpt ?? ""), 1200);
+            return [
+              `Evidence ${idx + 1}:`,
+              `kind: ${kind}`,
+              title ? `title: ${title}` : "",
+              `excerpt: ${excerpt}`,
+            ].filter(Boolean).join("\n");
+          });
+          const recallAddon = [
+            recallAddonHeader,
+            "Use ONLY the evidence below. Do not invent missing details.",
+            "If the user asked for a story retell, retell the story directly from the evidence.",
+            "",
+            recallAddonLines.join("\n\n---\n\n"),
+          ].join("\n");
+          systemPrompt = `${systemPrompt}\n\n${recallAddon}`;
+          const evidenceText = evidences
+            .map((e, idx) => {
+              const t = (e.title ? `Story ${idx + 1}: ${e.title}\n` : `Story ${idx + 1}:\n`);
+              return `${t}${e.excerpt}`.trim();
+            })
+            .join("\n\n---\n\n");
+          contextBlock = `${contextBlock}\n\nCANONICAL_EVIDENCE:\n${evidenceText}`.trim();
+        
+          // Story retell hard-enforcement: prevents meta "records/entries" replies and permission stalling.
+          const _storyQ_for_retell = (storyQuery || (extractStoryRecallQuery(userMessageForPrompt) ?? "")).trim();
+          if (_storyQ_for_retell.length > 0) {
+           // Capture a deterministic retell fallback from the best available narrative evidence.
+           // Priority: memory_raw > story_seed > story_recall > capsule.
+           const scoreStoryEvidence = (e: any): number => {
+             const excerpt = String(e?.excerpt ?? "");
+             const hay = excerpt.toLowerCase();
+             const queryTokens = _storyQ_for_retell
+               .toLowerCase()
+               .replace(/[^a-z0-9\s]/g, " ")
+               .split(/\s+/g)
+               .map((t) => t.trim())
+               .filter((t) => t.length >= 3);
+             const hits = queryTokens.filter((t) => hay.includes(t)).length;
+             const exactMarkers = queryTokens.filter((t) => /\d/.test(t) && hay.includes(t)).length;
+             return hits * 20 + exactMarkers * 100 + Math.min(excerpt.length, 1200) / 120;
+           };
 
-          if (best.length > 0) retellFallbackText = best;
-          // Deterministic retell: if we have narrative evidence, bypass Gemini.
-          // This prevents the model from "stalling" with follow-up questions.
-          if (retellFallbackText && retellFallbackText.trim().length > 0) {
-            forcedLegacyReply = retellFallbackText.trim();
-          }
-           // If we don't have any narrative evidence to retell, do NOT call Gemini (it will meta-stall).
-           // Fail closed with the safe recall reply instead.
+           const pickBest = (kinds: string[]): string => {
+              const candidates = evidences
+                .filter((e) => kinds.includes(e.kind) && (e.excerpt || "").trim().length > 0)
+               .sort((a, b) => scoreStoryEvidence(b) - scoreStoryEvidence(a));
+              return (candidates[0]?.excerpt || "").trim();
+            };
+            const pickAny = (): string => {
+              const candidates = evidences
+                .filter((e) => (e.excerpt || "").trim().length > 0)
+               .sort((a, b) => scoreStoryEvidence(b) - scoreStoryEvidence(a));
+              return (candidates[0]?.excerpt || "").trim();
+            };
+            const promptLow = String(userMessageForPrompt ?? "").trim().toLowerCase();
+            const cleanBest = (s: string): string => {
+              const t = String(s ?? "").trim();
+              const low = t.toLowerCase();
+              if (!t || low === promptLow) return "";
+              if (/^tell me (?:the |a |my )?story\b/i.test(t)) return "";
+              if (/^retell\b/i.test(t)) return "";
+              return t;
+            };
+
+            const best =
+              cleanBest(pickBest(["memory_raw"])) ||
+              cleanBest(pickBest(["story_seed"])) ||
+              cleanBest(pickBest(["story_recall"])) ||
+              cleanBest(pickBest(["capsule"])) ||
+              cleanBest(pickAny());
+
+           if (best.length > 0) retellFallbackText = best;
+           if (retellFallbackText && retellFallbackText.trim().length > 0) {
+             forcedLegacyReply = retellFallbackText.trim();
+           }
            if (!retellFallbackText) {
              forcedLegacyReply = buildNoEvidenceRecallReply();
            }
  
-          contextBlock = `${contextBlock}
+           contextBlock = `${contextBlock}
 
 STORY_RETELL_MODE:
 - The user asked for a story retell. If any story evidence is present, retell it immediately.
@@ -7660,13 +8455,14 @@ STORY_RETELL_MODE:
 - Do not describe the database/logs/entries/requests; just tell the story.
 - Do not ask for permission (no "Would you like me to proceed?").
 - Minimum 4 sentences. Start the story right away.`.trim();
-        }      
+          }
+        }
       }
     } else {
       forcedLegacyReply = buildNoEvidenceRecallReply();
     }
-  }
-}
+   }
+ }
 
       if (_lowContentLegacyConstraint) systemPrompt = `${systemPrompt}${_lowContentLegacyConstraint}`;
       if (_legacyToneConstraint) systemPrompt = `${systemPrompt}${_legacyToneConstraint}`;
@@ -7759,6 +8555,21 @@ STORY_RETELL_MODE:
       if (!isEndSession && (conversationMode === "legacy" || conversationMode === "avatar")) {
         systemPrompt = `${systemPrompt}\n\n${buildTurnDirective(turnState)}`;
       }
+
+      // Universal recall rule:
+      // when recall evidence exists in context, answer from it directly.
+      // Do not ask the user to remind you when the context already contains a grounded reply/evidence block.
+      if (!isEndSession && wantsRecallForThisTurn) {
+        systemPrompt = `${systemPrompt}
+
+RECALL_GROUNDED_ANSWER_RULE:
+- If the context includes AUTHORITATIVE_USER_KNOWLEDGE, FACT_RECALL_EVIDENCE, STORY_RECALL_EVIDENCE, or DIRECT_GROUNDED_REPLY, treat that as recorded memory evidence.
+- When such evidence is present, answer directly from it.
+- Do NOT say "I don't remember", "I do not recall", "I do not have that recorded", or ask the user to remind you, unless the evidence blocks are absent or empty.
+- Prefer the most specific grounded answer available.
+- If DIRECT_GROUNDED_REPLY is present, use it as the answer unless it conflicts with stronger evidence in the same context.
+`;
+      }
  
       // Explicit save UX: if the user just asked to save/record something, acknowledge it as saved
       // and do NOT ask them again whether to save it in the same turn.
@@ -7771,6 +8582,7 @@ STORY_RETELL_MODE:
 ${contextBlock}
 
 User message:
+
 "${userMessageForPrompt.trim()}"`.trim();
 
       let rawReply = "";
@@ -7920,31 +8732,81 @@ User message:
           );
         }
 
-        // Deterministic fallback: if this is a story-retell request and Gemini STILL stalls,
-        // return the best narrative evidence directly (fail-closed, avoids meta "recorded" replies).
-        if (_storyQ2.length > 0 && looksLikeStoryStall(replyText) && retellFallbackText) {
-          replyText = normalizeStoryRetellText(retellFallbackText);
-        }
+         // Deterministic fallback: if this is a story-retell request and Gemini stalls
+         // OR denies recall despite canonical evidence, return the best narrative
+         // evidence directly (fail-closed, avoids meta "recorded" replies).
+          if (
+            _storyQ2.length > 0 &&
+            retellFallbackText &&
+           looksLikeStoryStall(replyText)
+          ) {
+            replyText = normalizeStoryRetellText(retellFallbackText);
+          }
 
-        if (_noQuestionsRequested || _patternSignal) {
-          replyText = stripTrailingQuestion(replyText);
-        }
-      }
+        // Deterministic execution for FACT recall:
+        // If this is a recall turn, we already hydrated canonical evidence,
+        // and we already computed a grounded direct fact answer, do not leave
+        // the final wording up to the model. Use the grounded answer directly.
+        //
+        // This is the fact-side equivalent of the story fail-closed retell path.
+         if (
+           wantsRecallForThisTurn &&
+           forcedLegacyReply &&
+           hadCanonicalEvidenceThisTurn &&
+          (
+            _storyQ2.length === 0 ||
+            String(contextBlock ?? "").includes("FACT_LOOKUP_MODE:")
+          )
+         ) {
+           replyText = forcedLegacyReply;
+         }
+
+        // Deterministic fallback for FACT recall:
+        // if this is a recall turn, canonical evidence exists, and we already
+        // computed a grounded direct reply, do not allow the model to deny,
+        // speculate, or bounce the user back with a question.
+         if (
+           wantsRecallForThisTurn &&
+           forcedLegacyReply &&
+           hadCanonicalEvidenceThisTurn &&
+           (
+             /\?\s*$/.test(String(replyText ?? "").trim())
+           )
+         ) {
+           replyText = forcedLegacyReply;
+         }
+ 
+         if (_noQuestionsRequested || _patternSignal) {
+           replyText = stripTrailingQuestion(replyText);
+         }
+       }
 
       // -------------------------------------------------------------------
       // Legacy recall honesty guard:
-      // If we did not hydrate canonical evidence this turn, do not allow the model
-      // to claim it remembers specific stories or details. Replace with safe reply.
-      // -------------------------------------------------------------------
-      if (conversationMode === "legacy" && !hadCanonicalEvidenceThisTurn && !hadSessionLocalEvidenceThisTurn) {
-        replyText = stripUnsupportedRecallClaims(replyText);
+       // If we did not hydrate canonical evidence this turn, do not allow the model
+       // to claim it remembers specific stories or details. Replace with safe reply.
+       // -------------------------------------------------------------------
+      if ((conversationMode === "legacy" || conversationMode === "avatar") && !hadCanonicalEvidenceThisTurn && !hadSessionLocalEvidenceThisTurn) {
+         replyText = stripUnsupportedRecallClaims(replyText);
+       }
+       // If we DID have evidence, strip any "not recorded yet" preface deterministically.
+      if ((conversationMode === "legacy" || conversationMode === "avatar") && (hadCanonicalEvidenceThisTurn || hadSessionLocalEvidenceThisTurn)) {
+         replyText = stripNotRecordedYetPreface(replyText);
+       }
+      if (conversationMode === "avatar") {
+        replyText = stripPosthumousAvatarDrift(replyText);
       }
-      // If we DID have evidence, strip any "not recorded yet" preface deterministically.
-      if (conversationMode === "legacy" && (hadCanonicalEvidenceThisTurn || hadSessionLocalEvidenceThisTurn)) {
-        replyText = stripNotRecordedYetPreface(replyText);
-      }
-
+ 
       // Persist the chat-bubble text (null for end-session)
+      if (
+        !isEndSession &&
+        wantsRecallForThisTurn &&
+        forcedLegacyReply &&
+        (hadCanonicalEvidenceThisTurn || hadSessionLocalEvidenceThisTurn)
+      ) {
+         replyText = forcedLegacyReply;
+       }
+
       const trimmedReplyText = replyText.trim();
       reply_text = trimmedReplyText.length > 0 ? trimmedReplyText : null;
 
@@ -8474,12 +9336,30 @@ User message:
                    summarizeLegacySessionWithGemini,
                    // Optional in end_session.ts; keep only what EndSessionDeps actually supports.
                    extractUserFactsWithGemini,
-                  },
+                   },
+                 });
+ 
+              try {
+                const transcriptForDeterministicFacts = await fetchLegacySessionTranscript(
+                  client,
+                  user_id,
+                  effectiveConversationId,
+                );
+                await persistDeterministicSessionFactsBestEffort({
+                  client,
+                  user_id,
+                  conversation_id: effectiveConversationId,
+                  raw_id_this_turn: rawIdThisTurn,
+                  transcript: transcriptForDeterministicFacts,
+                  created_at_iso: new Date().toISOString(),
                 });
+              } catch (e) {
+                console.warn("deterministic_session_facts: end_session pass failed (non-fatal):", e);
+              }
 
-              // Fallback: if the immediate memory_summary re-read below misses (timing/RLS),
-              // still return a usable end_session_summary payload so the GUI can route.
-              // The DB row is still being upserted inside end_session.ts.
+               // Fallback: if the immediate memory_summary re-read below misses (timing/RLS),
+               // still return a usable end_session_summary payload so the GUI can route.
+               // The DB row is still being upserted inside end_session.ts.
               if (!endSessionSummaryPayload) {
                 const ss = typeof (endSessionResult as any)?.short_summary === "string"
                   ? String((endSessionResult as any).short_summary).trim()
@@ -8567,39 +9447,156 @@ User message:
             }
           : null;
 
+      const extractDirectGroundedReply = (text: string): string | null => {
+        const src = String(text ?? "");
+        const m = src.match(/DIRECT_GROUNDED_REPLY:\s*\n([\s\S]*?)(?:\n\s*\n|$)/i);
+        return m?.[1] ? String(m[1]).trim() : null;
+      };
+
+      const extractFirstFactEvidenceReply = (text: string): string | null => {
+        const src = String(text ?? "");
+
+        const direct =
+          src.match(/DIRECT_GROUNDED_REPLY:\s*\n([\s\S]*?)(?:\n\s*\n|$)/i)?.[1] ??
+          src.match(/RECALL_EVIDENCE_FROM_USER_FACTS:\s*\n\s*-\s*([^\n]+)/i)?.[1] ??
+          src.match(/FACT_RECALL_EVIDENCE:[\s\S]*?\n\s*-\s*([^\n]+)/i)?.[1] ??
+          "";
+
+        let line = String(direct ?? "").trim();
+        if (!line) return null;
+
+        line = line
+          .replace(/^\s*[-•]\s*/, "")
+          .replace(/\s*\(conf:\s*[0-9.]+\)\s*/i, " ")
+          .replace(/\s*receipt:\s*["“][\s\S]*$/i, "")
+          .replace(/\s+/g, " ")
+          .trim();
+
+        return line.length ? line : null;
+      };
+
+      const looksLikeRecallDenial = (text: string): boolean => {
+        const s = String(text ?? "").trim().toLowerCase();
+        if (!s) return false;
+        return (
+          s.includes("i do not recall") ||
+          s.includes("i don't recall") ||
+          s.includes("i do not remember") ||
+          s.includes("i don't remember") ||
+          s.includes("i do not have") ||
+          s.includes("i don't have") ||
+          s.includes("not recorded yet") ||
+          s.includes("no record of") ||
+          s.includes("no records of") ||
+          s.includes("i do not have any specific memories") ||
+          s.includes("i don't have any specific memories") ||
+          s.includes("can you remind me") ||
+          s.includes("could you remind me") ||
+          s.includes("can you tell me more") ||
+          s.includes("could you tell me more") ||
+          s.includes("what would you like me to note") ||
+          s.includes("what color is the folder") ||
+          s.includes("what do you keep in it") ||
+          s.includes("would you like me to save") ||
+          s.includes("want me to save") ||
+          s.includes("do you recall mentioning it") ||
+          s.includes("what you keep in it recorded yet") ||
+          s.includes("would you like to tell me about it") ||
+          s.includes("would you like me to record")
+        );
+      };
+
+      const hasGroundedRecallEvidence = (() => {
+        const src = String(contextBlock ?? "");
+        return (
+          src.includes("DIRECT_GROUNDED_REPLY:") ||
+          src.includes("AUTHORITATIVE_USER_KNOWLEDGE:") ||
+          src.includes("FACT_RECALL_EVIDENCE:") ||
+          src.includes("RECALL_EVIDENCE_FROM_USER_FACTS:") ||
+          src.includes("STORY_RECALL_EVIDENCE:")
+        );
+      })();
+
+      const groundedRecallReply = extractDirectGroundedReply(String(contextBlock ?? ""));
+      const groundedFactFallbackReply = extractFirstFactEvidenceReply(String(contextBlock ?? ""));
+      const effectiveGroundedRecallReply =
+        String(forcedLegacyReply ?? "").trim() ||
+        String(groundedRecallReply ?? "").trim() ||
+        String(groundedFactFallbackReply ?? "").trim() ||
+        null;
+ 
+      if (
+        !isEndSession &&
+        wantsRecallForThisTurn &&
+        (hadCanonicalEvidenceThisTurn || hasGroundedRecallEvidence) &&
+        effectiveGroundedRecallReply &&
+        (
+          looksLikeRecallDenial(replyText ?? "") ||
+          /\?\s*$/.test(String(replyText ?? "").trim())
+        )
+      ) {
+        replyText = effectiveGroundedRecallReply;
+        reply_text = replyText;
+      }
+ 
       // Bubble reply text (null for end-session)
       let safeReplyText: string | null = null;
 
       // Strip leading INTENT=... header (model routing metadata) from assistant text
       const stripIntentHeader = (text: string): string => {
-        if (!text) return text;
-        const lines = text.split(/\r?\n/);
-        let i = 0;
-        while (i < lines.length && lines[i].trim() === "") i++;
-        if (i < lines.length && /^INTENT=[A-Z_]+$/.test(lines[i].trim())) {
+         if (!text) return text;
+         const lines = text.split(/\r?\n/);
+         let i = 0;
+         while (i < lines.length && lines[i].trim() === "") i++;
+         if (i < lines.length && /^INTENT=[A-Z_]+$/.test(lines[i].trim())) {
+
           lines.splice(i, 1);
           // Remove a single following blank line, if present
           if (i < lines.length && lines[i].trim() === "") {
             lines.splice(i, 1);
           }
-        }
-        return lines.join("\n").trim();
-      };
+         }
+         return lines.join("\n").trim();
+       };
 
-        // NOTE: Some clients treat reply_text=null as "no update" and skip parsing end_session_summary.
-        // Return an empty string for end_session so the UI still processes the response payload.
-       safeReplyText = isEndSession
-         ? (conversationMode === "avatar"
-            ? (() => {
-                const t = String((body as any).__avatar_proxy_reply_text ?? "").trim();
-                return t.length > 0
-                  ? t
-                  : "⚠️ Avatar returned no reply_text (end_session). Check /avatar logs.";
-              })()
-             : "")
-        : stripIntentHeader((reply_text ?? "").trim());  
- 
-       // Persist avatar transcript turns (never blocks reply; errors are logged only).
+       // IMPORTANT:
+       // The final HTTP payload is built from reply_text below, not replyText.
+       // Any deterministic override that mutates replyText must be copied back
+       // before safeReplyText is computed, otherwise the client receives the
+       // stale Gemini denial even though replyText was corrected.
+      if (!isEndSession) {
+        if (
+          wantsRecallForThisTurn &&
+          effectiveGroundedRecallReply &&
+          (hadCanonicalEvidenceThisTurn || hasGroundedRecallEvidence)
+        ) {
+          replyText = effectiveGroundedRecallReply;
+          }
+
+        const finalReplyTextForClient = String(replyText ?? "").trim();
+        reply_text = finalReplyTextForClient.length > 0 ? finalReplyTextForClient : null;
+      }
+
+        // Final safety-net: never return a silent avatar turn.
+        if (conversationMode === "avatar" && (reply_text == null || String(reply_text).trim().length == 0) && !isEndSession) {
+         console.log("AVATAR_FINAL_REPLY_FALLBACK");
+         reply_text = "I’m here. (Avatar v0.5) Ask me something about what you’ve shared so far, and I’ll reflect it back.";
+       }
+
+      // NOTE: Some clients treat reply_text=null as "no update" and skip parsing end_session_summary.
+      // Return an empty string for end_session so the UI still processes the response payload.
+      safeReplyText = isEndSession
+        ? (conversationMode === "avatar"
+           ? (() => {
+               const t = String((body as any).__avatar_proxy_reply_text ?? "").trim();
+               return t.length > 0
+                 ? t
+                 : "⚠️ Avatar returned no reply_text (end_session). Check /avatar logs.";
+             })()
+            : "")
+        : stripIntentHeader((reply_text ?? "").trim());
+
+      // Persist avatar transcript turns (never blocks reply; errors are logged only).
       // For avatar+end_session (client bug / mixed behavior), persist the proxied reply if present.
       if (conversationMode === "avatar") {
         const shouldPersist = !isEndSession || (isEndSession && typeof safeReplyText === "string" && safeReplyText.trim().length > 0);
@@ -8610,20 +9607,29 @@ User message:
           }
         }
       }
-
-      // 8) Final response to the client
-      // -----------------------------------------------------------------------
-      
-      // Final safety-net: never return a silent avatar turn.
-      if (conversationMode === "avatar" && (reply_text == null || String(reply_text).trim().length == 0) && !isEndSession) {
-        console.log("AVATAR_FINAL_REPLY_FALLBACK");
-        reply_text = "I’m here. (Avatar v0.5) Ask me something about what you’ve shared so far, and I’ll reflect it back.";
+ 
+      if (
+        !isEndSession &&
+        (wantsRecallForThisTurn || detectRecallIntent(userMessageForPrompt)) &&
+        (safeReplyText == null || String(safeReplyText).trim().length === 0)
+      ) {
+        safeReplyText =
+          String(effectiveGroundedRecallReply ?? "").trim() ||
+          String(forcedLegacyReply ?? "").trim() ||
+          "I found recall evidence, but could not format the saved value yet.";
       }
 
-       return jsonResponse({
-         reply_text: safeReplyText,
-        legacy_artifacts: legacy_artifacts_payload,
-         mode: conversationMode,
+      if (!isEndSession && safeReplyText != null) {
+        reply_text = String(safeReplyText);
+      }
+
+return jsonResponse({
+  reply_text: safeReplyText,
+  text: safeReplyText,
+  reply: { text: safeReplyText },
+  message: safeReplyText,
+         legacy_artifacts: legacy_artifacts_payload,
+          mode: conversationMode,
         // KILL: locale prefs in response (client can own prefs; reduces stale language-learning remnants)
         preferred_locale: null,
         target_locale: null,

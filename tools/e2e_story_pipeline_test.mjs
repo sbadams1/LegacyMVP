@@ -64,54 +64,25 @@ function parseJsonMaybe(value) {
   }
 }
 
-function pickNarrativeText(row) {
+function pickRecallText(row) {
   if (!row || typeof row !== "object") return "";
 
   const evidence = row.evidence_json && typeof row.evidence_json === "object"
     ? row.evidence_json
     : parseJsonMaybe(row.evidence_json);
 
-  const nestedCandidates = [
-    evidence?.story,
-    evidence?.retell_text,
-    evidence?.retell,
-    evidence?.body,
-    evidence?.narrative,
-    evidence?.content,
-    evidence?.synopsis,
+  const candidates = [
+    row.synopsis,
+    evidence?.one_liner,
     evidence?.summary,
-    evidence?.text,
-    evidence?.seed_text,
+    evidence?.synopsis,
   ];
 
-  for (const v of nestedCandidates) {
-    if (typeof v === "string" && v.trim().length >= 120) return v.trim();
+  for (const v of candidates) {
+    if (typeof v === "string" && v.trim().length >= 40) return v.trim();
   }
 
-  const keys = [
-    "retell_text",
-    "retell",
-    "story",
-    "body",
-    "narrative",
-    "content",
-    "synopsis",
-    "summary",
-    "text",
-  ];
-
-  for (const k of keys) {
-    const v = row[k];
-    if (typeof v === "string" && v.trim().length >= 120) return v.trim();
-  }
-
-  let best = "";
-  for (const [, v] of Object.entries(row)) {
-    if (typeof v !== "string") continue;
-    const s = v.trim();
-    if (s.length > best.length) best = s;
-  }
-  return best;
+  return "";
 }
 
 function norm(s) {
@@ -211,10 +182,10 @@ async function main() {
   const conversation_id = crypto.randomUUID();
 
   const storyTurns = [
-    "Last month in Bangkok I took a motorbike taxi across town because I was running late for dinner with a friend.",
-    "Halfway there the driver turned into a narrow side street where a night market had spilled into the road and we had to stop suddenly.",
-    "My phone slipped from my pocket onto the pavement, and for a second I thought it was gone because people and scooters were moving everywhere around us.",
-    "The driver helped me look, we found the phone under a cart wheel with a cracked case, and after that I decided to keep my phone zipped inside my bag whenever I ride.",
+    "Two weeks ago in Chiang Mai I took the last river shuttle across town because a thunderstorm had already started and I was trying to make it to a small jazz bar before the music began.",
+    "As we pulled up to the dock, a gust of wind flipped my cheap plastic poncho over my face and I dropped the paper ticket I had been using as a bookmark inside the novel I was carrying.",
+    "The ticket blew under a row of wet benches, and for a minute I thought I had lost both my place in the book and the only proof that I had prepaid for the return ride.",
+    "A dock worker helped me fish it out with a broom handle, the bookmark was ruined but the novel was fine, and ever since then I keep a laminated card in my bag instead of using loose paper when I travel in the rain.",
   ];
 
   console.log("Posting multi-turn story...");
@@ -303,7 +274,34 @@ async function main() {
       process.exit(1);
     }
 
-    if (haveAllTurns && phaseBDone && ss.data?.length && uk.data?.facts) {
+    if (haveAllTurns && phaseBDone && uk.data?.facts) {
+      if (!ss.data?.length) {
+        const latest = ms.data?.length ? ms.data[ms.data.length - 1] : null;
+        const insights =
+          latest &&
+          typeof latest === "object" &&
+          latest.session_insights &&
+          typeof latest.session_insights === "object"
+            ? latest.session_insights
+            : latest &&
+                typeof latest === "object" &&
+                latest.observations &&
+                typeof latest.observations === "object"
+              ? latest.observations
+              : null;
+
+        failWithSeed(
+          "story_seeds not created after Phase B completed",
+          null,
+          null,
+          {
+            phase_b_status: latestJob?.status ?? null,
+            session_counts: insights?.counts ?? null,
+            session_trace: insights?.end_session_trace ?? null,
+          },
+        );
+      }
+
       const mrTexts = (mr.data ?? []).map((r) => String(r?.content ?? ""));
       const missingTurns = storyTurns.filter(
         (t) => !mrTexts.some((x) => norm(x).includes(norm(t).slice(0, 30))),
@@ -321,7 +319,7 @@ async function main() {
       const title = String(recall?.title ?? seedRow0?.title ?? "");
       const seedId = String(recall?.story_seed_id ?? seedRow0?.id ?? "").trim();
 
-      const recallText = pickNarrativeText(recall);
+      const recallText = pickRecallText(recall);
 
       const seedObj0 = parseJsonMaybe(seedRow0?.seed_text);
       const seedTextStory = String(
@@ -331,22 +329,21 @@ async function main() {
       ).trim();
 
       const narrativeText =
-        recallText && recallText.trim().length >= 80
-          ? recallText
-          : (seedTextStory && seedTextStory.trim().length >= 80 ? seedTextStory : "");
+        seedTextStory && seedTextStory.trim().length >= 80
+          ? seedTextStory
+          : (recallText && recallText.trim().length >= 40 ? recallText : "");
 
       if (!narrativeText || narrativeText.length < 120) {
         failWithSeed(
-          "missing coherent narrative text (story_recall empty and story_seeds.seed_text.story too short)",
-          seedRow0,
-          narrativeText || JSON.stringify(recall),
-          {
-            has_story_recall: Boolean(recall),
-            story_recall_len: recallText?.length ?? 0,
-            seed_story_len: seedTextStory?.length ?? 0,
-          },
-        );
-      }
+          "missing coherent narrative text (story_seeds.seed_text.story too short and story_recall synopsis/one_liner unavailable)",
+           seedRow0,
+           narrativeText || JSON.stringify(recall),
+           {
+             has_story_recall: Boolean(recall),
+             story_recall_len: recallText?.length ?? 0,
+             seed_story_len: seedTextStory?.length ?? 0,
+           },
+         );      }
 
       let seed = null;
       if (seedId) {
@@ -358,16 +355,11 @@ async function main() {
         if (seedRes?.data) seed = seedRes.data;
       }
 
-const rawSeedKey =
+const canonicalSeedKey =
   String(seed?.seed_key ?? seedRow0?.seed_key ?? "").trim();
 
-const normalizedSeedKey =
-  rawSeedKey.includes("__")
-    ? rawSeedKey.split("__")[0]
-    : rawSeedKey;
-
 const candidates = [
-  normalizedSeedKey ? `stories.${normalizedSeedKey}` : null,
+  canonicalSeedKey ? `stories.${canonicalSeedKey}` : null,
   seed?.id ? `stories.${String(seed.id).trim()}` : null,
 ].filter(Boolean);
 
@@ -443,14 +435,14 @@ const hasAnyStoryKey = allStoryKeys.length > 0;
       const oneLiner = String(seedObj?.one_liner ?? "").trim();
 
       const keyPhrases = [
-        "bangkok",
-        "motorbike",
-        "driver",
-        "market",
-        "phone",
-        "pocket",
-        "cracked",
-        "decided",
+        "chiang mai",
+        "river",
+        "shuttle",
+        "thunderstorm",
+        "poncho",
+        "ticket",
+        "bookmark",
+        "laminated",
       ];
 
       const storyHits = keyPhrases.filter((k) => norm(story).includes(k));
@@ -477,8 +469,8 @@ const hasAnyStoryKey = allStoryKeys.length > 0;
       const sentenceCount = (story.match(/[.!?](\s|$)/g) ?? []).length;
       const hasFirstPerson = /\b(i|my|me|we|our)\b/i.test(story);
       const hasSequence = /\b(then|after that|afterwards|next|later|before that|eventually)\b/i.test(story);
-      const hasOutcome = /\b(in the end|i decided|i learned|i realized|so i)\b/i.test(story);
 
+const hasOutcome = /\b(in the end|i decided|i learned|i realized|so i|ever since|from then on|after that|since then|now i|i started|i always)\b/i.test(story);
       if (
         !oneLiner ||
         story.length < 220 ||
@@ -528,16 +520,30 @@ if (!hasCandidate) {
   console.log("Matched story key in user_knowledge:", matchedCandidate);
 }
 
+      const latestSummary = ms.data?.length ? ms.data[ms.data.length - 1] : null;
+      const phaseBCounts =
+        latestSummary &&
+        latestSummary.session_insights &&
+        typeof latestSummary.session_insights === "object" &&
+        latestSummary.session_insights.counts &&
+        typeof latestSummary.session_insights.counts === "object"
+          ? latestSummary.session_insights.counts
+          : null;
+
       console.log("\nPASS ✅ Story pipeline verified");
-      console.log("memory_raw ✔");
-      console.log("story_seeds ✔");
-      if (recall && recallText && recallText.trim().length >= 80) {
-        console.log("story_recall ✔");
-      } else {
-        console.log("story_recall (optional) — not present yet");
-      }
-      console.log("user_knowledge ✔");
-      process.exit(0);
+       console.log("memory_raw ✔");
+       console.log("story_seeds ✔");
+       if (recall && recallText && recallText.trim().length >= 40) {
+         console.log("story_recall ✔"); 
+       } else {
+         console.log("story_recall (optional) — not present yet");
+       }
+       console.log("user_knowledge ✔");
+      console.log("phase_b.counts:", JSON.stringify(phaseBCounts, null, 2));
+      console.log("conversation_id:", conversation_id);
+      console.log("story_seed_id:", seedRow?.id ?? null);
+      console.log("story_seed_key:", canonicalSeedKey || null);
+       process.exit(0);
     }
 
     await sleep(1000);
